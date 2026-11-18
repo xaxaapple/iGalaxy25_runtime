@@ -1,0 +1,64 @@
+// A made-up source for the edit list "gpu3d" (no Python original: written by hand, 2026-11-13): every anchor once.
+// (before anchor 0)
+DroidVMClientMemory droidvm_virtgpu_client_memory[64];
+// OneiOS: a blob made (its resource id, client slot, bytes, kind bits: 1 host-visible, 2 the caller's pages wired,
+// 4 this driver's pages in the caller's task, the blob flags << 4), closed while the GPU may still use it, and gone.
+void oneios_gpu_blob_made(uint32_t, uint32_t, uint64_t, uint32_t, task_t, uint64_t) __attribute__((weak));
+void oneios_gpu_blob_closed(uint32_t) __attribute__((weak));
+void oneios_gpu_blob_gone(uint32_t) __attribute__((weak));
+// OneiOS: who submits, for the host's GPU policy (role, QoS, deadline: OneiOSAdreno.cpp, docs/gpu.md 2.2b).
+void oneios_gpu_hint(uint8_t *) __attribute__((weak));
+// (before anchor 1)
+    c->resources[c->resourceCount++] = r;
+    if (oneios_gpu_blob_made)
+        oneios_gpu_blob_made(r.id, c->slot, r.size, (r.hostVisible ? 1u : 0u) | (r.wired ? 2u : 0u) | (r.prepared ? 4u : 0u) |
+                             ((in.blob_flags & 0xfu) << 4), task, user);
+// (before anchor 2)
+        c->closed[c->closedCount++] = {*r, c->sequence};
+        if (oneios_gpu_blob_closed) oneios_gpu_blob_closed(r->id);
+// (before anchor 3)
+    countPages(c, r, -1);
+    if (oneios_gpu_blob_gone) oneios_gpu_blob_gone(r.id);
+// (before anchor 4)
+volatile int droidvm_virtgpu_compositor_pid;
+// OneiOS: the surface trail (OneiOSAdreno.cpp trail::).
+void oneios_gpu_surface_use(uint32_t, uint32_t, uint32_t, uint64_t) __attribute__((weak));
+void oneios_gpu_surface_done(uint32_t, uint32_t, uint32_t, uint64_t) __attribute__((weak));
+void oneios_gpu_surface_lock(uint32_t, uint32_t) __attribute__((weak));
+void oneios_gpu_submit(uint32_t) __attribute__((weak));
+void oneios_gpu_blob_segments(uint32_t, uint32_t, uint64_t, const void *, uint32_t) __attribute__((weak));
+bool oneios_gpu_reader_waits(int) __attribute__((weak));
+// (before anchor 5)
+            gSurfaceUses[gSurfaceUseCount++] = {record.surface, record.written != 0, c, answer};
+            if (oneios_gpu_surface_use) oneios_gpu_surface_use(record.surface, record.written != 0, c->slot, answer);
+// (before anchor 6)
+        if (gSurfaceUses[i].client == c && (!ticket || gSurfaceUses[i].ticket == ticket)) {
+            if (oneios_gpu_surface_done) oneios_gpu_surface_done(gSurfaceUses[i].surface, gSurfaceUses[i].write, c->slot, ticket);
+// (before anchor 7)
+    droidvm_surface_lock_options[options & 3] = droidvm_surface_lock_options[options & 3] + 1;
+    if (oneios_gpu_surface_lock) oneios_gpu_surface_lock(uint32_t(surface), uint32_t(options));
+// (before anchor 8)
+    count(4);
+    if (oneios_gpu_submit) oneios_gpu_submit(c->slot);
+// (before anchor 9)
+    if (!status && entries && r.wired && oneios_gpu_blob_segments) oneios_gpu_blob_segments(r.id, c->slot, r.size, entries, entryCount);
+    if (entries) IODeleteData(entries, Entry, entryCapacity);
+// (before anchor 10)
+    IOLockUnlock(lock);
+    if (!status && head.count && oneios_gpu_reader_waits && oneios_gpu_reader_waits(c->pid)) awaitWriters(c, answer);
+    return status;
+}
+}
+}
+// For the display: the holds taken so far
+// (before anchor 11)
+    CtxCreate create = {{CmdCtxCreate, 0, 0, context, 0, {}}, 0, in.capset_id, {'x', 'n', 'u', ':'}};
+    if (oneios_gpu_hint) {
+        uint8_t hint[3] = {};
+        oneios_gpu_hint(hint);
+        create.contextInit |= uint32_t(hint[0]) << 8 | uint32_t(hint[1]) << 16;
+    }
+// (before anchor 12)
+    Submit submit = {{CmdSubmit3D, uint32_t(FlagFence) | uint32_t(FlagRingIndex), fence, c->context, uint8_t(in.ring_idx), {}}, in.size, 0};
+    if (oneios_gpu_hint) oneios_gpu_hint(submit.h.padding);
+// (the end)

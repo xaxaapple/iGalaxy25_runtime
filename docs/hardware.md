@@ -1,0 +1,2809 @@
+# Hardware: what the Galaxy S24 Ultra has and how iOS reaches it
+
+Owner of this file: the bridges agent (`drivers/`, `runtime/bridges/`). Date: 2026-11-10.
+
+iOS 27 runs on a source-built XNU inside xnuhost, a process on One UI's kernel. One UI's kernel, init services,
+vendor HALs, audioserver, cameraserver and surfaceflinger keep running in a session; zygote, system_server and every
+app are gone. So each device has two halves:
+
+- a **driver in the kernel** (`drivers/`, or one taken unchanged from UniXNU-droidvm) that iOS's daemons talk to;
+- a **host bridge** in xnuhost (`runtime/bridges/`) that uses the Linux or Android interface.
+
+Marks: **[F]** read in a source at a pinned commit, or reported from the owner's phone (SM-S928B, kernel
+`6.1.162-android14-11`, board notes of 2026-11-10 in `docs/agents.md`). **[I]** inference. **[U]** unknown until tried
+on the phone. **Nothing in this file has run on the phone**: the host bridges pass their unit tests on the PC, build
+for Android, and the kernel-side drivers compile and link-check against the kernel build.
+
+## 0. State at a glance
+
+| Device | Kernel side | Host side | State |
+|---|---|---|---|
+| CPU | `droidvm-amp.patch` + `DroidVMCpufreq.c` (UniXNU-droidvm, unchanged) | `runtime/bridges/cpu`: topology, vCPU plan, thread placement, the cpufreq device | host built and tested; kernel side waits for release-kernel (series, archive) and booter (device tree, placement calls) |
+| GPU | UniXNU-droidvm's virtio-gpu 3D + NativeAdreno user client (unchanged) | booter's `virtio_gpu.c` + drm2kgsl | booter's; not owned here (section 2) |
+| Wi-Fi / network | `kernel/patches/oneios-hosted/net`: `IO80211Controller`/`IO80211Interface` under the collection's `IOEthernetController`/`IOEthernetInterface`, a station that asks the host, UniXNU-droidvm's virtio-net transport (section 3) | `runtime/bridges/wifi`: wlan0 is iOS's for the session: frames by AF_PACKET, scans by nl80211, joins by the vendor's supplicant (AIDL V2 over `/dev/binder`); `wifictl`; the old tap/NAT route only with `wifi=tap` | both built; host tested (132 + 35 checks, the binder client on a real binder driver); on the phone beside One UI: the supplicant's service and an nl80211 scan (53 networks) answer our client; **not yet run in a session** (wifid, a join, DHCP) |
+| Bluetooth | `drivers/bluetooth` (port of iOSPlus10's transport) on `drivers/bridge` | `runtime/bridges/bt`: the HAL over `/dev/hwbinder` | both built; on by default in a session since 2026-11-11 (before: off, `bluetooth=virtual`); HAL client tested on the PC against a fake HAL on a real binder driver, not yet on the phone |
+| Haptics | `drivers/haptics` (port of iOSPlus10's LaurelVibrator and haptic node) and, since 2026-11-12, the Actuator IOAudio2Device of the audio archive (UI and keyboard taps) | `runtime/bridges/haptics`: evdev force feedback | both built; host tested with a fake actuator; the `vibrator` path ran in sessions (alerts), the Actuator path not yet run (section 5) |
+| Audio | `DroidVMVirtioSnd.c` + `DroidVMAudio.cpp`: the hosted kernel's audio archive since 2026-11-12 (before: not built, no device in iOS) | `devices/virtio_snd.c`, `audio/aaudio_helper.c` (`oneios-audio`) | helper run on the phone beside One UI (plays and records, 0 underruns, about 130 ms); host-tested against a fake AAudio; in sessions iOS's I/O thread failed for large buffers (system sounds 3 s late or lost): hosted 0052, not yet run (section 6) |
+| Camera | `drivers/camera`: the `oneios,camera` transport, `/dev/oneios-camera`; `userland/camera`: the capture plug-in (its device object not written) | `runtime/bridges/camera`: helper `oneios-camera` (provider HAL in a session, Camera2 NDK with One UI), ring, device, `camctl` | host and kernel sides built and host-tested; iOS shows no camera yet; one phone run (2026-11-11): cameraserver lists 4 cameras and opens one for a root client, no frame arrived (no binder threads in the process: fixed, the fix not yet run on the phone); the HAL back end never run (section 7) |
+| Backlight and light sensor | `drivers/brightness`: the backlight service (port of iOSPlus10's `AppleARMBacklight`), the light readings; the HID light sensor device, built into the hosted kernel's HID archive | `runtime/bridges/brightness`: the backlight sysfs node, `als_rear` by evdev, `brightctl` | both built; host tested; in a PC boot the HID device starts and Apple's `AppleUSBALSService` attaches to it; on the phone backboardd finds the service; the slider reached no request because CoreBrightness ran VMBLControl (fixed 2026-11-12 in backboardd through the Metal plug-in, not yet run; section 7a) |
+| Battery | `drivers/battery`: an `IOPMPowerSource` powerd reads | `runtime/bridges/battery`: Android's `power_supply` nodes, polled, changes sent over the bridge channel; `batteryctl` | both built; host tested with a fake sysfs; one phone session (2026-11-12 23:45, on the charger): published, and a "plugged in" sound before the lock screen (the startup chime: section 7c) |
+| Thermal | `drivers/thermal`: `OneiOSThermal` (the readings and the level in the registry); `userland/helpers/oneios-thermal` sets iOS's `com.apple.system.thermalpressurelevel` from it | `runtime/bridges/thermal`: the thermal zones, Samsung's thermistors, the battery's sensors; a level on iOS's scale; xnuhost's CPU step when hot; `thermalctl` | host built and tested; the bridge and `thermalctl` run on the phone (2026-11-12); the step, the driver and the helper not yet run; an idle session's heat traced to the guest's idle cache flush (xnuhost's `setway-skip`: -40% CPU) (section 7d) |
+| Hardware backends (2026-11-15) | - | `runtime/bridges/hw`, `hal`: `hw-backend=samsung\|treble` (default samsung, unchanged), per bridge `hw-backend-<bridge>`; treble = the AIDL HALs through servicemanager, evdev by capabilities, standard sysfs classes by named paths | treble done for the backlight, battery, thermal sensors and vibrator (host and stand-in phone tests, both backends); touch and keys share one capability lookup; the light sensor, Wi-Fi, Bluetooth, display next; not run on a phone (section 7e, the audit table) |
+| Touch screen and buttons | `kernel/patches/oneios-hosted/hid`: UniXNU's NativeHidInput (digitizer, buttons) under the collection's `IOHIDDevice`, UniXNU-droidvm's virtio-input transport with the side keys | xnuhost's `input.c` (evdev, no grab) and `virtio_input.c`; `input_script.c` for a host with no panel | built; in a PC boot backboardd opens both services and scripted touches and keys are queued for it as HID events; never run on the phone (section 7b) |
+| S Pen (off by default: xnuhost `pen=auto`, guest `oneios-pen=1`) | the HID archive's third NativeHidInput, Digitizer / Stylus (`staged/hid_pen.rs`): backboardd's pencil digitizer; the transport's pen code (UniXNU-droidvm, unchanged) | xnuhost's `pen.c`: one replaceable lookup by bits (`xh_pen_lookup`), evdev read only, no grab, a second virtio-input device `/arm-io/input-1` | built; host-tested; PC boot with the demo script's pen: backboardd "*** acquired pencil digitizer", its touchstats count the strokes as pencil touches (section 7f); never run on the phone (section 7f) |
+
+Common pieces:
+
+- **The bridge channel** (`drivers/bridge/oneios_bridge_proto.h`): one virtio-mmio device, `/arm-io/bridge`, compatible
+  `oneios,bridge`, carrying small messages (haptic requests, HCI packets). Guest end `drivers/bridge/OneiOSBridge.c`,
+  host end `runtime/bridges/devices/bridge_dev.c`. Devices that already have a virtio driver in UniXNU-droidvm
+  (network, sound) use standard virtio devices instead.
+- **Tests**: `runtime/bridges/tests/host.sh` (CI runs it): 198 checks (and 48 in `brightness/`, 65 in `battery/`) with ASan and UBSan, the virtio devices driven
+  through xnuhost's real transport (`runtime/xnuhost/src/virtio.c`) by a guest made of plain memory; then the Android
+  build. `oneios-tool kernel drivers --check` compiles the kernel sources with the kernel build's own compile records
+  (xnu-12377, arm64e, `-Wall -Wextra -Werror`); the archive's 292 undefined symbols all resolve in `xnu.macho`.
+- **On the phone**: `runtime/bridges/build/android/bridgectl` (static) tries each bridge without xnuhost:
+  `bridgectl cpu|haptic|haptic-pattern|bt|net|audio`. It is the first thing to run when the phone is attached.
+
+### 0.1 Baseline on the phone (2026-11-12, bringup)
+
+Measured beside real sessions on the S24 Ultra (SM-S928B, One UI's kernel, KernelSU), with
+`scripts/phone/survey.sh [session]` and the session's `xnuhost.log`. Raw output: `out/phone-baseline/2026-11-12/`
+(git-ignored: `oneui-idle-before.txt`, `oneui-after-session3.txt`, `session4-survey.txt`, `session5-survey.txt`,
+`session1..5-xnuhost.log`). Read only: nothing was changed that is not put back. The phone was on USB, battery
+100 % (full). Kernel for sessions 3-5: the Linux-built `kernel.kc` 9476a867 of 2026-11-11 (no 0035-0037); the Mac
+`kernel.kc` panics in the first 2 s (`kernel/prelink/README.md`, "On the phone").
+
+| | One UI idle, before | Session 4: runtime 0.1.7-dev, lock screen, about 6 min after ready | Session 5: runtime 0.1.6, owner unlocked to the Home Screen | One UI, 1 min after session 3 |
+|---|---|---|---|---|
+| cpuss-0 / gpuss-0 / ddr / xo-therm | 29.3 / 26.8 / 27.7 / - C | 60.6 / 50.6 / 53.2 / 43.5 C | 51.7 / 45.5 / 47.7 / 41.0 C | 64.5 / 54.5 / 56.7 / 44.8 C |
+| battery (thermal zone `battery`, `power_supply/battery/temp`) | 23.6 C | 36.8 C | 35.7 C | 34.9 C |
+| CPU clocks (cur, kHz, cpu0-1 / 2-4 / 5-6 / 7) | 1804800 / 614400-3148800 / 1190400 / 672000 (walt) | every core at its top: 2265600 / 3148800 / 2956800 / 3340800; load 6.6 | **capped**: scaling_max 1689600 / 2035200 / 1920000 / 2035200, every core at it; load 8.0 (27.5 over 5 min) | |
+| GPU (`kgsl-3d0` gpuclk, devfreq) | 231 MHz, msm-adreno-tz, 0 % busy | **1000 MHz, 0 % busy** (drm2kgsl `context 5: power constraint at the highest level`) | 231 MHz (`max_gpuclk` 500 MHz per the coordinator's read) | 231 MHz |
+| render server frames per 10 s (`oneios-gpu-report`) | | 0-9, mean 8-24 ms | 0-20, mean 22-69 ms | |
+| swaps (`oneios-display-report`, gap between swaps) | | 124 swaps, median 0.76 s, max 60 s | 174 swaps, median 0.17 s, max 77 s | |
+
+On 2026-11-11 (runtime 0.1.6 with the 12:49 xnuhost, the same `kernel.kc`, Data store and seed) the same report
+showed 224-544 frames per 10 s once the lock screen was up. So on 2026-11-12 the GPU path drew a frame only every few
+seconds in both runtimes; the cause is not known (passed to agents gpu and thermal). Session 5's caps on the CPU
+were in place after four sessions in 40 minutes: the phone was hot (cpuss-0 64.5 C one minute after session 3).
+
+Per area, in the sessions (lines of `xnuhost.log`):
+
+- **CPU**: `bridgectl cpu`: 8 CPUs, 2 E (cpu0-1, capacity 369, 364800..2265600 kHz) and 6 P (cpu2-4 capacity 897 to
+  3148800 kHz, cpu5-6 capacity 842 to 2956800 kHz, cpu7 capacity 1024 to 3398400 kHz); plan 2 E then 6 P vCPUs; its
+  thread placed and `uclamp.min 1024` set (both done). xnuhost: `cpu: 2 E + 6 P vCPUs on the host's 2 E + 6 P cores`;
+  every xnuhost thread `SCHED_OTHER` (policy 0), nice 0, `oom_score_adj` 500, its own cgroup.
+  No `oneios-cpu` heat lines: that helper is in no seed yet.
+- **GPU**: `gpuctl nodes`: `/dev/kgsl-3d0`, `/dev/udmabuf`, `/dev/dma_heap/system` open; udmabuf `list_limit`
+  1024, `size_limit_mb` 64. Metal plug-in on (`oneios-gpu-plugin`, five GPU clients). Frame numbers above.
+- **Touch**: delivered, none dropped: session 4 `6165 virtio-input events, 1387 frames, 1463 HID reports, 39
+  contacts`, session 5 `2751 events, 757 HID reports, 7 contacts`, `0 dropped` in both. Runtime 0.1.7-dev wakes the
+  touch IC (`brightness: touch: 1 IC under /sys/class/sec (/sys/class/sec/tsp/enabled) woken`); 0.1.6 does not
+  (the coordinator wrote `2,0` and `2,1` by hand in session 5). The buttons reached iOS (`buttons: 6 key events`),
+  but the Volume Up + Volume Down return chord did not return in sessions 3-5; xnuhost holds `/dev/input/event0`
+  and `event2` (the two volume-key devices) open (agent touch).
+- **Audio**: `audio: on: helper /data/runtime/bin/oneios-audio`; no sound was played or checked.
+- **Haptics**: `haptics: on: /dev/input/event5 (sine effects, period 4..10 ms, level 40..255)`; iOS's `ONEIOS HAPTIC
+  UI: off: no Actuator HAL plug-in in the root` (ringtones and alerts only). A kernel from 2026-11-12 (media) on has the
+  Actuator audio device (section 5).
+- **Bluetooth**: 0.1.7-dev: `bluetooth: on: the phone's controller through its HAL 1.1, address 02:d7:be:af:18:ea
+  (made up: /mnt/vendor/efs/bluetooth/bt_addr not read)`; no line shows bluetoothd opening it. 0.1.6: `ONEIOS BT: off:
+  the host serves no Bluetooth controller`.
+- **Wi-Fi / network**: every session: `xnuhost E network: oneios-net.sh up ended with status 256: the guest has no
+  route out` (Wi-Fi was on in One UI before the switch).
+- **Battery**: `ONEIOS BATTERY: 100%, on power, full (284/10 C, 4311 mV, 12 mA)`.
+
+Not run, and why: `bridgectl bt`, `net`, `haptic` and `audio` (during a session xnuhost holds the Bluetooth HAL, the
+tap, the vibrator and the audio helper; beside One UI, `bt` needs Bluetooth off, which the owner had on).
+
+## 1. CPU
+
+### The phone [F]
+
+| Linux CPU | Core | `capacity-dmips-mhz` | Cluster (`cpu-map`) | Frequency domain |
+|---|---|---|---|---|
+| cpu0, cpu1 | Cortex-A520 | 1024 | cluster0 | 0 |
+| cpu2, cpu3, cpu4 | Cortex-A720 | 1792 | cluster1 | 3 |
+| cpu5, cpu6 | Cortex-A720 | 1792 | cluster2 | 1 |
+| cpu7 | Cortex-X4 | 1894 | cluster3 | 2 |
+
+Source: `qcom/pineapple-v2.dts` lines 419-660 in
+[samsung-sm8650/android_kernel_samsung_sm8650-devicetrees@2f6a973](https://github.com/samsung-sm8650/android_kernel_samsung_sm8650-devicetrees/blob/2f6a9734e556f2f7680b0094bec4ad4671157f8b/qcom/pineapple-v2.dts)
+(decompiled stock DTBs). The core names are the SoC's (SM8650: 1 X4, 5 A720, 2 A520); the DT says `qcom,kryo`. All
+eight CPUs have `paca` and `pacg` [F, owner's phone]. Top frequencies are not in the DT (they come from the
+`qcom,cpufreq-epss` tables at run time): read them with `bridgectl cpu` [U].
+
+### iOS side
+
+- XNU reads `/cpus/cpuN` `cluster-type` (`'E'`, `'P'`) in `ml_parse_cpu_topology`
+  (`osfmk/arm64/machine_routines.c`). With `__ARM_AMP__` it makes one processor set per cluster type, runs the Edge
+  scheduler, and `hw.nperflevels` / `hw.perflevel0.*` (P) / `hw.perflevel1.*` (E) follow. Without it the kernel is
+  SMP: one performance level, whatever the tree says. `__ARM_AMP__` for this machine configuration is UniXNU-droidvm's
+  `ipados27/patches/xnu-12377/droidvm-amp.patch` (19 lines; it applies on today's series tree, checked with
+  `git apply --check`). The kernel series leaves it out today (`kernel/profiles/iphone18-2-ios27.md`).
+- Without CLPC every thread group would stay on the boot CPU's cluster. `DroidVMCpufreq.c` (UniXNU-droidvm,
+  unchanged; it compiles with our records) registers a performance-control callout that gives each thread group its
+  preferred cluster (UI, above-UI and real-time classes on P) and writes the frequency a vCPU wants into a per-vCPU
+  register window, `/arm-io/cpufreq` (Linux's virtual-cpufreq layout).
+- `l2-cache-size`, `l3-cache-size` of a cpu node are read by XNU when present.
+
+### The bridge (`runtime/bridges/cpu/topology.c`)
+
+- `br_cpu_read("/sys", &t)`: per CPU `cpu_capacity`, `cpufreq/cpuinfo_{min,max}_freq`,
+  `scaling_available_frequencies`, `related_cpus`, `regs/identification/midr_el1`, `cache/index*`. CPUs of the lowest
+  capacity are E when capacities differ: on this phone cpu0-1 are E, cpu2-7 P.
+- `br_cpu_plan_make(&t, nvcpu, pin, &plan)`: the guest's vCPUs, **E first** (an iPhone's boot CPU is an E core), then P.
+  8 vCPUs: 2 E + 6 P. Fewer: one E per four vCPUs, at least one. Each vCPU carries `type`, `cluster_id` (0 E, 1 P),
+  the host CPUs it may use (`affinity`: all cores of its kind; with `pin` one core each, the X4 first), the frequency
+  table and cache sizes of the core cpu-pin gives it (the rank-th of its kind, vCPU *i* on CPU *i* here; before
+  2026-11-15 the fastest core in the mask), the boost frequencies included (`scaling_boost_frequencies`).
+- `br_cpu_place(tid, &plan, vcpu)`: `sched_setaffinity`. For the vCPU thread, and for the Linux thread of the iOS
+  thread a vCPU runs (iOS threads are threads of other processes; booter's `xh_thread_run`).
+- `br_cpufreq_*`: the register window. A write of a frequency sets the utilisation clamp
+  (`sched_setattr`, `SCHED_FLAG_UTIL_CLAMP_MIN`, capacity x kHz / max kHz) of the vCPU's thread; the lowest table
+  entry drops the request. Linux's governor keeps clock control. `br_cpufreq_requested(d, vcpu)` lets booter apply
+  the same clamp to the iOS thread it runs (`br_cpu_request`).
+
+### Missing
+
+- release-kernel: `droidvm-amp.patch` in the series, `DroidVMCpufreq.c` in the board archive.
+- booter: `cpu_cluster[]` and the cache properties of the cpu nodes from the plan; the `/arm-io/cpufreq` node
+  (`reg` = nvcpu x 0x1000) and its MMIO region forwarded to `br_cpufreq_read/write`; `br_cpu_place` on its threads.
+- [U] whether `uclamp` is writable from KernelSU's domain on Samsung's kernel (`CONFIG_UCLAMP_TASK`); `bridgectl cpu`
+  says.
+- [I] `hw.perflevel*` cache sizes come from the kernel reading `CCSIDR_EL1` on the running CPU, which under xnuhost
+  is the host core the vCPU thread happens to be on: correct per kind as long as placement holds.
+
+## 2. GPU
+
+Not owned here. The references agent found the working path on this SoC (`docs/references.md` section 1): the guest's
+NativeMetal plug-in, metal2vulkan and Turnip over virtio-gpu's DRM native context, served on the host by
+virglrenderer's `drm2kgsl` on `/dev/kgsl-3d0`. That is the 3D half of booter's `runtime/xnuhost/src/virtio_gpu.c`;
+the KGSL proxy (NativeAdreno's own user client) was retired upstream and our metal2vulkan/reims-vgpu path is the
+fallback only. Facts for it from the phone [F]: Adreno 750 v2 (`Adreno750v2`, 1.0 GHz top), `/dev/kgsl-3d0`
+(crw-rw-rw-, `msm_kgsl`), `/dev/udmabuf` present (`CONFIG_UDMABUF=y`), `/dev/dma_heap/system` and the qcom heaps
+present. Offer on the board: this agent takes the host GPU bridge only if booter asks.
+
+GPU memory on this phone (2026-11-11, `gpuctl` of runtime 0.1.3 as root; `docs/gpu.md` section 4.1 has the run):
+
+- [F] **udmabuf limits**: `/sys/module/udmabuf/parameters/size_limit_mb` **64**, `list_limit` **1024** (the kernel's
+  defaults; built in, parameters mode 0644). One udmabuf is at most 64 MiB and 1024 runs of adjacent pages, so
+  xnuhost splits a larger or more scattered guest buffer into several (`docs/gpu.md` section 2).
+- [F] **KGSL**: chip `0x43051400`, gpu id 6770, gmem 3072 KiB, msm protocol 1.12 through drm2kgsl, one priority;
+  `KGSL_MEMFLAGS_VBO` works. A 64-bit process's GPU addresses are `0x4000000000`..`0x8000000000` (256 GiB,
+  `kgsl_iommu.h` of [the modules repo@3e11ddc](https://github.com/samsung-sm8650/android_kernel_samsung_sm8650-modules/tree/3e11ddcb2b63ce5af65e229e4f340ba6221bddee/qcom/opensource/graphics-kernel)),
+  and a VBO of all 256 GiB is granted.
+- [F] `IOCTL_KGSL_GPUOBJ_IMPORT` of a 16 KiB udmabuf returned ENOMEM beside that 256 GiB VBO; `dmesg` showed only
+  `kgsl kgsl-3d0: Skipped access check` (the mem-buf permission check passing for a foreign exporter).
+  [I] The cause is the VBO filling the address range, not udmabuf; drm2kgsl now leaves room. [U] until `gpuctl`
+  runs again: `gpuctl routes` tests the udmabuf, `system` heap, `qcom,system` heap and `GPUOBJ_ALLOC` routes.
+- [F] dma heaps present: `system`, `qcom,system`, `qcom,display`, `qcom,camera`, `qcom,secure-*`, `qcom,sp-hlos`,
+  `qcom,qseecom`.
+
+## 3. Wi-Fi and network
+
+Design of 2026-11-12 (owner): **no NAT**. Wi-Fi works the way a Treble GSI gets it: in a session iOS is the only OS
+that uses the radio, and it drives the vendor's own Wi-Fi stack. The tap, the private subnet and `oneios-net.sh` are
+the old route; xnuhost runs them only with `wifi=tap`.
+
+### The phone [F, read on the owner's phone 2026-11-12 unless marked]
+
+- Chip: Qualcomm WCN785x / FastConnect 7800 ("kiwi"): DT node `compatible = "qcom,cnss-kiwi"`, `supported-ids =
+  <0x1107>` (`samsung/e3q_eur_openx_w00_r09.dts` line 17994); modules `qca_cld3_kiwi_v2` + `cnss2` (`ethtool -i
+  wlan0`: driver `cnss_pci`); firmware `vendor/firmware/kiwi/` ([android_device_samsung_e3q@fb2ba30](https://github.com/samsung-sm8650/android_device_samsung_e3q/blob/fb2ba3010d59c0f38ddf81aef7fd9c78e2172860/proprietary-files.txt)).
+- Android 17 (SDK 37) with the vendor image's HALs. `wlan0`: ifindex 44, MTU 1500. Offloads (`ethtool -k`): GRO on
+  (can be changed), TSO and TX scatter-gather on and fixed, RX checksum on and fixed, LRO off and fixed. While One UI
+  is not joined to a network, `disable_ipv6` is 1 on wlan0 and the interface has no address. **wlan0's address is a
+  random one while One UI is not joined** (`06:e3:b9:7d:95:16` at 09:30, `8e:f6:ae:01:7e:c9` after a return restarted
+  the framework): the address iOS's en0 gets is the one wlan0 has at the switch.
+- **HALs (all AIDL, none HIDL)**, from `service list`, `lshal` and `/vendor/etc/vintf/manifest/`:
+
+  | Service | Interface, version | Process (domain) |
+  |---|---|---|
+  | `android.hardware.wifi.IWifi/default` | AIDL `android.hardware.wifi` V1 (no version tag in the manifest; `android.hardware.wifi-V1-ndk.so`) | `android.hardware.wifi-service` (`hal_wifi_default`) |
+  | `android.hardware.wifi.supplicant.ISupplicant/default` | AIDL `android.hardware.wifi.supplicant` **V2**: `getInterfaceHash` answers `5e5c6d9e5565999f73fa7f797f5b94616174745b`, the hash of AOSP's frozen `aidl_api/.../2` | `/vendor/bin/hw/wpa_supplicant` (init service `wpa_supplicant`, `disabled oneshot`, `interface aidl`: started on the first lookup; uid wifi) |
+  | `vendor.samsung.hardware.wifi.ISehWifi/default`, `vendor.samsung.hardware.wifi.nan.IWifiVendorNan/default` | Samsung's AIDL extensions (`vendor.samsung.hardware.wifi-V1-ndk.so`, `...wifi.supplicant-V1-ndk.so`) | `vendor.samsung.hardware.wifi-service` |
+  | `wifinl80211` (`android.net.wifi.nl80211.IWificond`) | the platform's nl80211 client (scans, station info) | `wificond` |
+
+  The framework scans through wificond (nl80211), not through the supplicant: ISupplicant has no scan call.
+- The supplicant's **control socket is closed to root** on this user build: `/data/vendor/wifi/wpa/sockets/wlan0`
+  and `@android:wpa_wlan0` exist, but every `wpa_cli` command from KernelSU's `ksu` domain (PING, STATUS,
+  LIST_NETWORKS, SCAN_RESULTS) timed out after 10 s; the client socket was created with the right owner (wifi:wifi,
+  0660). Cause [I]: AOSP lets the supplicant send to a client socket only of the `su` domain and only on userdebug
+  and eng builds (`hal_wifi_supplicant.te`, `userdebug_or_eng(unix_socket_send(hal_wifi_supplicant, wpa, su))`), so
+  its replies to `ksu` are refused. Not used.
+- The supplicant's **AIDL service answers root**, and so does nl80211 (both run with our own client on 2026-11-12,
+  One UI running, SELinux Enforcing, no policy change; "On the phone" below).
+- No SIM in the phone on 2026-11-12 (`gsm.sim.state` ABSENT), mobile data off. One UI's Wi-Fi was on and joined to no
+  network (its last network, a phone hotspot, left on 2026-11-11 15:36).
+
+### The design: iOS drives the vendor stack
+
+```
+ iOS: wifid, Settings, configd (DHCP, ARP, IPv6, DNS)
+   |  Apple80211 ioctls (SIOCGA80211/SIOCSA80211) on en0, IEEE 802.11 kernel events
+ guest kernel: OneiOSWifi.cpp: IO80211Controller/IO80211Interface (the classes wifid knows) under the collection's
+               IOEthernetController/IOEthernetInterface, a station that asks the host, UniXNU-droidvm's virtio-net transport
+   |  one virtio-net device (/arm-io/net): frames, and the station's messages as frames of their own type
+ xnuhost: runtime/bridges/wifi
+   joins: ISupplicant V2 (AIDL over /dev/binder): getStaInterface(wlan0), addNetwork, set*, select, disconnect,
+          removeNetwork; one callback object for state changes, disconnects, rejections
+   scans and signal: nl80211 on wlan0 (TRIGGER_SCAN, GET_SCAN, GET_STATION, GET_INTERFACE), as wificond does
+   frames: AF_PACKET on wlan0 (ETH_P_ALL, PACKET_IGNORE_OUTGOING), the guest's MAC = wlan0's
+ One UI's kernel: cfg80211 + qca_cld3, the vendor's wpa_supplicant (keys, 4-way handshake, rekeys)
+```
+
+1. **Control.** The supplicant keeps doing what only it can do on this chip (WPA2/WPA3 handshakes, PMF, rekeys,
+   roaming inside an ESS). The bridge is its only client in a session, as the framework is in One UI:
+   - join: `addNetwork`, then on the network `setSsid`, `setKeyMgmt`, `setProto`, `setPairwiseCipher`,
+     `setGroupCipher`, the secret, `select`. What to set comes from the key iOS gave and from the network's RSN and
+     WPA elements in the last scan (`br_wifi_plan_join`):
+
+     | The network offers | iOS gave | Supplicant network |
+     |---|---|---|
+     | no RSN or WPA element | no key | `NONE` |
+     | OWE only | no key | `OWE`, PMF required |
+     | PSK (also beside SAE: a transition network) | a passphrase | `WPA_PSK | WPA_PSK_SHA256`, `setPskPassphrase`; WPA and TKIP allowed too when the network has a WPA element or TKIP |
+     | PSK | a 32-byte key (iOS's own PBKDF2 of the passphrase) | the same with `setPsk` |
+     | SAE only | a passphrase | `SAE`, `setSaePassword`, PMF required, `setSaeH2eMode(optional)` |
+     | SAE only | a 32-byte key | refused before the supplicant is asked: WPA3 needs the password itself |
+     | not in the last scan | either | as PSK or open, with `setScanSsid(true)` (a probe for the name) |
+
+     The outcome comes from the callback: `onStateChanged` or `onSupplicantStateChanged` to COMPLETED is the join;
+     `onAssociationRejected` (not timed out) fails it with the access point's status; a disconnect or an
+     authentication timeout after the 4-way handshake began, with a key, is a refused key; two `onNetworkNotFound`
+     are a network that is not there; nothing in 25 s is a timeout. After any failure the network is removed, so the
+     supplicant does not try again by itself.
+   - leave: `disconnect`, `removeNetwork`.
+   - the link drops (`onDisconnected` while joined): the network is removed and iOS is told (`OW_STATE`, link down
+     with the 802.11 reason). **iOS decides when to join again**, not the supplicant.
+   - scan: nl80211 `TRIGGER_SCAN` on wlan0 with one wildcard SSID (an active scan, as wificond's) and `GET_SCAN`
+     after `NEW_SCAN_RESULTS` (or after 8 s without the event): BSSID, frequency, signal (mBm), capability, beacon
+     interval, and the information elements as they are, cut to whole elements within the 1024 bytes of iOS's scan
+     record. A busy radio (`EBUSY`: the supplicant's own scan) is not an error: its results are taken.
+   - signal: nl80211 `GET_STATION` (signal, transmit rate) and `GET_INTERFACE` (the channel), every 2 s while joined.
+   - iOS keeps its own known networks (wifid's store in the Data volume); the supplicant holds only the one network
+     iOS is joining or joined to.
+   - At the start of a session the bridge disconnects the supplicant and removes the networks in it, so the
+     supplicant does not rejoin One UI's network on its own; One UI's framework adds its networks again when it
+     starts (it does that after every framework restart).
+   - The supplicant is a lazy service: when it is not running (its client, One UI's framework, is gone) the
+     lookup starts it (waited for up to 8 s), and it then has no station interface: the bridge adds `wlan0`
+     (`addStaInterface`) and removes it again at the stop (`removeInterface`). When it is running with `wlan0`, the
+     bridge takes that interface and leaves it at the stop.
+2. **Data.** One IP stack on the link: iOS's. The bridge opens `AF_PACKET`/`SOCK_RAW`/`ETH_P_ALL` bound to wlan0,
+   with `PACKET_IGNORE_OUTGOING` and `PACKET_VNET_HDR`. The guest's en0 has wlan0's MAC (a station can send only
+   with its own address; iOS's private addresses are refused by the driver: `setHardwareAddress` is not supported).
+   Frames from the guest with that source address go out as they are; frames to wlan0's MAC, broadcast and
+   multicast come in (the socket asks for every multicast group, `PACKET_MR_ALLMULTI`: iOS's IPv6 solicited-node group and
+   mDNS are groups Linux has not joined on wlan0; the membership ends with the socket). EAPOL (0x888e) is not
+   passed either way: it is the supplicant's. GRO is turned off on wlan0
+   for the session (`ETHTOOL_SGRO`); a coalesced TCP frame that still arrives (its `virtio_net_hdr` says GSO or
+   "needs checksum") is cut back into MTU-sized segments with fresh IPv4/TCP checksums. The Linux side keeps quiet
+   on wlan0: its IPv4 addresses are removed (`ip -4 addr flush dev wlan0`) and `disable_ipv6` is 1. `ip_forward`
+   stays as it is (0 on the phone: a frame for iOS's address is dropped by Linux, not forwarded or answered), and
+   with no address on wlan0 Linux answers no ARP request for iOS. netd, which keeps running, is not asked for
+   anything.
+3. **Return.** xnuhost's stop (`br_wlan_close`): `disconnect` and `removeNetwork` for its network, `removeInterface`
+   if it added `wlan0`, the binder closed (the supplicant drops a dead client's callback), then GRO and
+   `disable_ipv6` back to the values in `/data/session/wifi.state` (written before anything was changed), wlan0 left
+   with no address. One UI's framework then sets wlan0 up itself when it starts: IpClient enables IPv6 and runs
+   DHCP, the framework adds its saved networks and joins (to be checked on the phone: "One UI's Wi-Fi joins again by
+   itself").
+   **After a SIGKILL** of xnuhost nothing of xnuhost runs, and what is left is: GRO off and `disable_ipv6` 1 on
+   wlan0, and the supplicant with iOS's network in it (unless it ended with its client [I: AOSP's AIDL supplicant
+   ends itself when a client that registered a callback dies; not seen on this phone yet]). Neither setting breaks
+   One UI's Wi-Fi: `disable_ipv6` 1 is how the framework itself leaves wlan0 between networks (IpClient turns IPv6 on
+   when it joins), GRO off only costs receive speed, and the framework removes the supplicant's networks before it
+   joins one. That is why the bridge does **not** set `arp_ignore` (the first design did): left at 8 after a kill it
+   would stop One UI answering ARP on wlan0. `bin/wifictl restore /data/local/tmp/oneios/session/wifi.state` puts
+   both settings back; the fork's return can run it after its SIGKILL step (`oneos/interface.md` section 6; not in
+   the fork yet).
+4. **Wi-Fi off in One UI at the switch** [U]: then the chip is stopped and wlan0 does not exist. The bridge says
+   `wifi: off: no wlan0 (One UI's Wi-Fi was off at the switch?)` and iOS gets no network device. Starting the chip
+   itself (IWifi `start`, `createStaIface`) is not written.
+
+### The guest's side (`kernel/patches/oneios-hosted/net`, in the hosted kernel since 2026-11-12)
+
+Before 2026-11-12 the hosted kernel had **no network driver at all** (UniXNU-droidvm's network sources are built only
+by its own script), so iOS had no en0 in any boot. Now `build-hosted.sh` builds one more archive,
+`liboneiosnet.a` (`kernel/patches/oneios-hosted/net/README.md`):
+
+- `OneiOSWifi.cpp`: `IO80211Controller` and `IO80211Interface` (the class names configd and wifid know a Wi-Fi
+  interface by; Apple's IO80211Family is not in the collection) as subclasses of **the collection's own**
+  `IOEthernetController` and `IOEthernetInterface`. Apple's `com.apple.iokit.IONetworkingFamily` is a root of the
+  collection and 25 of the 130 roots link it, so it cannot be replaced by a copy compiled into the kernel (what
+  Droid-VM does). The classes are compiled against IONetworkingFamily-188's headers (APSL; fetched into
+  `out/sources/IONetworkingFamily`), and the build checks those headers against the kernelcache's classes
+  (`IONetworking-24A446-v54.json`, made by `oneios-tool kernel layout net`): 250 and 221 vtable slots, every slot's
+  pointer-authentication discriminator, and whether its function is the family's or the kernel's. 159 original
+  functions are bound at their addresses in the collection through `.original` stubs (`prelink stubs-check`: good).
+- The Apple80211 requests and events of DroidVMWifi.inc (below), with its made-up station replaced: `SCAN_REQ` sends
+  `OW_SCAN` and the records come back as `OW_BSS`; `ASSOCIATE` sends `OW_JOIN` and `ASSOCIATE_RESULT` follows
+  `OW_JOIN_RESULT`; `DISASSOCIATE` sends `OW_LEAVE`; `OW_STATE` carries the link, the signal, the rate and the joined
+  network's record. The link status configd's DHCP waits for (`setLinkStatus`) is active only while joined. Frames
+  pass only while joined.
+- The messages (`drivers/net/oneios_wifi_proto.h`) travel on the virtio-net queues as Ethernet frames of type 0x88b5
+  (IEEE 802 local experimental) to and from the address `02:4f:57:49:46:49`: the bridge never sends such a frame to
+  the radio, the driver never gives one to iOS's network stack.
+- `DroidVMVirtioNet.c` (UniXNU-droidvm f9121cd, the transport), staged with one change: its receive filter passes
+  multicast too (IPv6 neighbour discovery, mDNS).
+- Boot argument `oneios-wifi=0` leaves it out. Log lines: `ONEIOS WIFI: classes registered below the collection's
+  IOEthernetController and IOEthernetInterface`, `ONEIOS WIFI: on: the phone's Wi-Fi, address ...`, `the host has
+  the phone's radio`, `wifid gets|sets N: ...` (each request for the first 150, then a type's first), `scan done: N
+  networks`, `join: ...`, `join done: joined` or `join failed`.
+
+### What wifid needs from the interface (Apple80211)
+
+From DroidVMWifi.inc (UniXNU-droidvm f9121cd, written for iPadOS 27 24A446 and shown in Settings by Droid-VM on
+2026-11-02 with `droidvm-wifi-ssid=`), UniXNU-sheng's `package/WifiNet.cpp` (6bc0ce1: a driver that joins real
+networks on 24A446, so its join details are the ones used) and iOSPlus10's 20H392 trace (`patches/xnu/README-wifi.md`,
+"How wifid uses Apple80211"; iOS 16, so what only it says is [I] until seen):
+
+- **IO80211.framework lists an interface as Wi-Fi by its media** [F, 24A446's `__getIfListCopy`, disassembled from
+  the image's shared cache]: it sends `SIOCGIFMEDIA` and takes the interface when the current medium's type is IEEE
+  802.11 (`(ifm_current & 0xe0) == 0x80`); only when that request fails does it ask `SIOCGIFTYPE` for `IFT_ETHER`
+  with `IFNET_SUBFAMILY_WIFI`. IONetworkingFamily answers `SIOCGIFMEDIA` from the controller's selected and active
+  medium, and `IFM_NONE` when neither is set. The driver set a medium only while joined (as DroidVMWifi.inc, which
+  Droid-VM showed in Settings with a joined made-up network), so on the phone on 2026-11-12 wifid never took en0:
+  no scan request in the whole session, Settings' Wi-Fi page searching for ever. Fixed: the controller selects its
+  IEEE 802.11 medium at the start and keeps it the active medium while the link is down.
+- Found as Wi-Fi only if: the controller's class is `IO80211Controller` (configd), the interface is `IFT_ETHER` with
+  `IFNET_SUBFAMILY_WIFI` (IO80211.framework), it has the property `IOInterfaceName` (wifid matches on it), and the
+  device tree has `/arm-io/wlan` (wifid's launchd plist has `_LimitLoadToDeviceTree=wlan`; MobileGestalt's `wifi`
+  reads it too; booter's tree has the node). A refused `APPLE80211_IOC_FILTER_MONITOR_EVENTS` makes wifid give up
+  the device: accept it.
+- The request numbers' names on 24A446 are in IO80211.framework (`_convertApple80211IOCTLToString`'s table of 607
+  entries). Seen from clients that are not wifid's own attach: 96 VIRTUAL_IF_ROLE and 97 VIRTUAL_IF_PARENT (refused:
+  no virtual interfaces), 560 PROTOCOL_CLEANUP_COMPLETE (a set of 4 bytes, accepted), 103 CURRENT_NETWORK asked with
+  a 2280-byte buffer.
+- **The scan record is 2280 bytes on 24A446** [F, IO80211.framework's `__addScanResultToList`]: the 1164-byte
+  record's fields at the same offsets (channel flags 0x0c, RSSI 0x16, capability 0x1a, rate count 0x22, SSID length
+  0x60, SSID 0x61, flags 0x88, element length 0x8a, elements from 0x8c), a longer element area, and a tail the
+  framework also reads (the BSS's TIMESTAMP at 0x8d0, 64-bit ns of the continuous clock: "Wi-Fi does not join" below; a flag at 0x8d8, two 32-bit values at 0x8dc and 0x8e0, three bytes at
+  0x8e4 to 0x8e6; their meaning is not known). The driver gives a caller whose buffer is that large the whole
+  record with a zero tail (SCAN_RESULT and CURRENT_NETWORK); a smaller buffer gets the 1164 bytes.
+- **The framework first tries a user client** [F, `Apple80211BindToInterfaceWithService`]: `IOServiceOpen` of type 0
+  on the interface's service, and with it every request goes through `IOConnectCallStructMethod`; when the open is
+  refused it uses the socket requests (`SIOCGA80211`/`SIOCSA80211`) this driver answers. The family's
+  `IONetworkInterface` refuses type 0 [I: IONetworkingFamily-188's source; the driver logs the first eight opens
+  and their results].
+- Requests (type numbers): 1 SSID, 2 AUTH_TYPE, 4 CHANNEL, 5 POWERSAVE, 8 RATE, 9 BSSID, 10 SCAN_REQ, 11 SCAN_RESULT
+  (1164-byte records, 2280 on 24A446; EIO after the last), 12 CARD_CAPABILITIES, 13 STATE, 14 PHY_MODE, 15 OP_MODE, 16 RSSI, 17 NOISE,
+  19 POWER, 20 ASSOCIATE (**656 bytes on 24A446**: version 1, mode, 32-bit lower and upper authentication, then the
+  network at 0x10: SSID, BSSID, key length, key cipher, key; the older layout is 592 bytes with 16-bit authentication
+  fields and the network at 0x0c. The driver takes either by its length and refuses any other. Key cipher 6 is the
+  32-byte pairwise master key the daemon derived, 10 the passphrase itself), 21 ASSOCIATE_RESULT (0 while the join
+  runs, 1 success, 2 failed, 9 timed out, 21 wrong key; polled every 20 ms for 8 s), 22 DISASSOCIATE, 27/254 SUPPORTED_CHANNELS, 51 COUNTRY_CODE, 86
+  SCAN_REQ_MULTIPLE, 103 CURRENT_NETWORK, 106 RSSI_BOUNDS, 207 CHANNELS_INFO.
+- Sets: a set of settings or notes is accepted with no effect (383 SET_PROPERTY, 365 DISPLAY_STATE, 564
+  FILTER_MONITOR_EVENTS, which Droid-VM saw the daemon give the device up over when refused, 560
+  PROTOCOL_CLEANUP_COMPLETE). A set the driver cannot carry out and that names another way of doing a thing is
+  **refused**, so the daemon falls back to the plain requests instead of waiting for an answer that never comes: 287
+  request numbers of 24A446's table (every WCL_*, AWDL_*, NAN*, P2P_*, VIRTUAL_IF_*, OFFLOAD_*, GAS_*, SOFTAP_* and
+  ranging request, the access point modes, ROAM, REASSOCIATE, PRIVATE_MAC and SET_MAC_ADDRESS, RESET_CHIP and a few
+  more; `kRefusedSets` in `OneiOSWifi.cpp`). UniXNU-sheng's driver refuses every set it does not know and joins with
+  the plain ASSOCIATE (20). [I: which of the two rules wifid needs for each request is not seen yet.]
+- A leave while a join runs ends the join for the daemon too (ASSOC_DONE with a failure), as UniXNU-sheng's.
+- Events (kernel event class 6, subclass 1, the interface name first): 1 POWER_CHANGED, 2 SSID_CHANGED, 3
+  BSSID_CHANGED, 4 LINK_CHANGED (32 bytes: down, RSSI, SNR, noise, reason), 9 ASSOC_DONE (**on 24A446 with 540
+  bytes**: ten 52-byte access point records, then the result at 0x214 and a flag that it is valid at 0x218; the
+  daemon's `_dispatchAsyncAssocEvent` reads them, so an empty event is not safe), 10 SCAN_DONE; and the link state on
+  the IOKit side (`setLinkStatus`, which configd's DHCP waits for). A join that worked sends, in this order: the
+  IOKit link, ASSOC_DONE, SSID_CHANGED, BSSID_CHANGED, LINK_CHANGED.
+- The regulatory country (51 COUNTRY_CODE) is the Country element of the strongest network of the last scan that
+  has one (the host's station finds it and sends it in `OW_STATE`); "XX" until a scan.
+
+### The host bridge (`runtime/bridges/wifi`)
+
+| File | What |
+|---|---|
+| `frames.c` | which frames cross (above), and the cut of a coalesced TCP frame |
+| `station.c` | the station the guest's driver talks to: its messages become calls on a radio back end, the radio's reports become messages |
+| `wlan.c` | the back end on the phone: the AF_PACKET socket, nl80211, wlan0's settings kept and given back. Three threads: frames, nl80211 events, control. The guest's vCPU only sends a frame or queues a message; netlink, binder and the join's timeouts are the control thread's |
+| `sim.c` | a made-up radio (`wifi=sim`) |
+| `supplicant.c` | the supplicant's client: the lookup, the interface, the callback object, the join's plan and its outcome |
+| `aidl_parcel.c`, `aidl_binder.c` | stable AIDL over `/dev/binder` with no Android library (xnuhost is static): the interface token (strict mode word, work source, `SYST`), `String` as UTF-16, `byte[]`, binder objects with the stability word (VINTF 0x3f), the status header of a reply; the kernel's binder protocol, one looper thread for the calls into our callback, death notifications |
+| `tools/wifictl.c` | the bridge without xnuhost: `status`, `scan`, `join`, `restore` (`runtime/bridges/README.md`) |
+
+xnuhost: `wifi=auto` (the default; `xnuhost.conf` or `--set wifi=...`) takes wlan0 when the bridges are on, `wifi=off`
+makes no network device, `wifi=tap` is the old route, `wifi=sim` is `sim.c`: a made-up radio with two networks
+("OneiOS open", and "OneiOS WPA2" with the passphrase `password`) for a boot on a PC, where the guest's side can be
+run and read in the log; no frame goes anywhere (unit-tested; not yet run in a boot). Log lines: `wifi: wlan0 is iOS's for the session: ...`, `wifi:
+on: wlan0 (..) is the guest's en0`, `wifi: the vendor's supplicant is the bridge's`, `wifi: the guest's driver is up`,
+`wifi: join: network N in the supplicant, WPA2 (passphrase): selected`, `wifi: supplicant: <state>`, `wifi: join done`
+or `join failed (status S, code C)`, `wifi: link down (reason R)`, `wifi: closed (...)`, `wifi: wlan0 given back`.
+
+Old (only with `wifi=tap`): `runtime/bridges/net/net.c` (tap `oneios0`, DHCP answered in the bridge: 192.168.77.2/24)
+and `runtime/bridges/net/oneios-net.sh` (NAT). The script's `ip rule del priority 16000` would delete netd's own rule
+of that priority (netd's `fwmark 0x10063/0x1ffff iif lo lookup local_network` is at 16000 on this phone) when ours is
+absent: a reason not to run it on the phone as it is.
+
+### Tested
+
+- Host (arm64 Linux container, `runtime/host-tests.sh`): `test_wifi` 162 checks (frame rules; the netlink group reader; the nl80211 band reader (`OW_CHANNELS`); the DHCP reader, with the REQUEST forms
+  SELECTING, INIT-REBOOT, RENEWING and REBINDING, iOS's and another station's, and the log line of each; a 4000-byte coalesced
+  IPv4 frame and a 3000-byte IPv6 one cut into three with right lengths, sequence numbers and checksums; the station
+  against a fake radio; the AIDL parcels byte for byte; the join's plan for WPA2, WPA3, transition, WPA with TKIP,
+  open, OWE and a network not seen; the supplicant's callbacks decoded); `test_aidl_binder` 35 checks: the client
+  against a fake service manager and supplicant in another process on a real binder driver (a lazy service found on
+  the third lookup, the interface added and removed, the callback's descriptor and version asked for inside
+  `registerCallback`, a join, a wrong key, a network not found, a rejection, a link that drops, a look without a
+  callback, a supplicant that dies). Both ends of that test use `aidl.h`.
+- **Third session (2026-11-12, about 14:00, with `04ab894`)**: the networks show in Settings (`scan done: 64
+  networks`, `event 10 for en0, 0 bytes -> 0`, `wifid[41] gets 11: len 2280 -> 0` for each). The owner joined an
+  open network: `join: layout 656, authentication lower 0x1 upper 0x0, key of 0 bytes of kind 0`, xnuhost `join:
+  network 0 in the supplicant, open: selected`, `supplicant: scanning`, 2.9 s later `associating`, `associated`,
+  `completed: joined`, `join done (status 0, code 0)`, the guest `join done: joined`. At the return: `wifi: wlan0
+  given back: IPv6 off, GRO on` and `wifi: closed (96 frames to the guest, 45 from it, 0 cut, 0 dropped, 0 refused)`:
+  **the join through the vendor's supplicant, frames both ways and the give-back work.** Not working, fixed after it:
+  - **ASSOC_DONE was not posted**: `event 9 for en0, 540 bytes -> 40` (`EMSGSIZE`): a kernel event must fit one
+    mbuf. Settings stayed at "connecting". Hosted patch `0049-wifi-association-event.patch` lets an IEEE 802.11
+    event of Apple's fill an mbuf cluster (UniXNU-sheng's patch for the same event).
+  - **Two scans ended by the guest's 10 s timeout** (`scan: no end from the host in 10000 ms`): a scan's records
+    and its end are up to 65 frames in one burst, the guest's receive ring has 64 buffers, and the frame that found
+    no buffer was dropped: the end. The virtio-net device now holds a frame of the station's own type (0x88b5) for
+    up to 50 ms until the guest has a buffer; and in the guest a state message that says "up" for the network a
+    join waits for completes that join, so a lost result costs at most the 2 s to the next state.
+  - Whether iOS got an address is not in that log. The bridge now logs iOS's DHCP as it crosses (`wifi: DHCP: iOS
+    sends DISCOVER for 0.0.0.0`, `wifi: DHCP: OFFER of a.b.c.d from e.f.g.h`, `iOS sends REQUEST SELECTING for
+    a.b.c.d`, `ACK of a.b.c.d from e.f.g.h`; a REQUEST's state as RFC 2131 4.3.2 tells them apart: SELECTING,
+    INIT-REBOOT, RENEWING, REBINDING) and, 10 s after a join, `wifi: 10 s after the join: N frames from iOS, M to it;
+    K DHCP messages of other stations`.
+  - **`DHCP: REQUEST of 0.0.0.0 from 0.0.0.0`, repeated** (the boot before 2026-11-12 23:45, after the join and the
+    ACK of 172.16.235.71): not iOS's renewals and not a wrong offset. The decoder read the BOOTP header right; the line
+    was the one for a message **from the radio** (iOS's own were logged as `iOS sends ...`), and it printed yiaddr and
+    option 54, which a REQUEST never has (yiaddr) or has only in the SELECTING state (option 54). So each such line was
+    an INIT-REBOOT or REBINDING REQUEST broadcast by another station on the network (a RENEWING one is unicast to the
+    server and does not reach iOS): proven for the decoder by `test_wifi`'s DHCP checks (the three forms, built as
+    clients send them, all decode with yiaddr 0.0.0.0 and no server); that they were other stations' is [I] (their
+    client address was not logged). They also used up the 16 lines a join gets, so iOS's own later messages were not
+    logged. Since 2026-11-13 a message whose client (chaddr) is not en0's address is counted, only the first after a
+    join is logged (`wifi: DHCP: another station's REQUEST INIT-REBOOT for a.b.c.d (client 3c:22:fb:..) (passed to iOS
+    as any broadcast; ...)`), and the count is in the 10-second line; iOS's own message back from the radio would say
+    `iOS's own REQUEST ... came back from the radio`.
+- **Second session (the diagnostic session of 2026-11-12 11:53, `kernel.kc` 8eff915f from `bd7c1fb`, with the
+  medium fix)**: wifid takes en0 (`the interface is enabled (en0 is up)`, its whole attach: CARD_CAPABILITIES, POWER,
+  RSSI_BOUNDS, HW_SUPPORTED_CHANNELS, `sets 564` FILTER_MONITOR_EVENTS with 33 bytes, STATE, PHY_MODE, OP_MODE ...)
+  and scans: `wifid[41] sets 10: len 5528 -> 0`, and 8 s later `scan done: 45 networks (host error 0)`. But it never
+  fetched the results (no `gets 11`), twice. Two causes, both fixed after it:
+  - **No IEEE 802.11 event of the driver was ever posted.** The driver (as DroidVMWifi.inc) posted with
+    `kev_msg_post`, the function for kernel extensions, which refuses every vendor code that is not a registered
+    third party's: `KEV_VENDOR_APPLE` gets `EINVAL`. The kernel's own `kev_post_msg` is the one (UniXNU-sheng's
+    driver uses it). So SCAN_DONE never reached IO80211.framework's event reader (`_eventRead`: the event's first 16
+    bytes must be the interface's name, its code must be one the client monitors; for SCAN_DONE it then fetches
+    SCAN_RESULT records of 2280 bytes until `EIO`). The driver now logs the first events with their outcome.
+  - **The bridge listened to the wrong nl80211 group**, so each scan ended by the 8 s timeout and not by the
+    radio's event: the kernel writes a multicast group's id before its name, and the reader kept "the last name
+    seen", which gave it the id of the group after `scan` (`regulatory`). Fixed and unit-tested
+    (`br_wifi_nl_group`).
+- **First session with it (prelink's session 2, 2026-11-12 10:28, `kernel.kc` 66faa3e8 and runtime 0.1.8-dev from
+  `924a0d9`)**: worked: `ONEIOS WIFI: classes registered ...`, `on: the phone's Wi-Fi, address a6:a4:20:b8:00:0c`,
+  `the host has the phone's radio`; xnuhost: `the vendor's supplicant is the bridge's: joins by its AIDL service`,
+  `the guest's driver is up; it gets the radio` (so the binder client, the callback registration and the station's
+  messages on the virtio-net queues work in a session). Did not work: no scan. 41 requests reached the driver in 20
+  minutes, the first 261 s after the driver's start (en0 is named that late: for the owner of the boot), none of
+  them a scan or wifid's attach sequence. Cause: the media rule above. Not seen yet with the fix.
+- **On the phone, beside One UI (2026-11-12, SELinux Enforcing, no policy change)**: `wifictl status`: the service
+  manager's lookup, `getStaInterface("wlan0")`, `getMacAddress` (wlan0's own address), `listNetworks` (0) all
+  answered by Android 17's servicemanager and the vendor's supplicant; `wifictl scan`: 53 networks with their
+  security from nl80211 in 6 s.
+
+### en0 late: two minutes before iOS turns Wi-Fi on (fix-wifi-late, 2026-11-13)
+
+On the phone (boot of 2026-11-12 23:45, main ea06d46, kernel.kc through 0058, the Data store kept) xnuhost had wlan0
+from +0.1 s, but `ONEIOS WIFI: the interface is enabled (en0 is up)` came at +130 s (+162 s the boot before, 261 s
+after the driver's start in prelink's session 2), while the join and DHCP took 2 s. What it waited for, read in 24A446
+and configd's source (configd's `Plugins/InterfaceNamer`, apple-oss-distributions):
+
+1. **configd's InterfaceNamer names a new interface only once IOKit is quiet** (`copyUnitForEstablishedInterface`:
+   `waiting for quiet`). An interface is not new when its naming database (`NetworkInterfaces.plist`) has its prefix
+   and hardware address, or when the IORegistry reserves a unit for it: `network-interface-unit-en` on the interface
+   or a parent. 24A446's `WaitQuietTimeout` is 240 s and `WaitStackTimeout` 300 s (configd's `__data`; the bundle's
+   Info.plist sets neither).
+2. **en0 was always new.** Its address is wlan0's, a random one while One UI is not joined, so it changes between
+   sessions and the database did not match it ([I]: the phone's `NetworkInterfaces.plist` was not read; the
+   database is also written only once IOKit is quiet, so a session that ended earlier left none). The iPhone's own Wi-Fi node reserves the unit (24A446's device tree:
+   `/arm-io/apcie/pci-bridge0/centauri-alpha`, `network-interface-unit-en = <0>`); our nub `oneios-wlan` did not.
+3. **IOKit is quiet only after driverkitd.** The only busy service is the service root, `oneios,xnuhost` (class
+   `IOPlatformExpertDevice`; 0042's `oneios-iobusy:` lines on the PC at 30, 60, 120, 240 s and on the earlier PC boot
+   until between 240 and 480 s): `StartIOKitMatching` holds one busy count on it until the IOKit daemon (driverkitd
+   on iOS) has sent its dexts' personalities (`IOService::iokitDaemonLaunched`; the kernel then logs `KextLog:
+   driverkitd is active`). So en0's name, and with it wifid's attach and the `enable` of en0, waited for driverkitd,
+   which on the phone runs in the first two busy minutes (lsd, backboardd, iconservicesagent). [I] That driverkitd's
+   time is the +130 s: the phone's log of that boot was not read here; the lines to read are below.
+
+**Fix (merged in #8; on the phone on 2026-11-13 it did not make Wi-Fi earlier, below):** the nub has `network-interface-unit-en = <0>` (32 bits), as the
+iPhone's node, so InterfaceNamer names en0 as soon as the interface appears (`OneiOSWifi.cpp`, `net/README.md`, "en0's
+name"). InterfaceNamer still refuses the unit when its database has en0 at another registry path (`builtinAvailable`;
+configd then says `has reserved unit 0, but it's not available`). No XNU source changed, so no numbered patch.
+
+**New lines** (the driver): `ONEIOS WIFI: first naming (en0 attached to the network stack): by configd[PID], +S s
+after the driver's start, IOKit busy N`, and the same `first ...` line for `enable (IFF_UP)`, the first `Apple80211
+request`, `power on`, `scan request`, `join request` (who, when, IOKit's busy count).
+
+**On the PC** (qemu-aarch64 under a load of 12-24 on 4 CPUs, `--set wifi=sim`, so every time is many times the
+phone's), the image set `out/image-pc/24A446`, a Data store with no naming database (no earlier boot on it got as
+far as naming):
+- With the fix (`kernel.kc` `ee5a85d7`, from this branch; times after the driver's start): launchd +769 s, configd
+  spawned +834 s, `KextLog: driverkitd is active` +872 s, `first naming ...: by configd[34], +1009.874 s ..., IOKit busy
+  0`, `first Apple80211 request: by configd[34], +1142 s`, `first enable (IFF_UP): by configd[34], +1144.6 s` (so
+  IPConfiguration in configd brings en0 up, not wifid), wifid's first request +1350 s (its attach: 12, 19, 106, 254,
+  207, 103, `sets 564` ...), `first scan request: by wifid[40], +1775 s`, `scan done: 2 networks` (the made-up
+  radio). configd's own log (read from the running boot's `data.img` with `oneios-tool ioslog show ... --proc
+  configd`): `copyUnitForEstablishedInterface: <SCNetworkInterface ... address = 02:d7:36:0c:64:80, builtin = TRUE, path
+  = IOService:/IOResources/oneios-wlan/OneiOSWifiController/IO80211Interface ...> has reserved unit 0`, then `Known
+  interface named unit = 0`, and `*QUIET*` only after that: **the reserved-unit path is taken**. On the PC driverkitd
+  was done before configd's InterfaceNamer started (configd's plugins load slowly under qemu), so this boot cannot show
+  the time the fix saves; the phone's order is the open question (below).
+- Without it (`kernel.kc` `ee88c1b1`: the same `first ...` lines, no reserved unit): the boot was stopped by its
+  4200 s `timeout` with configd running for about 1300 s, driverkitd not yet active, and no naming. Consistent with
+  `waiting for quiet`, not proven: configd's log of that boot was not on the volume after the kill.
+- driverkitd on 24A446 does not ask LaunchServices on this hardware (`Hardware does not support third party
+  drivers`, `Using cached application list`, in its log of both PC boots), so lsd is not what it waits for.
+
+**On the phone (2026-11-13 ~10:50, main c1223f8 with the fix, runtime 0.1.9-dev, `kernel.kc` `4b9a91ae`): the fix
+did not make Wi-Fi earlier.** Guest seconds: the driver's start 787.6, launchd 809.9, first frame 832.3; `first naming
+...: by configd[34], +111.079 s ..., IOKit busy 0` (898.7, launchd + 89 s), `first Apple80211 request: by configd[34],
++129.3 s`, `first enable (IFF_UP): by configd[34], +131.1 s` (918.8), `first scan request: by wifid[40], +200.8 s`
+(988.5), then scans of 20 to 39 networks (host error 0). The 0.1.8 boot had en0 up at +128 s. IOKit was already quiet
+at the naming, so in this boot InterfaceNamer did not wait for driverkitd: the wait is elsewhere in configd, before
+InterfaceNamer names en0 (configd's open source, `plugin_support.c` and `ifnamer.c` at its main branch, not 24A446's build: the plugin thread first loads every plugin
+bundle, dlopen()ing the ones that are not built in (IPConfiguration, EAPOLController and the others outside configd's
+binary), then calls the `load()` functions in its allow-list order, InterfaceNamer's first; that starts the
+`InterfaceNamer thread`, which reads `NetworkInterfaces.plist` (`*START*`), opens IONetworkStack (`*STACK*`), and names
+the interfaces that have arrived, while PreferencesMonitor's `load()` runs `__SCNetworkConfigurationUpgrade` on the
+plugin thread; the two share the SCPreferences locks). The PC shows the same shape, many times slower: configd spawned +834 s, named +1010 s, `IFF_UP` +1145 s,
+wifid's first request +1350 s, first scan +1775 s. What holds configd for those 89 s on the phone is not known yet [U];
+the next boot's lines below say it. No join came by +275 s; whether a known network was in range is open (the owner
+was asked; 35 networks against the hotel's 64).
+
+**Where configd was, on the PC** (2026-11-13, `kernel.kc` `84d3304c` with 0061, `oneios-ubt=configd
+oneios-ubt-at=850 oneios-ubt-every=45 oneios-ubt-count=6`, a fresh Data store; six reports, then `oneios-ubt: 6
+reports, the last (oneios-ubt-count)`). configd was spawned about 625 s after the driver's start and named en0 at
++1568 s; its two threads, named with `oneios-tool sym` (slide `0xbb54000`):
+- reports 1 and 2 (+850, +895 s): the main thread in `_os_state_add_handler` -> `__os_trace_init_slow` ->
+  `_firehose_client_reconnect` -> `_firehose_send_register` -> `mach_msg`: **waiting for logd** to register its log
+  buffer (logd's first lines came after configd's in that boot);
+- reports 3 to 6 (+940 to +1075 s): the main thread **loading the plugin bundles**: `CFBundleLoadExecutableAndReturnError`
+  -> dyld `dlopen_from` -> `notifyLoad` -> libobjc `map_images_nolock`, mostly in state 0x9 (an uninterruptible wait;
+  [I] page-ins of the bundle's pages), and the second thread, configd's server (`_dispatch_mach_mig_demux`), waiting
+  in `objc_lookUpImpOrForward` for the Objective-C runtime lock the load holds: **configd's server does not answer
+  its clients** (wifid, IPConfiguration's own clients) while a plugin bundle loads.
+[I] The phone's 89 s are the same two waits (logd, the bundles' load under the first minutes' CPU and storage load);
+the next boot's reports say. The PC cannot rank them for the phone.
+
+**wifid's `sets 25` -> 102** is `APPLE80211_IOC_HOST_AP_MODE` (24A446's table; the PC's iOS log names it: `IOCTL
+type 25/'APPLE80211_IOC_HOST_AP_MODE', len[0] return -1`, the framework's `-3903`). 102 is `EOPNOTSUPP`: the driver
+refuses the access point modes on purpose (`kRefusedSets`, bit 25), and wifid goes on with its attach and scans after
+it (PC and phone). Right as it is.
+
+**Who brings en0 up and what starts a join** [F 24A446, PC boot]: configd's IPConfiguration sets `IFF_UP` (the
+`first enable` line names configd) after its first Apple80211 requests (`gets 12` CARD_CAPABILITIES, `gets 1` SSID),
+not wifid. wifid joins only by its auto-join: a network of its known-networks store
+(`/private/var/preferences/com.apple.wifi.known-networks.plist` on the Data volume) that the last scan has; with none
+in range it scans and does not join, which is iOS's normal behaviour. Its log says which (`AUTO-JOIN:` lines; the
+PC's first auto-join was `trigger=power_on`, then `Cancelled active auto-join request` with no known network). wifid
+also has an auto-join deferral (`AJDeferralTimer`, `in autojoin deferral period`, `Auto-join deferral is active, will
+not continue auto-join`) and first-unlock rules (`enabling autojoin before first unlock`): its log tells those apart.
+
+**For the next phone boot**, in the image's `xnuhost.conf` boot arguments: `oneios-ubt=configd,wifid,logd oneios-ubt-at=20
+oneios-ubt-every=10 oneios-ubt-count=18` (hosted 0061: a report of every configd and wifid thread every 10 s from +20 s
+to +190 s after bsd_init, each headed `oneios-ubt: report K at +S s`), and `oneios-sysfail=configd` (0034: its failing
+path calls). Then:
+- `oneios-tool sym` on the `oneios-ubt: configd[34] thread ...` lines of the reports before `first naming`: the thread
+  named `InterfaceNamer thread` and configd's plugin thread show where they wait (an SCPreferences lock, a plugin's
+  `load()`, an IOKit call, a Mach message to another daemon); the same for wifid between `first enable` and `first
+  scan request`.
+- `xnuhost.log`: `first naming`, `first Apple80211 request`, `first enable`, `first scan request` against launchd's
+  start and the `oneios-ubt: report` times; `KextLog: driverkitd is active`; `wifi: join` / `ONEIOS WIFI: join:` if a
+  join comes.
+
+**Searches in iOS's own log** (`oneios-tool ioslog show data.img --boot last --sort ...`; the times of configd's
+`addTimestamp:` lines are its own clock, `CFAbsoluteTime`):
+- `--proc configd --grep 'addPlugin|loading |adding |load failed|InterfaceNamer|addTimestamp|STACK|QUIET|COMPLETE|reserved unit|Known interface|waiting for quiet|Assigned unit|lock held|lock delayed|Hardware model changed|Network configuration|currentSetExists'`:
+  when configd started, when InterfaceNamer started (`*START*`), when it had the stack (`*STACK*`), when en0 was named,
+  and which SCPreferences lock was held for how long.
+- `--proc configd --grep 'IPConfiguration|en0|DHCP|link'`: when IPConfiguration started the en0 service and brought
+  it up.
+- `--proc wifid --grep 'Now attempting to add AirPort Interface|WiFi network interface added|AUTO-JOIN|deferral|Deferral|first unlock|First unlock|known network|KnownNetwork|power|Power|scan'`:
+  when wifid took en0, why its first scan came 70 s after `IFF_UP`, and what its auto-join found (a known network in
+  range or none).
+- `--proc wifid --type error,fault` and `--proc airportd`: anything that failed.
+- The known networks themselves: copy `/private/var/preferences/com.apple.wifi.known-networks.plist` out of the Data
+  volume (`oneios-tool image apfs-copy --volume 2 --newest data.img /preferences/com.apple.wifi.known-networks.plist DIR`:
+  the Data volume is `/private/var`) and compare its SSIDs with the scan.
+Not checked without the phone: everything in this list; whether the phone's configd waits on the same thing the PC's
+does.
+
+### Wi-Fi does not join: every scan result filtered out (fix-wifi-join, 2026-11-13; partly done)
+
+**The phone** (c1223f8 session, iOS's own log): wifid knows 2 networks (`Fetched 2 known networks from the cache`),
+auto-join scans (`AUTO-JOIN: Discovering known networks (maxScanCycles=1, maxScanChannelCount=3, maxScanSSIDCount=9,
+minRSSI=-80)`), and CoreWiFi drops every result: `CWFFilteredScanResults ... All scan results are filtered out.
+mutableScanResults count: 0, scanResults count: 1..7` (32 times), `AUTO-JOIN: Scan Results (0)` (21) and `Scan Cache
+Results (0)` (12); also `Could not read APPLE80211_IOC_CHANNELS_INFO err=-3903` (13) and 17 wifid entries of the fault
+type (their messages were not read here).
+
+**Read in 24A446** (the dyld cache, with `ipsw dyld disass/xref/str` and `ipsw class-dump`; nothing of Apple's kept):
+- `_CWFFilteredScanResults` (CoreWiFi) drops a result for, in this order: `age` above the filter's `maximumAge` (when no
+  `minimumTimestamp`), `timestamp` below `minimumTimestamp`, `RSSI` below `minimumRSSI`, a channel (number and band) not
+  in `channels`, a FILS discovery frame, not in `includeScanResults`, a background scan result, a hidden network, BSS
+  type, SSID, short SSID, network-name prefix, the predicate, duplicates and the merge policy. Each reason has its own
+  line (`[corewifi] Filtering based on maxAge (...)` and so on) at the info level, so the phone's log, which keeps the
+  default level, does not have them.
+- `-[CWFScanResult timestamp]` is the scan record's `TIMESTAMP`; `-[CWFScanResult age]` is
+  `(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - timestamp) / 1000000` (ms).
+- IO80211.framework's `__addScanResultToList` reads `AGE` (32 bits) at 0x84 and **`TIMESTAMP` (64 bits) at 0x8d0** of the
+  2280-byte record (this doc called it "an address" before), plus a byte at 0x8d8 and 32 bits at 0x8dc when a
+  property of its own is set. Our driver leaves 0x8d0 zero, so every result's `age` is the phone's uptime.
+- Auto-join (`-[CWFAutoJoinManager __performScanWithChannelList:SSIDList:passive:dwellTime:maxCacheAge:cacheOnly:...]`)
+  calls `setMaximumAge:` on its filter twice right before `_CWFFilteredScanResults`.
+- So [I, strong; the info-level reason line would prove it]: **every result fails the `maxAge` filter because its
+  `TIMESTAMP` is 0**. The Settings list does not filter by age, which is why networks showed there.
+- `APPLE80211_IOC_CHANNELS_INFO` (207, refused by our driver): IO80211's `Apple80211GetWithIOCTL` reads a 10016-byte
+  record: the count (16 bits) at 0x0c, then per channel i (at most 400) the number at 0x32e+i, indoor-only 0x4be+i, DFS
+  0x64e+i, passive 0x7de+i, 40 MHz 0x96e+i, 80 MHz 0xafe+i (bytes), a 32-bit bitmap at 0x12d0+4i, a 6 GHz byte at
+  0x1aa0+i (`CHANNELINFO_BAND_NUM`: 1 with it, else 0 below channel 15 and 3 above). wifid reads CH_NUM, DFS,
+  BAND_NUM, 40MHZ and 80MHZ, and retries 6 times, 0.5 s apart, on EBUSY, ECONNREFUSED or -3905.
+- wifid's `sets 25 -> 102` is `APPLE80211_IOC_HOST_AP_MODE`, refused on purpose (see "en0 late").
+
+**Done here (host-tested, in the runtime):** the bridge sends the radio's channel list to the guest after `OW_HELLO`
+(`OW_CHANNELS`, `drivers/net/oneios_wifi_proto.h`): on the phone from nl80211 (a split `NL80211_CMD_GET_WIPHY` dump for
+wlan0, `br_wifi_nl_bands` in `frames.c`: each channel that is not disabled, with passive, radar, indoor-only, no-40
+and no-80 MHz flags), with `wifi=sim` a fixed list (38 channels). Log line: `wifi: N channels of the radio for the guest
+(F MHz to L MHz)`. The guest drivers of main ignore the message (an unknown type), so it is harmless until the driver
+below is in. `test_wifi`: 162 checks (the band parser on a constructed attribute tree, cut and split cases; the sim's
+channel message).
+
+**The guest driver's half** is in `OneiOSWifi.cpp` since the hand-over of 2026-11-13: it was kept as a diff until
+then, applied in the integration tree of that day and **compiled** in its kernel (`HOSTED_OUT=integ`, the prelink
+audit 0 failures, `stubs-check` 666 good); **not booted yet**. It: stamps each BSS with the continuous-clock time the radio saw it
+(`mach_continuous_time` in ns minus the host's `age_ms`) and writes it at 0x8d0 of every 2280-byte `SCAN_RESULT`
+(and "now" for `CURRENT_NETWORK`); answers `CHANNELS_INFO` from the host's list (built-in list until one came);
+builds `SUPPORTED_CHANNELS` from the same list (active unless passive, DFS flag 0x100 on radar channels); logs
+`the host's channels: N, F MHz to L MHz`, `channels info: N channels (the host's|the built-in list)` and once per boot
+`scan record 1 (...): channel, flags, RSSI, noise, SNR, capability, beacon, BSSID, name length, rates, age, TIMESTAMP ..
+(.. ms before now), element bytes`; the log line buffer grows to 384 bytes.
+
+**Next, in order:**
+1. Boot the PC with `--set wifi=sim` (a kernel built from `main`; the archive is `oneios-tool kernel gen net`):
+   `scan record 1` must show
+   a TIMESTAMP a few ms before now, `channels info: 38 channels (the host's list)`, and wifid's log (`ioslog --proc wifid`)
+   `APPLE80211_IOC_CHANNELS_INFO returned 38 channels in list` instead of `Could not read`.
+2. On the phone: a join to a known network in range. Lines: `ONEIOS WIFI: scan record 1`, `wifi: N channels of the
+   radio`, `ONEIOS WIFI: join: ...`; in iOS's log `AUTO-JOIN: Scan Results (N)` with N > 0 and `Found matching network`.
+   If results are still filtered: turn on CoreWiFi's info level for the session (or read `oneios-tool ioslog show
+   --type info`, if the store keeps it) for the `Filtering based on ...` reason.
+3. The 17 fault entries of wifid: `ioslog show --proc wifid --type fault` (their messages); not looked at yet.
+4. configd's 22 s between `*STACK*` and en0's name (InterfaceNamer): the next boot's `oneios-ubt` reports of configd
+   (0061) name where its InterfaceNamer thread is in those seconds.
+
+
+**On the phone with the driver's half (main 9f6dc38, 2026-11-14): Wi-Fi still "just keeps scanning".** The driver's
+side works: `scan record 1 (2280 bytes asked): channel 6 flags 0xa, RSSI -65, noise -95, SNR 30, capability 0x1431,
+beacon 100 TU, ..., age 2328 ms, TIMESTAMP 16830238088697 ns (3951 ms before now), 302 element bytes`, `channels info:
+63 channels (the host's list)`, 20 `scan done` of 7 to 25 networks (host error 0); `first naming` +96.5 s, `first
+enable` +134.0 s, `first scan request` +248.1 s after the driver's start. Still no `sets 20` (join).
+
+**Read for it (fix-wifi-join-2, 24A446's dyld cache):**
+- The record's numbers agree: age 2328 ms is the host's (nl80211's) at the moment the guest got it, TIMESTAMP is that
+  moment minus the age, and the record was asked for 1.6 s later (3951 ms). The clock: `TIMESTAMP` is
+  `mach_continuous_time` in ns (kernel), `-[CWFScanResult age]` is `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)` minus
+  it, and CLOCK_MONOTONIC_RAW is `mach_continuous_time` scaled by `mach_timebase_info`, which is the kernel's
+  `rtclock_timebase_const`, set from the same frequency as `absolutetime_to_nanoseconds` (`osfmk/arm/rtclock.c`); the
+  guest's timebase is not scaled on the phone (xnuhost gives the counter's own frequency, `droidvm-timebase-hz` unset).
+  [I] So the age CoreWiFi computes is the right one; not seen in a log.
+- Auto-join's filter (`__performScanWithChannelList:...`) is the scan's own `CWFScanParameters`: BSS type, PHY mode,
+  include-hidden, `addScanDurationToMaxAge`, the channels (the known networks' recent ones), the SSID list, dwell time,
+  scan flags and type, acceptable cache age; then `maximumAge` = the `maxCacheAge` argument, plus the scan's duration
+  in ms (CLOCK_UPTIME_RAW) when `addScanDurationToMaxAge`. The value of `maxScanCacheAge` comes from wifid's
+  auto-join parameters and was not found statically. A result seen during the scan is younger than the scan.
+- `_CWFFilteredScanResults` reads of each result: `age`, `timestamp`, `RSSI`, `channel` (number and band: CoreWiFi's
+  `channelWithNumber:band:width:` with width 0, the band from the channel flags; 0xa is 20 MHz and 2.4 GHz, right),
+  `scanFlags`-dependent background and FILS checks, `BSSType` (`isESS`/`isIBSS`: IO80211 makes `AP_MODE` 2 from the
+  capability's ESS bit, so 0x1431 is ESS), `SSID`, `shortSSID`, `networkName`, `isPasspoint`. Not the security, the
+  PHY mode or the known network's state: those come later, in auto-join's own candidate checks.
+- **Fixed here: `PHY_MODE` at 0x8e0** of the record (IO80211 reads 32 bits there after `AP_MODE`) was zero (no mode).
+  The driver now gives the modes the network's band, rates and elements show (`APPLE80211_MODE_11A` 0x2, 11B 0x4,
+  11G 0x8, 11N 0x10 with HT Capabilities, 11AC 0x80 with VHT Capabilities, 11AX 0x100 with the HE extension element),
+  in `SCAN_RESULT` and `CURRENT_NETWORK`, and `AGE` (0x84) is now the age as of the answer (now minus TIMESTAMP), not
+  the host's at arrival. `scan record 1` says `PHY 0x..` (the line is shorter since: `scan record 1 (2280 B): ch .. flags .. RSSI .. noise .. SNR .. cap .. beacon .. BSSID .. name .. B .. rates age .. ms TIMESTAMP .. ns (.. ms ago) PHY 0x.. IEs .. B`; the console cut the longer one at about 250 characters). [I] Whether PHY mode 0 was what auto-join refused: not
+  known (it is not one of the filter's checks; auto-join's scan sets a PHY mode of its own). On the PC: `scan record 1 (2280 bytes asked): channel 6 flags 0xa, RSSI -48, ..., age 34 ms, TIMESTAMP .. (34 ms before now), PHY mode 0xc` for the made-up 2.4 GHz network (11b and 11g; the line of that build was cut by the console after it).
+- **Fixed here: the reason becomes visible.** CoreWiFi's reason lines are at the info level, which the store does not
+  keep. Hosted 0070 (`oneios-log-persist=com.apple.WiFiManager`, off by default) writes the Data volume's logging
+  override before launchd so that info-level messages of that subsystem are kept (`kernel/patches/oneios-hosted/README.md`,
+  0070). On the PC it works: with `oneios-log-persist=com.apple.WiFiManager` iOS's log kept wifid's info-level `[corewifi]` lines (14 in the first minutes of a `wifi=sim` boot, none expected without it: the system has no preference of its own for that subsystem).
+
+**For the next phone boot:** `oneios-log-persist=com.apple.WiFiManager` in the image's `xnuhost.conf` (with 0061's
+`oneios-ubt=configd,wifid,logd oneios-ubt-at=20 oneios-ubt-every=10 oneios-ubt-count=18`). In `xnuhost.log`:
+`oneios-logpersist: com.apple.WiFiManager: info kept (...)`, `ONEIOS WIFI: scan record 1 ... PHY 0x..`. The Mac's
+manual tap of a network tests the join path apart from auto-join (`ONEIOS WIFI: wifid[..] sets 20` and `join: layout
+656 ...`).
+
+**Searches after the return** (`oneios-tool ioslog show data.img --boot last --sort`, plus):
+- `--proc wifid --grep 'Filtering based on|Filtering BG|Filtering FILS|Filtering hidden|Filtering duplicate|All scan results are filtered out'`:
+  the reason for each dropped result (needs 0070's file; otherwise add `--type info` and see whether the store kept any).
+- `--proc wifid --grep 'AUTO-JOIN: (Discovering|Scanning|Scan Channels|Scan Hidden|Scan .*Results|-- |Found matching|Skipping)'`:
+  what auto-join scanned for (the channels and hidden SSIDs it asked), what came back, and why a candidate was skipped.
+- `--proc wifid --grep 'age=[0-9]+ms'`: CoreWiFi's own description of a result (`age=%lums (%llu)`, the age and the
+  timestamp it computed); an age of hours would be a clock mismatch after all.
+- `--proc wifid --grep 'known networks|KnownNetwork|disabled|lastJoined|autoJoin'`: the 2 known networks and whether
+  either is disabled for auto-join.
+- `--proc wifid --grep 'ASSOCIATE|Apple80211Associate|join'` and xnuhost.log's `sets 20`: the join path, for the manual
+  tap.
+- `--proc wifid --type fault`: the 17 fault entries' messages.
+- The known networks: `oneios-tool image apfs-copy --volume 2 --newest data.img /preferences/com.apple.wifi.known-networks.plist DIR`
+  (the Data volume is `/private/var`), then compare their SSIDs and channels with the networks in range (the last
+  `wifi:` scan lines, or `wifictl scan` in One UI).
+
+**iOS's own log of the same session: auto-join is off by the user's setting** (`AUTO-JOIN: Auto-join aborted (...
+error=(1 'Auto-join is disabled by user (and not in priority link setup)'), reason=DisabledByUser)` 19 times,
+`WiFiManagerGetUserAutoJoinState: user auto join state 0` 18 times and `... state 1` 19 times, `WiFiManagerIsAlwaysOnWiFiEnabled:
+user auto-join disabled.` 14 times; `CWFFilteredScanResults` no longer among the top lines). Read in 24A446's wifid
+(`/usr/sbin/wifid`, `llvm-objdump` and its strings): `WiFiManagerSetUserAutoJoinState(manager, state, trigger)` has 10
+callers. All but two set it to 1, each with its own log line: trigger 1 and 6 and 8 (enabling paths), 2 `Forcing
+auto-join to be enabled for network %@`, 3 `reseting user auto join due to restart` and `... after first unlock due to
+device restart`, 4 `enabling user auto join due to motion state`, 5 `enabling user auto join due to time (date: %@)`.
+**Only trigger 0, a client's request over XPC, sets it to 0**, logged as `Set user auto join enabled requested by "%@"
+enabled %d` (the client's name in the quotes; Control Center's Wi-Fi button is such a client: its strings `Control
+Center`, `Control Center/3rd Party Client`, `Control Center Widget`, `ControlCenterToggled: state:%d`). The state is
+kept in wifid's plist with the place and date of the disabling (`UserAutoJoinState`, `UserAutoJoinDisabledLoc`,
+`UserAutoJoinDisableTimestamp`), so it survives the session in the kept Data store; wifid turns it back on by itself by
+time, by motion or by a new location (location needs location services: [I] ours may never give one). Nothing of
+ours sets it: no driver request or event reaches that setter. [I] The 0 came from a tap of Control Center's Wi-Fi
+button (which on iOS means "disconnect, no auto-join until tomorrow") in this or an earlier session; the client's line
+says it.
+
+**`maxScanChannelCount=-1`** (3 before #22): -1 is "no limit": with the channel list from `CHANNELS_INFO` (63) auto-join
+may scan all of them. [I] Right; it was limited to 3 while wifid had no channel information.
+
+**For the Mac, after the return** (`oneios-tool ioslog show data.img --boot last --sort --proc wifid`, plus):
+- `--grep 'Set user auto join enabled requested by|user auto join state [01] trigger|ControlCenterToggled|control center state changed'`:
+  who turned user auto-join off and when, and each change with its trigger number (0 a client, 1-8 the enabling paths
+  above).
+- `--grep 'date to enable user auto join|disabled location for user auto join|enabling user auto join due to'`: when
+  wifid will turn it on again by itself.
+- To turn it on now: in iOS, tap Control Center's Wi-Fi button once more, or turn Wi-Fi off and on in Settings, or tap
+  a network in Settings (a manual join does not need auto-join).
+- **Is a known network in range** (without sending the names anywhere): copy the store's
+  `/preferences/com.apple.wifi.known-networks.plist` (`oneios-tool image apfs-copy --volume 2 --newest data.img
+  /preferences/com.apple.wifi.known-networks.plist DIR`) and read it on the Mac (`plutil -p`). For each of the 2 entries
+  (`wifi.network.ssid.NAME`): its `SSID`, its security (`SupportedSecurityTypes` or the profile's security keys), its
+  `BSSList` channels, `AddedAt`, `JoinedBySystemAt`, `JoinedByUserAt`, and any `Disabled`, `AutoJoinDisabled` or
+  `__OSSpecific__` auto-join keys. Compare the SSIDs with the networks One UI sees at the same place (`wifictl scan` on
+  the phone in One UI prints each network's name and security) or with iOS's Settings list. What the answers mean: no
+  known SSID in the scan: nothing to join, iOS behaves as designed. A known SSID in range but `AutoJoinDisabled` or
+  `Disabled` set: iOS will not join it by itself (a per-network setting). A known SSID in range, enabled, and user
+  auto-join back at 1, but still no `sets 20`: a fault on our side; then the `Filtering based on` lines (0070) and the
+  `AUTO-JOIN: Skipping` lines say why.
+
+### Settings uses a full core while the password sheet is open (fix-settings-wifi-cpu, 2026-11-15)
+
+**The phone** (main 3233fed, 2026-11-15): `oneios-cpu: 10 s: Preferences[181] 106-111%` for minutes (kernel share 20-25 %),
+backboardd 30-50 %, kbd 18 %, typing lags; touch is not it (`706 HID events queued ... 0 dropped`, 0.4-0.7 ms).
+Preferences' top messages in iOS's log: 724 pairs of `ProcessSignpostStart/End [com.apple.UIKit:TableView]`, 493
+`Create send gesture actions`, 17 `Error __WiFiManagerClientAddDevice: for device ... using server port`, 8 `WiFi
+Sharing functionality not available from Sharing`; 63 `AUTO-JOIN: Scan SUCCEEDED` in the session; `ONEIOS WIFI: event
+10 for en0` among the driver's first 24 events.
+
+**What our side sends, read in the code and in 24A446 (proven unless marked):**
+- **Event 10 is `APPLE80211_M_SCAN_DONE`** (1 POWER_CHANGED, 2 SSID_CHANGED, 3 BSSID_CHANGED, 4 LINK_CHANGED, 9
+  ASSOC_DONE). The driver posts it once per scan of the host's, and only for a scan a client asked for (`SCAN_REQ` 10 or
+  `SCAN_REQ_MULTIPLE` 86); a request while a scan runs gets that scan's one event. On the PC with main's driver
+  (`wifi=sim`, 2026-11-14) wifid asked for 33 scans in 102 s, in pairs 0.1 s apart every 6.1 s, and got 33 SCAN_DONE: the
+  event rate is wifid's request rate, one for one. On the phone the 63 auto-join scans match. No BSSID, RSSI or link
+  event is posted outside a join or a leave (SSID_CHANGED, BSSID_CHANGED and LINK_CHANGED only when the link was up,
+  ASSOC_DONE once per join), and the host's 2-second `OW_STATE` while joined posts nothing.
+- **Who asks: locationd, two scans every 6 s, for ever** [F, the PC boot of this branch, iOS's own log]: every scan
+  request in the boot was wifid's `Async scan requested by "locationd" for 1 iterations with maxage=0` (116 of 116 in
+  the first minutes of scanning), a 2.4 GHz scan of channels 1, 6, 11 and then one of 2 to 13 0.1 s later
+  (`WiFiDeviceManagerIs5GScanRequest: 2GHz Scan request because channel 1|2 is requested`). locationd's Wi-Fi
+  positioning gets no fix (`@WifiAps, lookiter, ..., notindb`, `@WifiFlow, outcome, nofix`, `wifi fix is insufficient as
+  it is invalid`: its access point database has none of them and there is no network to ask) and no GNSS to fall back
+  on, so it sets the next scan 6 s on (`@WifiTimer, set, locreq, 6`, `WifiTimer, nextscan, ..., haveLoc, 0, codepath,
+  Unassociated`), with location services off system-wide (`location disabled system-wide, denying executable ...`,
+  `BigSwitch 0`); its Wi-Fi provider was started by its own location controller (`WlpReg, 1, loccontroller`,
+  `@ClxProvider, start, wifi, desiredAccuracy, 100.0`; which client holds it is private in the log). Each answer goes
+  through wifid's whole scan path (`{SCAN+} Attempting Apple80211ScanAsync`, `WiFiScanObserver ingestScanResults`,
+  `WiFiSettlementObserver _handleScanResults`, `Locationd scan done.`). The rate line of that boot, every minute for 8
+  minutes: `events 10x20; scans asked 20 (started 20, joined 0, refused 0), done 20 (2 networks), ...; records 40; power
+  sets 0 (changed 0); by wifid 20/40`. [I] On the phone, where a radio scan takes seconds, that is a radio that scans back
+  to back, and auto-join's, Settings' and a join's commands wait in wifid's queue behind them.
+- **Fixed: a scan request within 8 s of the end of the last good scan gets that scan's records again** (their own
+  ages and TIMESTAMPs, so an age filter sees how old they are), its SCAN_DONE 20 ms later (IO80211 marks the async scan
+  pending around the ioctl), and no radio scan. The rate line counts them as `reused`. A scan that timed out or failed,
+  and power off, end the reuse. The events stay one per request (wifid asked for each): what goes is the radio time.
+  The PC boot with it (`wifi=sim`, kernel.kc d846437d), 5 minutes of rate lines: `events 10x20; scans asked 20 (started
+  5, reused 15, joined 0, refused 0), done 20 (2 networks), timed out 0; records 40; ...; by wifid 20/40` (18 and 19 in
+  two of them): 5 radio scans a minute instead of 20, and every request still ended in wifid (`Async scan requested by
+  "locationd"` 49, `Completed Apple80211ScanAsync` 48 with the 49th running, no `Thread mismatch` or `scan loop
+  unexpected exit`), each reused answer read in full (2 records and the EIO).
+- **Rates, before and after, on the PC** (`wifi=sim`, SCAN_DONE and radio scans per minute): main's driver 19.5 and
+  19.5 (2026-11-14: 33 in 102 s); the first commit (per-reader cursor, power and no-radio fixes) 20 and 20; with the
+  reuse 20 and 5. POWER sets: none in any PC boot (nobody turned Wi-Fi off and on). Not run on the phone.
+- **On the phone, the lines that prove it**: `ONEIOS WIFI: 60 s: ... scans asked N (started S, reused R, ...)` with S
+  about one per 8 s at most while locationd scans, `events 10xN` equal to `scans asked` minus `refused`, power events
+  only with `(changed N)` and `power 1 (as it was: no event)` for a set that changed nothing; in iOS's log
+  (`ioslog --proc wifid --grep 'Async scan requested by'`) who asks, and `--proc locationd --grep 'WifiTimer, set'` its
+  interval. [I] Whether Preferences' load falls with it is for that session's `oneios-cpu:` lines.
+- What a SCAN_DONE does in a client [F, IO80211.framework `_eventRead`]: a client with an asynchronous scan of its own
+  pending reads the records (`_getAsyncScanResults`: `SCAN_RESULT` until `EIO`, which is the expected end); any other
+  client that monitors the event gets its callback with code 10 and no data. The event goes to every client's event
+  socket (wifid, wifip2pd, ...).
+- **Fixed: one `SCAN_RESULT` cursor for every reader.** Two loops that ran together split the list between them, and a
+  loop that stopped early made the next one start in the middle, so a reader could get a different part of the same
+  scan each time. Now each reading thread has its own cursor (eight slots, freed at its `EIO`, the least recently used
+  taken when all are in use), reset when a new scan finishes. [I] On the PC only wifid read records; whether two readers
+  ever overlapped on the phone is not in its log.
+- **Fixed: `POWER_CHANGED` at every `POWER` set**, also a set to the state the driver already had. wifid reads the power
+  on that event and tells its clients (Settings' switch, Control Center), which redraw. Now the event (and `OW_POWER` to
+  the host) only when the state changes; the first four sets that change nothing say `power 1 (as it was: no event)`.
+  [I] How often wifid set it on the phone is not in the lines we have.
+- **Fixed: a scan with no radio got an empty SCAN_DONE at once** (power off, or the host not answered yet): an event for
+  a scan that never ran, which a daemon that scans again on an empty list answers at once. Now the request is refused
+  (`ENETDOWN`) and nothing is posted.
+- **A lasting rate line**: `ONEIOS WIFI: 60 s: events 10x6 4x1; scans asked 6 (started 3, reused 3, joined 0, refused 0), done 6
+  (2 networks), timed out 0; records 18; power sets 0 (changed 0); by wifid 6/18` (scans asked / records read per
+  process), one a minute while anything happened. It says on the next phone boot whether iOS asks again and again and
+  who.
+- **`__WiFiManagerClientAddDevice` error** [F, MobileWiFi]: the client logs it when it is told a device is attached
+  that its own device table already has (`CFDictionaryContainsKey` on the interface name, then `.cold.3`); the calls
+  come from `WiFiManagerClientDispatchAttachmentEvent` (wifid's attach notice) and from the reconnect in
+  `__WiFiManagerClientGetOrReconnectServerPort` (after wifid's port died, the client copies the device list and adds
+  each again). Our interface is attached once (`attachInterface` at the controller's start, no detach) and the driver
+  has no path that publishes it again. On the PC boot of this branch the error came once to three times in each
+  process that has a Wi-Fi client (UserEventAgent 1, rapportd 1, apsd 2, locationd 3), with en0 attached once and
+  wifid not restarted: one per client object that starts while wifid has the device (the device list it copies and
+  the attach notice name the same en0), not an interface that comes and goes. [I] Preferences' 17 are 17 such client
+  objects (one per Wi-Fi view it opens); harmless.
+- [I] **Preferences' own load is not shown to come from Wi-Fi events.** 724 TableView signposts over the session are
+  about 60 list reloads of about 12 cells, close to the 63 scans (the Wi-Fi list redraws per scan, as on an iPhone);
+  `Create send gesture actions` is UIKit's `_UIGestureRecognizerSendActions` signpost (one per gesture action: the
+  typing). WiFiKit's own lines (`UI scan results updated: N networks`, `partial scan results`, `scanning did finish`)
+  were not among the top messages. The password sheet's Sharing query (`SFClient wifiPasswordSharingAvailability`, 8
+  answers "not available") is iOS's and not a loop at 8.
+
+**Auto-join "disabled by user"** (`UserAutoJoinState` 0): set only by a client's XPC request (#34). Settings' Wi-Fi page
+says so in words when it is: `New Wi‑Fi network connections have been turned off from Control Center.`
+(WiFiKitUI's `kWFLocUserAutoJoinDisabledWarning`). Nothing of ours reports Wi-Fi off: `POWER` answers on unless a client
+set it off, `STATE` follows the station, no power event is posted without a change (since this fix), and a link event
+is posted only around a join. A Control Center Wi-Fi button that shows off is turned on by a tap, which sets auto-join
+on, not off; the 0 comes from a tap on a button that showed on (Wi-Fi on, not joined: "disconnect until tomorrow").
+**To turn it on again: open Control Center and tap the Wi-Fi button once** (it turns blue; wifid logs `Set user auto
+join enabled requested by "..." enabled 1`). The Settings switch off and on, or a tap on a network, also works.
+
+### Missing, unknown
+
+- Seen in a session (2026-11-12): wifid takes en0, scans, lists the networks, joins an open network through the
+  vendor's supplicant; frames cross both ways; the give-back at the return. [U] still: what `ASSOCIATE` carries for
+  a secured network on iOS 27 (a passphrase, or the 32-byte key: the driver's log line says which), DHCP by
+  configd (the bridge logs it now), the internet, a wrong password, a WPA3 network.
+- [U] What the vendor stack does when system_server stops: whether the supplicant stays up with wlan0 (the bridge
+  handles both: it takes the interface, or adds it), whether the Wi-Fi HAL or wificond take wlan0 down.
+- [U] Whether the supplicant's callbacks reach our process (binder calls from `hal_wifi_supplicant_default` into
+  `ksu`; KernelSU allows binder calls into its domain [I]). `registerCallback` fails with a line naming SELinux if
+  the supplicant cannot ask our object for its descriptor.
+- [U] One UI joining its network again after the return without help.
+- wlan0's address is a random one when One UI is not joined, so iOS's en0 can have another address in the next
+  session (a new DHCP lease). The factory address is not set by the bridge (the framework sets wlan0's address
+  through the Wi-Fi HAL; the bridge does not use that HAL).
+- A WPA3-only network when iOS gives the 32-byte key instead of the password: not joinable (logged).
+- Enterprise (802.1X) networks, WEP, hotspot (iOS's Personal Hotspot), AWDL/AirDrop: not in the first version.
+- The fork's return does not run `wifictl restore` after a kill yet (`oneos/interface.md` section 6).
+- Mobile data (rmnet) as the uplink: not with this design (no NAT); not planned.
+
+## 4. Bluetooth
+
+### The phone [F]
+
+- Controller: Qualcomm WCN785x, SoC name `hamilton`; DT node `bt_kiwi`, `compatible = "qcom,kiwi"` with reset and
+  sw-ctrl GPIOs and five supplies (`e3q_eur_openx_w00_r09.dts` line 17875). Address: `/mnt/vendor/efs/bluetooth/bt_addr`.
+- HAL: **HIDL** `android.hardware.bluetooth@1.1::IBluetoothHci/default`, init service `vendor.bluetooth-1-1-qti`
+  (`vendor/bin/hw/android.hardware.bluetooth@1.1-service-qti`,
+  [android_device_samsung_sm8650-common@48c66f6](https://github.com/samsung-sm8650/android_device_samsung_sm8650-common/blob/48c66f6543b31784fce4e7d23ea855897f18ce6e/proprietary-files.txt)
+  line 126; running on the owner's phone). Not the AIDL HAL. It owns power, the UART and the firmware download.
+- Its only client is Android's Bluetooth app, a zygote child: gone in a session, so the HAL is free [I: the HAL
+  closes the controller when its client dies].
+- Checked on the phone 2026-11-12: `lshal` lists `android.hardware.bluetooth@1.0::IBluetoothHci/default` and
+  `@1.1::IBluetoothHci/default` (pid 1746) and `vendor.samsung.hardware.bluetooth@2.0::ISehBluetooth/default`;
+  `service list` has no AIDL `android.hardware.bluetooth.IBluetoothHci`. `bt_addr` is 18 bytes of text
+  (`system:bluetooth 0660`, `bluetooth_efs_file`), readable by root in init's namespace; in bringup's session of
+  2026-11-12 xnuhost found the HAL 1.1 but logged `made up: /mnt/vendor/efs/bluetooth/bt_addr not read`. Cause [F]:
+  the file is the 17 characters of the address and a NUL (`od -c`), and `br_bt_address` took the NUL for a
+  character that is not part of an address. Fixed 2026-11-12 (`hci.c`: the text ends at the first NUL; a test with
+  the phone's layout); not yet run on the phone.
+
+### iOS side (`drivers/bluetooth`, port of iOSPlus10 `patches/laurel/xnu/2600-laurel-bluetooth-wcn3990.patch`)
+
+- bluetoothd's POSIX transport: kernel control `com.apple.uart.bluetooth` (`oneios_bt_ctl.c`, as is) or
+  `/dev/uart.bluetooth`, `/dev/cu.bluetooth`, `/dev/btwake` (`oneios_bt_dev.c`, as is); raw H4 bytes both ways.
+- `oneios_bt_h4.c` (as is): H4 framing and the answers given on the controller's behalf. bluetoothd was written for
+  Broadcom chips; its vendor commands (OGF 0x3f) mean other things on a Qualcomm chip (0xfc48 baud rate, 0xfc00
+  firmware download, 0xfc14 address), so each gets a Command Complete in the kernel and never reaches the WCN785x.
+  The same family as the Mi A3's WCN3950, which is why the table applies unchanged [I].
+- `oneios_bt_ios.c`: the transport core with its seam changed: packets go to and come from the host
+  (`OB_CH_HCI`; the message type is the H4 indicator) instead of a UART. No in-band sleep bytes, no firmware, no
+  rails, no speed change: the HAL does those. Power follows the client: the first client sends `OB_HCI_OPEN`, the
+  host answers `OB_HCI_STATE` (ready with the address, or failed).
+- `OneiOSBluetooth.cpp`: writes the address in use into the device tree's `bluetooth` nub; hides the nub when
+  Bluetooth is off, so bluetoothd sees no Bluetooth instead of a transport that fails.
+
+### The bridge (`runtime/bridges/bt`)
+
+- `hci_hidl.c`: a HIDL client with **no Android library** (xnuhost is static): `/dev/hwbinder` through the kernel's
+  binder UAPI, `IServiceManager::get`, `initialize_1_1(callbacks)` (or `initialize` on a 1.0 service),
+  `sendHciCommand/AclData/ScoData/IsoData`, and a callback object the HAL calls (events, ACL, SCO, ISO,
+  `initializationComplete`, and the base methods `interfaceChain`, `interfaceDescriptor`, `ping`, ...). A death
+  notification turns the state to failed. Two threads: the looper only answers the HAL's calls into us; the caller
+  makes our calls (get, initialize, the sends, close) in order from a queue of up to 512 packets, so the guest's
+  vCPU, which holds the bridge device's lock, never waits on a binder call, and a HAL that sends an event before its
+  `sendHciCommand` returns is answered at once. No `initializationComplete` within 15 s
+  (`ONEIOS_BT_INIT_TIMEOUT_MS`) is a failure with a line naming SELinux. `br_hci_hidl_probe()` asks for the
+  service once at xnuhost's start. `ONEIOS_HWBINDER` names another binder device (the PC test).
+- `bridge_dev.c`: an `OB_HCI_OPEN` while the controller is failed (the HAL died or never finished) closes it and
+  opens it again, so a new bluetoothd client starts over.
+- `hidl_parcel.c`: the parcels (interface token, `hidl_string`, `hidl_vec<uint8_t>` as scatter-gather buffer
+  objects, strong binders). Unit-tested byte for byte; the transaction codes are the HIDL order of the methods.
+- `hci.c`: packet length checks both ways, the state, the address file. It logs `bluetooth: the controller hears
+  devices: N report(s) so far (LE advertising|inquiry result)` for the first report and for each power of two after
+  it: a scan of bluetoothd's that finds devices can be read in xnuhost's log (2026-11-12; not yet seen on the phone).
+
+### First session with the HAL bridge on (prelink's session 2, 2026-11-12) and what 24A446's bluetoothd opens
+
+- xnuhost: `bluetooth: on: the phone's controller through its HAL 1.1, address a4:a4:90:4a:53:2f`: the real address
+  (the fix of `81c4e5d` works). Guest: `ONEIOS BT: on: ...`. bluetoothd ran. **Nothing opened the transport**: no
+  `ONEIOS BT: ios: client ... connected` line, so the HAL was never opened either.
+- **Why [F, 24A446's `/usr/sbin/bluetoothd`, disassembled]:** this bluetoothd does not read and write a serial node.
+  Its transports by `transport-encoding`: 0 USB, 1 H4, 2 H4DS, 3 H4BC, 4 H5, 5 BCSP (refused), 6 APPLEBT, 7 PCIE
+  Skywalk, 8 PCIE SRS, 9 APPLE PCIE, 10 virtual (the boot argument `bt-transport-override` replaces it). Its UART
+  transport opens `/dev/btwake`, then the **kernel control `com.apple.uart.sk.bluetooth`** (`CTLIOCGINFO`,
+  `connect`), sets a channel specification and asks for a channel UUID through it (`IOAOSSKYSETCHANNELSPEC`,
+  `IOAOSSKYGETCHANNELUUID`), and moves the bytes over a **Skywalk channel** (`os_channel_create`, `os_channel_sync`;
+  its lines say `BM3UART`). `/dev/cu.bluetooth` and `/dev/uart.bluetooth` are only looked at in `main` (do they
+  exist: "is there Bluetooth on this device"), and that look is skipped in a virtual machine. The driver here offers
+  the transports of iOS 16 (the control `com.apple.uart.bluetooth` and the two serial nodes), which this bluetoothd
+  never opens. UniXNU's port of the same OS build carries H4 to bluetoothd through that Skywalk pipe ("UART.SK",
+  [UniXNU/QcaBluetooth](https://github.com/UniXNU/QcaBluetooth) `qbt_transport`), with `transport-encoding` 1.
+- So Bluetooth needs the Skywalk UART pipe in the guest, with the host bridge under it as it is. **Written
+  2026-11-12, not yet run**: `drivers/bluetooth/oneios_bt_sk.c`, after UniXNU/QcaBluetooth `986d631`
+  `src/qbt_transport.c` (APSL-2.0), which carries H4 to this same bluetoothd: the kernel control
+  `com.apple.uart.sk.bluetooth` (options `IOAOSSKYSETCHANNELSPEC` 0x800c5414, the spec 0x400c5413, the channel UUID
+  0x40105412, the 64-bit termios 0x80487414 and 0x40487413), a kernel pipe nexus bound to the client's pid, and the
+  two sync callbacks: bluetoothd's packets go into an 8 KiB FIFO that the core's pump thread hands to the H4 core
+  (framing, the answers on the controller's behalf, the bridge to the host), and the core's queued bytes fill the
+  receive ring. Connecting the control is the core's "client connected": the host opens the HAL then.
+  `transport-encoding` is 1 now (plain H4, what UniXNU gives this bluetoothd over the pipe; bluetoothd's boot
+  argument `bt-transport-override=3` tries H4BC).
+- **What is not known [U]:** how far the unchanged bluetoothd goes on a Qualcomm controller. UniXNU does not run
+  it unchanged: its adapter (`native-ios27.md`) patches this very binary so that every product gets the plain
+  controller type with no vendor operations, the virtual machine check says no, scans use the extended commands
+  (0x2041, 0x2042: the WCN7850 refuses the legacy ones once extended advertising was used), and capabilities follow
+  the controller's own reports. Here the kernel answers the vendor commands bluetoothd sends (the table of
+  `oneios_bt_h4.c`, made for iOS 16) and `/defaults/vmm-present` makes bluetoothd skip its chip initialisation. The
+  first boot's `ONEIOS BT: bluetoothd: command 0x....` lines say which command it stops at.
+- Expected lines, in order, when Bluetooth is turned on in iOS (since 2026-11-13 after `ONEIOS BT: transport up N ms
+  after the start: ...` at the root mount, and bluetoothd's `oneios-iokit:` lookups of 0062): `ONEIOS BT: dev:
+  bluetoothd[N] opens /dev/btwake: 0`, `oneios-iokit: bluetoothd[N] kernel control "com.apple.uart.sk.bluetooth" -> id
+  N`, `sk: bluetoothd[N] connects to com.apple.uart.sk.bluetooth: 0`, `ios: client Skywalk pipe connected`, xnuhost
+  `bluetooth: HAL 1.1 found, initialising`, `bluetooth: HAL initialisation complete`, `ONEIOS BT: host: controller
+  ready, address ..`, `sk: channel of 2048-byte buffers, N/N slots for pid N: 0`, `sk: bluetoothd's channel is
+  connected`, `bluetoothd: command 0x0c03` (HCI Reset), `controller: Command Complete for 0x0c03, status 0x00`, and
+  with a scan xnuhost's `bluetooth: the controller hears devices: N report(s)`.
+- The driver now logs who opens which node and how it went (`ONEIOS BT: dev: NAME[PID] opens /dev/...: error`), the
+  first 40 commands of a client with the ones it answers itself (`bluetoothd: command 0x....`), and the controller's
+  first 40 events (`controller: Command Complete for 0x...., status ..`).
+
+### bluetoothd finds our transport and never powers the stack (fixbt, 2026-11-13)
+
+- **The phone (2026-11-12 23:45, main ea06d46, and the Mac session of 2026-11-13 10:5x, main c1223f8):** only the
+  `on` lines of xnuhost and the guest; no `ONEIOS BT: dev:`, `sk:` or `ios:` line, so bluetoothd never opened even
+  `/dev/btwake`, the first step of its UART transport's open; Settings' Bluetooth switch does not turn on.
+- **On the PC with a stand-in controller (`bluetooth=sim`, hosted 0062, 2026-11-13, proven):** bluetoothd finds
+  our node and picks our transport. Kernel (`oneios-iokit:`): `match {IONameMatch=bluetooth ...} -> IOPlatformDevice
+  "bluetooth"`, `property "local-mac-address" (IODeviceTree, recursive) ... -> found`, later `property
+  "transport-encoding" (IODeviceTree, recursive) of IOPlatformDevice "bluetooth" -> found`, the key store and
+  `IOPMrootDomain` opened, `/product` read (`boot-ios-diagnostics`, `product-id`: not found). iOS's log
+  (`oneios-tool ioslog show data.img --proc bluetoothd`): `marconi-bt: Unable to match bluetooth service in device
+  tree` (it asks for `marconi-bt` first, then `bluetooth`), `Bluetooth is running inside a Virtual Machine, so
+  skipping check for Bluetooth available`, `DeviceTree transport = 0x00000001`, `HCI Transport is set to H4`,
+  `Warning: BT driver=0x...`. So the device-tree side is right: H4 is the transport whose driver ("POSIX" in its
+  strings) opens `/dev/btwake` and `com.apple.uart.sk.bluetooth` (`oneios_bt_sk.c`).
+- **What does not happen (PC, proven; phone, the same lines missing):** bluetoothd opens its transport only when it
+  starts its stack at power on; its log lines for that are `Beginning asynchronous power init`, `Default power state
+  : N`, `Beginning asynchronous power on`, `Bluetooth is running inside a Virtual Machine, so skipping chip
+  initialization`, `Starting up StackManager`, `Starting bluetooth core stack`. None of them came in 13 minutes of
+  bluetoothd on the PC (nor in the PC boot of 2026-11-12, Bluetooth off), and its own line says `fStackStarted:0`
+  (and on a fresh Data store `BuddyHasNotCompleted:1`). [I] bluetoothd's power manager is never started, so nothing
+  reaches the transport; what starts it is not known yet. Not the transport, the node or the HAL: those are found or
+  never asked for.
+- iPhone18,2's own device tree (`devicetree.bin` of the kernel inputs): `/arm-io/bluetooth` with
+  `transport-encoding` 9 (APPLE PCIE) and `local-mac-address` from syscfg; ours is `/bluetooth`, encoding 1, which
+  bluetoothd reads as above.
+- **PC stall, not fixed (corrected 2026-11-13 afternoon):** some qemu boots never get their root device: APFS's start
+  waits for the `IOBSD` resource while `IOResources` stays busy (AppleImage4, AMFI and AppleLockdownMode wait in their
+  starts for services that come later: `IOAESAccelerator`, `sep-endpoint,scrd`/`AppleCredentialManager`,
+  `AppleSEPManager`), with `/defaults` and the APFS media busy in the `oneios-iobusy:` lines; seen with
+  `hosted_dump_threads=1`. With the Bluetooth driver on: 3 stalls in 3 boots before the change below, then 1 boot that
+  mounted, then the same day 1 stall and, in a retry loop, 1 that mounted. With `oneios_bt=0` or no bridge: 2 of 2
+  booted. So the driver's transport now starting after the root mount (`ONEIOS BT: transport up N ms after the start:
+  ...`) is kept (nothing needs it earlier), but it did not remove the stall; [I] a timing race in the kernel's
+  early matching that the driver start's timing makes likelier. The phone never showed it. For a PC test: boot again
+  when `Waiting on <dict ...BBA627F7...>` is not followed by `BSD root` within about 90 s.
+
+### The phone's iOS log (Mac session 2026-11-13 10:5x, main c1223f8) and what is next
+
+- bluetoothd, in this order: `marconi-bt: Not a valid MAC address (all 00s)`, `marconi-bt: Unable to match bluetooth
+  service in device tree`, `DeviceTree transport = 0x00000001`, `HCI Transport is set to H4`, `Warning: BT driver=...`,
+  **`Beginning asynchronous power init`**, `Bluetooth is running inside a Virtual Machine, so skipping chip
+  initialization`, then 32 times `Power state changed. PowerState:3 managerState:2` and 55 times `Returning bluetooth
+  power state: FFFFFFFFDEADBEEF`. SpringBoard's and Preferences' sessions: `is turning power on for module Bluetooth`,
+  `GetControllerInfo: BlSt PoweredOff, Chip APPLE_VIRTUAL, HCIT UART`, `fStackStarted:0`. No `/dev/btwake` open, no
+  StackManager line. On the phone power init begins (it did not in the PC boots, which never got that far: the PC's
+  SpringBoard did not ask within the runs) and never finishes.
+- **The all-zero MAC is not ours [F]:** bluetoothd asks for a service named `marconi-bt` first (an Apple chip's node we
+  do not have), logs zeros for it, then asks for `bluetooth`. On the PC the same two `marconi-bt:` lines come, and
+  0062 shows `property "local-mac-address" (IODeviceTree, recursive) of IOPlatformDevice "bluetooth" -> found`, with no
+  `bluetooth: Not a valid MAC address` line. The phone's next boot's `oneios-iokit:` lines confirm it.
+- **Power init fails on the virtual-machine path [F since 2026-11-15, read in 24A446's bluetoothd: next section]:**
+  with `vmm-present` bluetoothd takes chip `APPLE_VIRTUAL`, and its chip initialisation in a VM succeeds only when the
+  transport is 10; with H4 (1) it fails and power init sets PowerState 3, the line above.
+- **Tried and dropped (2026-11-14): hiding the VM from bluetoothd** with `owner-hide-vmm=bluetoothd,BlueTool` (the
+  kernel's per-process `kern.hv_vmm_present` switch of Droid-VM-UniXNU's `zzyd-owner-hide-vmm.patch`). bluetoothd then
+  leaves the virtual-controller path and **crashes at its start, in a loop** [F]: on the phone (main 9f6dc38) 18 pids in
+  one boot, then launchd's 1200 s throttle; on the PC (`bluetooth=sim`) the same, a new pid every few seconds, each one
+  right after its first device-tree reads. Without the hide (c1223f8, and every PC boot before) it runs as one pid.
+  The non-VM path expects Apple's own Bluetooth chip and its bring-up (UniXNU runs this bluetoothd only with a patched
+  binary and its own library, `native-ios27.md`); the project does not change Apple's binaries, so **the VM path stays**
+  and its power init is what to fix. Never put bluetoothd in `owner-hide-vmm`: no default does, and xnuhost now says
+  so in its log when the boot arguments do (`boot arguments: owner-hide-vmm names bluetoothd: ...`).
+- **Tried on the phone (main 3233fed, 2026-11-15) and a dead end: the VM path's own transport**,
+  `bt-transport-override=10`. The virtual transport is a simulated controller inside bluetoothd's own process, not a
+  service to publish: next section. Do not use it; xnuhost now says so in its log when the boot arguments carry it.
+- **0062 now also says how a process saw the VM:** `oneios-iokit: bluetoothd[N] sysctl kern.hv_vmm_present -> 1 (a
+  virtual machine)` or `-> 0 (the virtual machine hidden by owner-hide-vmm)` (kernel.kc bc81badb, built, not yet in a
+  boot).
+- **What the next phone boot must check:** in xnuhost.log the `oneios-iokit: bluetoothd[...]` and `oneios-iokit:
+  BlueTool[...]` lines (what it looks up, whether a `kernel control "com.apple.uart.sk.bluetooth"` lookup ever comes);
+  in iOS's log `oneios-tool ioslog show data.img --proc bluetoothd --grep "power|Power|chip|Chip|Virtual|BlueTool|OLYHAL|HWIdentifiers|StackManager|core stack|transport|MAC"`
+  and `--proc BlueTool`.
+
+### The virtual transport is bluetoothd's own (fix-bt-virtual, 2026-11-15)
+
+The phone session of main 3233fed (2026-11-15) had `bt-transport-override=10` and no `owner-hide-vmm`: no crash loop,
+but Bluetooth never powered on. bluetoothd[73] `exited due to exit(1), ran for 56223ms`, then pids 168, 190, 245; 42
+`Returning bluetooth power state: FFFFFFFFFFFFFFFF`, 17 `... FFFFFFFFCAFEBABE`, 51 `manager state not powered on`; 128
+`BTVirtual transport send packet type: 0x00000001`, 128 `-[BTVCPacketControl didSendPacket:error:] no completion
+function`, 116 `send HCI event to virtual transport size 6`; no `.ips`. Read in 24A446's `/usr/sbin/bluetoothd` on the
+PC (`oneios-tool image apfs-copy` from `os.img`, `llvm-objdump -d`, the `adrp`/`add` pairs matched to its strings; the
+addresses are the binary's, unslid):
+
+- **Transport 10 never leaves bluetoothd's process [F].** `BTVirtualTransportRegisterCBs` (0x1003c42a0) stores five
+  callbacks, and `BTVirtual transport init` (0x1003c4384) creates its HCI, ACL and LMP transports through them. Its
+  only caller (0x100899d78, logged `registerCallbacks`) hands it bluetoothd's own `TransportCreate`, `TransportFree`
+  and `TransportWrite` (0x100899e00 on); `TransportWrite` (0x10089a3d4) sends the packet, by `objc_msgSend`, to a
+  `BTVCHciManager` that bluetoothd allocates itself (0x100899d2c): `-[BTVCHciManager
+  transportWriteCmd:length:amountWritten:dtor:]`. That object is a simulated LE controller ("BTVC", sources
+  `MobileBluetooth_base/Server/Platforms/Darwin/VirtualController/`): `handleHciCmd: opCode 0x%04X`,
+  `handleHciResetCmd`, `handleHciReadLocalVerInfoCmd`, ... `handleHciLeExtendedCreateConnectionCmd`, and its events go
+  back with `%s send HCI event to virtual transport size %d`. Its "radio" is Bonjour (`_btvc._tcp`,
+  `BTVCBonjourService`) to other virtual devices. So there is no IOKit service, kernel control or XPC service to publish:
+  the 128 commands and the 6-byte events (a Command Complete with only a status: Reset, Set Event Mask, LE Set Event
+  Mask, the filter accept list, ...) are bluetoothd talking to itself, and nothing reaches `drivers/bluetooth`, the
+  bridge or the phone's controller. A boot with it has no `oneios-iokit: bluetoothd[...] kernel control
+  "com.apple.uart.sk.bluetooth"` line and no `ONEIOS BT: dev:`, `sk:` or `ios:` line.
+- **"no completion function" is not a missing answer [F].** `-[BTVCPacketControl didSendPacket:error:]` (0x1006f08xx)
+  logs `%s completion function` and calls the block when the packet was queued with one, and `%s no completion
+  function` when it was queued with none: BTVC's own pacing of its own packets. Nothing outside is asked for a
+  completion, a credit or a Number of Completed Packets.
+- **In a VM only transport 10 powers on [F].** The chip initialisation of power init (0x10062941c) asks whether it runs
+  in a VM; if so it logs `Bluetooth is running inside a Virtual Machine, so skipping chip initialization` and returns
+  `transport == 10` (0x1006294b4: the transport is the device tree's `transport-encoding`, or the boot argument's,
+  kept at 0x100c1ce28 by 0x10030901c). Power init (0x100628730) sets PowerState 3 when that is false. So with
+  `/defaults/vmm-present` and H4 (1), power init always fails before any transport is opened: the c1223f8 session's
+  `PowerState:3 managerState:2` and no `/dev/btwake` open. The VM answer is `kern.hv_vmm_present`, read once and kept
+  (0x10056a164); four places use it: `main`'s check for `/dev/cu.bluetooth` (skipped), the chip factory (chip
+  `APPLE_VIRTUAL`), this chip initialisation, and CloudPairing.
+- **So an unchanged 24A446 bluetoothd cannot reach the phone's controller while it sees a VM**: transport 10 is its own
+  simulation, every other transport fails power init. With the VM hidden (`owner-hide-vmm`) it crashes at its start
+  (above). [I, from the code and the crash's address] The chip factory (0x10050a08c) picks the chip by the environment
+  (`BT_CHIP=ACI BT`: chip 2000), by transport 9 (APPLE PCIE: chip 3000), by the VM (chip 6000, `APPLE_VIRTUAL`), or by
+  the product's type (`MGIsDeviceOneOfType`, a table of products); none matches transport 1 on iPhone18,2 (whose own
+  tree says transport 9, so it is not in the table), the factory logs the fault `Unknown platform 0x%08x detected` and
+  leaves the chip null, and the chip's field at 0x350 (read right after `getChip()`, 0x1000071f0, in many places) is
+  the `SIGSEGV at 0x350` of the 9f6dc38 session. The fault line in that session's iOS log would prove it.
+- **The exit(1) [F for the paths, U for which one].** bluetoothd calls `_exit(1)` in two places: its fatal-error path,
+  which first logs `Bluetooth error - restarting { build=release, reason=%d, context="%s" }`, and the chip
+  initialisation's restart (`timed out booting the chip, restarting`, `hardware is unhealthy, restarting`, `Unknown
+  platform/chipset/manufacturer combination, restarting`). Fatal errors with BTVC's code among their callers: `Filter
+  Accept List add error`, `... remove error`, `... clear error`, `Policy enforcement timeout`, `BT VSC init failed`.
+  Which one ended pid 73 after 56 s is in 3233fed's iOS log: `oneios-tool ioslog show data.img --proc bluetoothd
+  --grep "Bluetooth error - restarting|restarting|Filter Accept List|Policy enforcement|VSC init|Unknown platform"`.
+  It does not matter for the controller: transport 10 is not a way to it.
+- **Nothing of ours stays busy for the next bluetoothd [F, from the code].** In a transport-10 boot nothing of ours is
+  opened (no control, no node; the HAL stays closed). With H4 a client's disconnect (`sk_ctl_disconnect`,
+  `ctl_disconnect`, the nodes' close) frees the core's client slot, destroys the Skywalk pipe and closes the HAL
+  (`obt_ios_release`); a new pid connects to a free slot, and a failed controller is opened again by the bridge.
+- **Fixed in our code:** (1) `oneios_bt_ios.c`'s pump thread woke every 20 ms from the root mount to the end of the
+  session with no client and nothing queued (50 wakeups a second of a vCPU, in every session, and with the VM
+  visible bluetoothd never connects). It now sleeps until it is kicked (a packet for the client, bluetoothd's bytes in
+  the Skywalk FIFO, `ctl_rcvd`'s room again, which kicks it now) and looks every 20 ms only while bytes wait for the
+  client. (2) xnuhost logs `boot arguments: bt-transport-override=10 gives bluetoothd its own simulated controller, in
+  its own process: nothing reaches the phone's controller (docs/hardware.md 4); take it out` (read as bluetoothd reads
+  it: any word that contains the name, the value after its `=`, under 13, the last word wins; host-tested).
+- **PC boot (2026-11-15, kernel.kc 7261a00b from xnu.macho 948bb412 with both fixes; `--set bluetooth=sim`,
+  `bt-transport-override=10`; stopped after 27 minutes):** xnuhost logged the new `boot arguments:
+  bt-transport-override=10 ...` error line; the root mounted on the first try; `ONEIOS BT: on: ...` and `ONEIOS BT:
+  transport up 2620 ms after the start: ...` as before. bluetoothd[75] (one pid for the whole run): `transport override
+  from boot-arg: 10`, `HCI Transport is set to virtual`, `fStackStarted:0`; its `oneios-iokit:` lines are the device
+  tree (`marconi-bt`, `bluetooth`, `local-mac-address`, `transport-encoding`), the key store, `IOPMrootDomain`,
+  `/product` and `kern.hv_vmm_present -> 1`, with **no kernel control lookup** and no `ONEIOS BT: dev:`, `sk:` or
+  `ios:` line. As in every PC boot so far nothing asked bluetoothd to power on (no `Beginning asynchronous power init`),
+  so neither a power-on nor the phone's exit(1) can be seen on the PC; a power on would run BTVC, not the stand-in
+  controller.
+- **What would reach the controller [U, not tried]:** a chip for transport 1 outside the VM without changing the binary:
+  `BT_CHIP=ACI BT` in bluetoothd's environment (chip 2000) with the VM hidden, or transport 9 (chip 3000, whose transport
+  is Apple's PCIe Skywalk protocol, not H4). Each needs the VM hidden from bluetoothd and a PC boot that reads the
+  chip's first commands (`ONEIOS BT: bluetoothd: command 0x....`); UniXNU instead patches the binary, which this project
+  does not.
+- **The next phone session:** take `bt-transport-override=10` out of `xnuhost.conf` (and keep `owner-hide-vmm` without
+  bluetoothd). Read the 3233fed session's `--grep` above for the exit's reason, and the 9f6dc38 session's
+  `oneios-tool ioslog show data.img --proc bluetoothd --grep "Unknown platform|getChip|SIGSEGV"` for the null chip.
+
+### Missing, unknown
+
+- [U] **SELinux**: hwservicemanager checks `find` for the caller's context, and the HAL's domain must be allowed to
+  call back into ours (`binder { call transfer }`). KernelSU's domain is allowed most things; if the callback is
+  denied, a `ksud sepolicy` rule is needed. `bridgectl bt` shows which step fails.
+- [U] the transaction codes and the callback handshake against the real libhwbinder and the QTI HAL. Tested on the PC
+  (`make -C runtime/bridges test-binder`, 2026-11-11): a fake hwservicemanager and IBluetoothHci 1.1 and 1.0 on a
+  real binder driver (binderfs in a user namespace) that read every parcel with libhwbinder's checks (tokens,
+  `readBuffer`/`readEmbeddedBuffer` parent links), call back two-way from their own thread, `interfaceChain` on our
+  callback, Reset and Read BD_ADDR answered, ACL echoed, close; no HAL registered; no `initializationComplete`; a
+  HAL that dies. First phone test: `bridgectl bt` must print two Command Complete events (`runtime/bridges/README.md`).
+- booter: the tree's node. `runtime/loader/src/machine.c` publishes `/bluetooth` with `transport-encoding` 10 (the
+  virtual transport of Apple's VMs) or, with the HAL (`bluetooth=hidl`, or `auto` when the HAL is registered, the
+  default since 2026-11-11), `transport-encoding` 1 (H4; it was 3, H4BC, until 2026-11-12), `transport-speed` 3000000 and the phone's
+  `local-mac-address`; `/defaults/vmm-present` 1 either way. What 24A446's `/usr/sbin/bluetoothd` contains (strings,
+  read from `os.img` on the PC): `HCI Transport is set to H4BC`, `No valid serial port found (tried cu.bluetooth and
+  uart.bluetooth)`, `Bluetooth is running inside a Virtual Machine, so skipping chip initialization` and `... skipping
+  check for Bluetooth available` (`kern.hv_vmm_present`). So with `vmm-present` it should take the H4BC transport on
+  our `/dev/cu.bluetooth` and run no BlueTool firmware step [I: from the strings, not run].
+- The session of 2026-11-11 14:33 had none of this: xnuhost's default was `bluetooth=virtual`, so the bridge offered
+  no HCI channel (`channels 0x33`), the guest said `ONEIOS BT: off: the host serves no Bluetooth controller` and hid
+  the nub; xnuhost logged nothing about it. The key store answers `aks_wrap_key`/`aks_unwrap_key` (10/11; the same log
+  has `selector 10 from securityd: 0x0` and `selector 11 ...: 0x0`), the fix Droid-VM needed (PROGRESS 11-02) for
+  bluetoothd to store its LE identity root; bluetoothd ran once (pid 74) with no restart loop.
+- userland: the bluetoothd job is on (it ran); BlueTool's firmware step should be skipped by `vmm-present` (above);
+  `BTAudioHALPlugin.driver` kept in HAL and bluetoothd's iAP PTY made non-blocking (iOSPlus10
+  `docs/laurel_sprout/bluetooth.md`, last section) are not done: they matter for headsets.
+- SCO audio goes through the HAL as HCI; A2DP is iOS's own stack over ACL. LE Audio (ISO) only with a 1.1 HAL.
+- UniXNU QcaBluetooth is a radio driver for a bare-metal WCN7850: not needed here.
+
+## 5. Vibration and haptics
+
+### The phone [F]
+
+- Actuator: an LRA on a **Cirrus CS40L26A**, I2C address 0x40 (`cirrus,cs40l26a`, `e3q_eur_openx_w00_r09.dts` line
+  11453; `samsung,f0-tracking`, dynamic boost control on). Modules `input_cs40l26_i2c`, `snd_soc_cs40l26`, `cl_dsp`.
+- Exposed by Samsung's wrapper `sec_vib_inputff` (line 682; `CONFIG_SEC_VIBRATOR_INPUTFF=m`, `CONFIG_INPUT_CS40L26_I2C=m`
+  in `arch/arm64/configs/oem/e3q_defconfig`) as an **evdev force-feedback device**: `/dev/input/event8`, name
+  `sec_vibrator_inputff`, EV_FF bitmap `124020000`: `FF_PERIODIC`, `FF_SINE`, `FF_CUSTOM`, `FF_GAIN`; **no
+  `FF_RUMBLE`** [F, owner's phone as root].
+- Driver source: `drivers/vibrator/cs/cs40l26/cs40l26.c` and `drivers/vibrator/common/inputff/` in
+  [samsung-sm8650/android_kernel_samsung_sm8650@809f7ed](https://github.com/samsung-sm8650/android_kernel_samsung_sm8650/blob/809f7edaad95be2f60ce09f577fe5104d8940214/drivers/vibrator/cs/cs40l26/cs40l26.c):
+  - `FF_PERIODIC` only (`cs40l26_upload_effect`); `FF_SINE` programs the chip's buzz generator
+    (`cs40l26_sine_upload`, line 3234): period clamped to 4..10 ms (100..250 Hz), magnitude 0..255, length in ms;
+  - `FF_CUSTOM` with two values `[bank, index]` plays a stored waveform (bank 0 RAM, 1 ROM, 3 buzz), with more
+    values a composite or PWLE waveform uploaded to the chip (`cs40l26_custom_upload`, line 3335);
+  - `FF_GAIN`: Samsung's scale 0..10000 (`gain / 100` = percent, `cs40l26_set_gain`, line 2569).
+- The AIDL vibrator HAL (`android.hardware.vibrator-service.samsung`) and IVibratorManager run and hold `event8`
+  open; a second open is allowed, and an effect belongs to the file that uploaded it.
+- Also present and not used: `qcom,hv-haptics` and `qcom,pm8550b-swr-haptics` nodes (PMIC haptics, Qualcomm's
+  reference design), `leds_qpnp_vibrator_ldo`.
+
+### iOS side (`drivers/haptics`, port of iOSPlus10 `patches/laurel/xnu/2700-laurel-pmi632-haptics.patch`)
+
+- `OneiOSVibrator.cpp` (LaurelVibrator as is): the IOService named `vibrator` that FigVibrator's legacy path finds
+  (`IOServiceNameMatching("vibrator")`, `IORegistryEntrySetCFProperties`): start
+  `{hertz_millisecs = ({intensity = 16.16 fixed}, on_ms, false, off_ms, ...), repeat}`, stop = a CFNumber 0. The
+  step timer, the repeat cap (a loop without a new request ends after 60 s: iOS loops a pattern without
+  TotalDuration for 31 days and relies on its client's stop), the key stop, the one log line per request shape are
+  kept. Changed: the `intensity` of a step is kept (0..1000) and sent to the host (the Mi A3's ERM was on/off);
+  the service is made by `oneios_vibrator_start()` instead of a KernelConfigTables entry, so no kernel patch.
+- `oneios_haptic.c` (laurel_haptic.c): `/dev/oneios-haptic` and `/dev/redwood-haptic` (the node ios-topaz's
+  RedwoodAudio HAL plug-in opens for its "Actuator" output): S16LE mono 48 kHz. Kept: 2 ms blocks, a peak above
+  256/32768 is "on", the closed-loop rule (publish `IODeviceTree:/product/haptics {closed-loop 1}` only when the root
+  has an Actuator plug-in and VirtualAudio.plugin: with closed-loop on and no Actuator device iOS plays no vibration
+  at all), the node made before the audio server can ask for it. Replaced: the SPMI lane, the LDO and the motor
+  thread (overdrive, minimum on-time, duty limit, watchdog). Those protected an ERM on a bare LDO; here the chip's
+  DSP brakes and protects the LRA. New: each write's loud span is sent with its peak as the intensity and its
+  zero-crossing rate as the frequency.
+- Messages: `OB_HAPTIC_VIB {on_ms, intensity 0..1000, frequency_hz}`, `OB_HAPTIC_STOP`.
+
+### UI haptics: the Actuator audio device (media, 2026-11-12; built, not run on the phone)
+
+Why taps did nothing [F, iOS's log of the 14:12 session]: `ONEIOS HAPTIC UI: off: no Actuator HAL plug-in in the
+root`, so no closed-loop node; UIKit then says `_UIKBFeedbackGenerator: ... Haptics: unsupported ... Mode: audio
+only`, `_UIFeedbackSystemSoundEngine` plays the feedback as a system sound, and backboardd says `Device doesn't support
+Haptic Music`. Only FigVibrator's legacy `vibrator` path ran (`ONEIOS VIBRATOR: request kind 1 from audiomxd`).
+
+How iOS 27 plays a tap [F 24A446 unless marked]: VirtualAudio.plugin (`/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin`
+on the OS volume, not in the shared cache) has `Device_Actuator_Aspen.cpp`, `VirtualAudioDevice_Actuator`,
+`VAD_Actuator`, `ActuatorIV`, `Creating Actuator Port`, `Could not find actuator port after 8 seconds`; its routing
+already looks for the actuator's settings (`Cannot find strips file oneios,xnuhost/VAD/d42_actuator_general` in every
+session). [V iOS 16, iOSPlus10 docs/haptics-plan.md 8.1; I for iOS 27] the physical device with UID **"Actuator"**
+becomes that VAD; UIKit's level 2 (taps, keyboard) and Core Haptics need MobileGestalt's closed-loop answer, which is
+`IODeviceTree:/product/haptics closed-loop`. The V54 device tree has `/product/haptics {closed-loop 1,
+supports-3rd-party-haptics 1, power-control-features 2, controller-coeff-cal "syscfg/CLCL"}`; the loader does not
+copy it (`/product`'s children are not copied). The kernel drops MobileGestalt's cache at each boot
+(`gestalt-cache-drop`), so a node published before the first answer is what it reads.
+
+What is built:
+- **The device**: the audio archive (`oneios-tool kernel gen audio`) stages a third
+  IOAudio2Device into `DroidVMAudio.cpp`: UID `Actuator`, one output stream, mono S16 at 48 kHz
+  (`oneios-actuator-channels=2` for stereo), the speaker's engine (240-frame periods on the guest's clock), output
+  latency one period (not the speaker's 6480 frames: the haptic synth keeps haptics in step with a device's
+  latency). Each period goes to `oneios_haptic_actuator_play()`, not to virtio-snd. Published only when
+  `drivers/haptics` has the host's actuator and UI haptics are on; `oneios-actuator=0` leaves it out.
+- **The requests** (`drivers/haptics/oneios_actuator.h`, host-tested by `drivers/haptics/test_actuator.c`, 16 checks):
+  a period is loud above 256 of 32768; the first loud period asks 20 ms (a tap), the run renews when less than 12 ms
+  is left (50 ms segments after 20 ms) or the level moves by more than 100 of 1000; a run of 30 ms or more is stopped
+  after 10 ms of silence, a tap runs out. Intensity = the period's peak; frequency = the run's zero crossings with
+  hysteresis, after 10 ms. A tap is one request; a long vibration about 20 a second (each is an effect upload on
+  the CS40L26's I2C).
+- **The closed-loop node**: `oneios_haptic.c` waits (5 s at most) for the audio archive's decision
+  (`oneios_haptic_actuator_published`), then publishes `/product/haptics {closed-loop 1, supports-3rd-party-haptics 1}`
+  when the device exists (the old rule, an Actuator HAL plug-in in the root, stays as the second way in). Not copied
+  from the DT: `controller-coeff-cal` (a syscfg key the guest has not) and `power-control-features` (unknown use).
+- With closed-loop on, FigVibrator also takes the unified engine [V iOS 16]: ringtones and alerts then play on the
+  Actuator too, and the `vibrator` service gets no requests.
+
+backboardd's `BKButtonHapticsController` and its "click states" [F, backboardd strings]: it configures the click
+haptics of a button through the ButtonHaptics framework and the HID haptic interface (`BKSButtonHapticsDefinition
+homeButtonDefinition`, `clickStatesPending`, `clickStatesConfigured`, `BKHIDHapticFeedbackInterface`), the path of a
+haptic Home button or a touch-sensitive button, not of the Actuator audio device. The device above does not satisfy it;
+on this identity (`home-button-type 2`, no haptic Home button) its pending state is harmless [I]. Corrected
+2026-11-13 (fix-haptics, read in backboardd): not harmless for a caller of `playHapticForClickState:clickSpeed:`,
+which then blocks until ButtonResolver is ready ("Haptics do nothing" below).
+
+Next boot's log (kernel lines):
+```
+DroidVMAudio: published Speaker=1 Mic=1 Actuator=1 as IOAudio2Devices (UIDs Speaker, Mic, Actuator x1; ...)
+ONEIOS HAPTIC: Actuator audio device published (UID "Actuator", mono 48 kHz S16)
+ONEIOS HAPTIC UI: on: /product/haptics closed-loop = 1 (... -> VirtualAudioDevice_Actuator -> the Actuator IOAudio2Device -> the host's actuator)
+ONEIOS HAPTIC: Actuator: I/O started by audiomxd (start 1)          (at the first haptic)
+ONEIOS HAPTIC: play 1: 20 ms, intensity N of 1000, 0 Hz (resonance)   (each tap; the first 24 are logged)
+ONEIOS HAPTIC: Actuator: I/O stopped: N periods, N loud, N requests to the motor so far
+```
+In iOS's log: no `Haptics: unsupported` from `_UIKBFeedbackGenerator`. If the device is published and no `I/O
+started` line comes: VirtualAudio did not make the VAD (`Could not find actuator port`) or MobileGestalt still says
+no. To go back: `oneios-actuator=0` (no device, no node: the `vibrator` path as before).
+
+### The power key since the Actuator (15:35 boot; read in 24A446's shared cache on the Linux PC, mem, 2026-11-12)
+
+In the 15:35 boot the side key's presses reached backboardd (34 HID events, 0 dropped) and no `request_power_change`
+followed; the boots before the Actuator device locked and woke. What is read [V, `ipsw dyld disass`, SystemOS cryptex
+`043-70037-715.dmg`]; what follows from it is marked [I]:
+
+- iOS 27 resolves hardware button presses (single, double, long) in the private framework **ButtonResolver**
+  (`BRButtonResolverController`, `+[BRInterface interfaces]`: a `BRInterfaceLegacy`, a `BRInterfaceKeyboard` and, when
+  `+[BRInterfaceAOP interface]` gives one, a `BRInterfaceAOP`). The AOP interface is made when MobileGestalt's
+  `JwLB44/jEB8aFDpXQ16Tuw` answers 1, or with `initWithFastHaptics:YES` when `MGIsDeviceOneOfType` matches a list of
+  device types (0x2569b3e20-0x2569b3ee4; which models the list holds is not decoded). It talks to the always-on
+  processor's button and haptics drivers (strings `AppleSPUButtonDriver`, `AppleSPUHapticsAudioDriver`,
+  `IOServiceMatched`), loads the press haptics through Haptics.framework's `HAButtonHapticsLoader`, waits for
+  `HAButtonHapticsLoaderServiceIsAvailableNotification` (`-[BRInterfaceAOP _receiveLoaderAvailableNotification:]`),
+  and tells its users when it is ready (`scheduleReadyNotificationOnDispatchQueue:withBlock:`). This guest has none of
+  the SPU services.
+- libMobileGestalt reads `closed-loop` (the `/product/haptics` node that `drivers/haptics` publishes with the
+  Actuator device).
+- [I, not proven] With `closed-loop = 1` the haptics loader expects the SPU haptics path, which never appears, so the
+  resolver's haptic interface is never ready and the presses it should resolve are dropped; before the node, the
+  loader answered "no haptic" (`HasHaptic: NO`) and the presses went on. The media agent's earlier reading
+  (`BKButtonHapticsController`'s click states, harmless with `home-button-type 2`) is about another class.
+
+**The test (needs the phone):** boot with `oneios-actuator=0` (no Actuator device, so no `/product/haptics` node:
+`drivers/haptics` never publishes closed-loop without the Actuator route) and press the side key once (lock) and
+once more (wake). If it locks and wakes, the haptics node is the cause; then `oneios_haptic_ui=0` is the same with
+the kernel's UI haptics off as well. Read in iOS's log (backboardd, the logarchive procedure of `docs/newtodo.md`):
+ButtonResolver's lines `HasHaptic: ...`, `... get asset components: ... haptic: ... success: ...` and any
+`HAButtonHapticsLoader` line, with and without the switch.
+
+**Fix candidates, by what the test shows:** (1) the node off by default (`oneios_haptic_ui` default 0) until (2) is
+done: UI haptics then go through the vibrator path again; (2) keep closed-loop and tell iOS the side buttons have
+no haptics: an answer for ButtonResolver's haptics query that says "none" (a userland hook in backboardd, built with
+the Metal plug-in as `BacklightMode.inc` is) so that the AOP interface is ready without the loader; which call to
+answer is the first `HasHaptic` / loader line of the log above. Nothing of this is built yet.
+
+### Haptics do nothing (23:45 boot; fix-haptics, 2026-11-13)
+
+On the phone every layer said "on" (`haptics: on: /dev/input/event5`, `ONEIOS HAPTIC: on`, the Actuator device and
+`/product/haptics closed-loop = 1` published) and no line showed a request reaching any of them: no `Actuator: I/O
+started`, no `play N`, and the `vibrator` service got nothing (with closed-loop on it is not used). Spotlight's log
+had `AVHapticClient ... Got error during transaction` (subsystem `com.apple.corehaptics`).
+
+**What iOS 27 reads, in 24A446** [V: llvm-objdump and ipsw on the 24A446 binaries, `oneios-tool image apfs-copy` for
+the OS volume's files; the MobileGestalt table read from `libMobileGestalt.dylib`'s `__AUTH_CONST`]:
+
+- MobileGestalt's two haptics answers come from our node only: **`DeviceSupportsHaptics`** (`cBy4BcYs5YWtFHbBpt4C6A`)
+  is "`IODeviceTree:/product` has a child `haptics`", **`DeviceSupportsClosedLoopHaptics`** (`gqDnklGQnpv5ilgh5uHckw`)
+  is that node's `closed-loop`. `supports-3rd-party-haptics`, `power-control-features` (`HapticsPowerControlFeatures`)
+  and `pre-warm-disabled` are other keys of the same node. Before the Actuator change both answers were NO; since
+  the 15:35 boot both are YES.
+- There is no `hapticsd` in 24A446: no launchd job names one. Core Haptics' client (`AVHapticClient`, CoreHaptics)
+  talks to the Mach service `com.apple.audio.hapticd`, which **audiomxd** publishes (`com.apple.audiomxd.plist`);
+  VirtualAudio.plugin runs in audiomxd too. So `--proc audiomxd` holds the haptic server, VirtualAudio and the
+  Actuator VAD.
+- `Got error during transaction: %@` is logged by ten `AVHapticClient` calls (`loadHapticEvent:reply:`,
+  `prepareHapticSequence:error:`, `loadAndPrepareHapticSequenceFromVibePattern:reply:`,
+  `loadAndPrepareHapticSequenceFromEvents:reply:`, `createCustomAudioEvent:...`, `copyCustomAudioEvent:...`,
+  `referenceCustomAudioEvent:`, `releaseCustomAudioEvent:`, `setChannelEventBehavior:`, `setSequenceEventBehavior:`)
+  with the method's name before it and the server's NSError after it: the whole line says which transaction and which
+  error. [I] A server whose haptic engine has no actuator port answers every transaction with an error.
+- VirtualAudio, at its plug-in's creation (`New_VirtualAudio_PlugIn`), asks `MGGetBoolAnswer("DeviceSupportsHaptics")`
+  and then waits up to 8 s for the actuator port: `Beginning loop to wait for actuator port`, then `Found actuator
+  port!` or `Could not find actuator port after 8 seconds of waiting`. The port is made by `Device_Actuator_Aspen`
+  (`Creating Actuator Port`) for the physical device whose UID is `Actuator`; its settings come from
+  `ActuatorSettingsFactory_Aspen` by product type (exceptions `Invalid Product Type`, `Invalid ActuatorDatabaseType in
+  platform attributes`). Earlier sessions logged `Cannot find strips file oneios,xnuhost/VAD/d42_actuator_general`;
+  the OS volume's `/System/Library/Audio/Tunings` has only `AID8022`, `Generic` and `IRs`, so [U] whether a missing
+  strips file stops the VAD or only its DSP tuning.
+- The V54 ADT's own Actuator is `arm-io/iop-audio-controller/audio-haptic` (`uid "Actuator"`, `model-name "leap"`,
+  `identifier "chpa"`, `input-latency 8`, `output-latency 8`, `thermal-budget-range`, `peak-power-range`,
+  functions `hpsc`/`pkpw`/`ther` on `arm-io/haptics-support-interface`), with `audio-hpdbg` ("Haptic Debug") and
+  `audio-haptic-leap` (`AppleHapticsAudioInterface`). Our device publishes the UID and the stream; [U] whether
+  `Device_Actuator_Aspen` reads any of the others (the CPMS lines `CPMS-Actuator: Get ThermalBudgetRange` suggest the
+  thermal budget).
+
+**Where it stops is not known yet: the 23:45 log has no line between the "on" lines and the motor.** So every layer
+now counts (2026-11-13: host-tested; the hosted kernel built on the Linux PC (`HOSTED_OUT=fixhap`) and prelinked, audit 0 failures, `stubs-check` 666 good; no PC boot, not on the phone):
+
+| Layer | Line | Says |
+|---|---|---|
+| Actuator's user clients (DroidVMAudio.cpp as staged) | `ONEIOS HAPTIC: Actuator: user client N opened by audiomxd`, `... asks for N channels at R Hz (the device: 1 at 48000 Hz: the same\|differs, refused ...)`, `... selector N refused`, `... maps memory type 0x...` (the first 24) | whether VirtualAudio opened the device at all, and whether it refused our format |
+| The device's I/O | `ONEIOS HAPTIC: Actuator: I/O started by audiomxd (start N)` and `I/O stopped: ...` (as before) | whether a VAD ran I/O |
+| The samples | `ONEIOS HAPTIC: counters: Actuator N opens (N closed, last by X), N selectors (N StartIO, N StopIO, N refused, N formats asked, last S), N maps; N periods (N ms), N with samples, N loud, peak P of 32768; N requests to the motor \| vibrator service N requests \| /dev/oneios-haptic N frames \| bridge N vib + N stop sent, N failed, N with no host actuator` (every 30 s while a figure moved; `oneios_haptic_report=0` leaves it out) | whether samples reached the ring (`with samples`), were loud enough (`loud`, above 256), became requests and went over the bridge |
+| xnuhost's bridge | `haptics: effect N played on /dev/input/eventN: N ms, period N ms, level N (intensity N, N Hz asked)` (the first 8, then 16, 32, 64, ...), `haptics: counters: N requests from the guest (N vibrate, N stop; N replaced before they started), N effects played, N stopped, N failed on ...` (at 16, 32, ... and at the end) | whether the requests arrived and the force-feedback device took them |
+
+**The power key (fault 2) and this fault** [V for what is read; I where marked]: backboardd's
+`BKButtonHapticsController` is made in every boot, by backboardd's start-up step `ButtonHaptics` right after `HID
+event processing`, independent of our node. Its init enters a dispatch group that only
+`-[BRButtonResolverController scheduleReadyNotificationOnDispatchQueue:withBlock:]` leaves (log `_BRController ready:
+device haptic asset slot count:%d`); with `home-button-type` 2 it queues `_configureAsyncWithBlock:`, whose block
+waits on that group with no time limit on the serial queue `com.apple.backboardd.buttonHaptics`. Every later
+`playHapticForClickState:clickSpeed:` goes through `_configureSyncWithBlock:` (`dispatch_sync` on that queue): until
+ButtonResolver is ready, its caller blocks for good. Its caller is backboardd's MIG routine `_BKHIDXXPlayHaptic`
+(clients with the entitlements `BKFastHapticPlayEntitlement` / `BKBackBoardClientEntitlement`). ButtonResolver
+itself asks MobileGestalt only `HomeButtonType` (`JwLB44/jEB8aFDpXQ16Tuw`) and `MGIsDeviceOneOfType`; Haptics.framework's
+`HAButtonHapticsLoader` waits for an IOKit service by property match (`IOServiceAddMatchingNotification`). **Neither
+reads `/product/haptics`**, so the node does not change whether ButtonResolver gets ready. So the same missing piece
+does not explain both by this reading: [I] what the node can change is who asks backboardd for a button haptic, or a
+lock path that waits on audiomxd's haptic server (the transactions above). Not proven either way; the first test
+decides:
+
+- `oneios-actuator=0` (no Actuator device, so no `/product/haptics`: both MobileGestalt answers NO, as before 15:35).
+  If the side key locks and wakes again, the node is the switch: then the `oneios-ubt=SpringBoard,backboardd` lines
+  after a press name the wait (`_dispatch_sync_f_slow` under `playHapticForClickState:clickSpeed:` and
+  `_BKHIDXXPlayHaptic` in backboardd; `dispatch_group_wait` in the `com.apple.backboardd.buttonHaptics` block; or a
+  SpringBoard thread in an `AVHapticClient`/`AudioServicesPlaySystemSound` call). If it still does not lock, the node
+  is not the cause of fault 2, and the haptics fault is a separate one.
+
+### The power key: a stand-in for the button haptics service (fix-power-key, 2026-11-14; built, not on the phone)
+
+The owner confirmed in the 9f6dc38 session that the power key neither sleeps nor wakes the display. The presses reach
+iOS (`oneios-hid: buttons: ... 24 key events ... 24 HID reports`, `HID events queued ..., 0 dropped`), so the stop is
+above the HID service, as in the 15:35 boot.
+
+What ButtonResolver needs to get ready [V: ButtonResolver, Haptics.framework and the kernelcache of 24A446]:
+
+- `+[BRInterfaceAOP interface]` makes the AOP interface when MobileGestalt's `HomeButtonType` is 1, or, with fast
+  haptics, when `MGIsDeviceOneOfType` matches its list of device types. [I] iPhone18,2 (a Camera Control phone) is in
+  that list: the list is hashes and was not decoded.
+- `-[BRInterfaceAOP _findService]`: an `IOServiceNameMatching` notification for **`AppleSPUHapticsAudioDriver`** (fast
+  haptics; else `AppleSPUButtonDriver`), then `IOServiceOpen` type 0 (`AOP service added: %u`). `updateReadyState`
+  logs `%s isReady: %s loaderReady: %s`: ready needs the service **and** the loader.
+- Haptics.framework's `HAButtonHapticsLoader` matches `IOPropertyMatch {"Button Haptics Asset Interface" = 1}` (a
+  number), opens type 0, maps memory type 0 (`IOConnectMapMemory`), calls scalar method 1 (`GetNumberOfSupportedAssets`,
+  one scalar out) and posts `HAButtonHapticsLoaderServiceIsAvailableNotification` (also if that call fails; not if
+  the open or the mapping fails: `Unable to open user client err %d`). Assets go in through struct method calls
+  (`UpdateSSHBAsset`).
+- `-[BRInterfaceAOP playState:forSpeed:error:]` is scalar method 2 with three scalars in; the configuration goes in
+  with `IORegistryEntrySetCFProperty` on the service.
+- Apple's `AppleSPUHapticsAudioDriver` is in the kernelcache (the string is in `kernelcache.macho` and in our
+  `kernel.kc`), but it belongs to the always-on processor's kexts, which have no hardware to match here: neither
+  service exists, so ButtonResolver is never ready and backboardd's `BKButtonHapticsController` queue waits for good
+  (section above). Also read: backboardd's `_BKHIDXXApplyButtonDefinitions` does not wait on this home-button type
+  (`not configuring SSHB because we don't have a real home button`); its `_BKHIDXXPlayHaptic` does.
+
+**The stand-in** (`drivers/haptics/OneiOSButtonHaptics.cpp`, a driver-archive source, no XNU patch; **off by default**):
+boot argument `oneios-button-haptics=1` publishes `IOService:/IOResources/oneios-button-haptics/AppleSPUHapticsAudioDriver`
+with `"Button Haptics Asset Interface" = 1`; its user client takes every call (selector 1 answers the slot count,
+`oneios-button-haptics-slots=N`, default 8; selector 2 and the others succeed, outputs zeroed), maps 128 KiB of type
+0, and its `setProperties` keeps every key. Nothing is played on the actuator. Log:
+`ONEIOS BUTTON HAPTICS: off (...)` or `ONEIOS BUTTON HAPTICS: on: AppleSPUHapticsAudioDriver published ...`, then
+`user client N (type 0) opened by backboardd`, `backboardd calls selector N (call N; ...)` (the first 4 calls of each
+selector), `backboardd sets KEY` (each new key).
+Tested: compiled with the drivers (`oneios-tool kernel drivers --check`, 17 sources). **Whether it brings the power key
+back is not known**: the power key worked before `/product/haptics`, and nothing above reads the node, so the stand-in
+helps only if the blocked path above is the one the press takes. The next boots decide (A/B):
+
+| Boot | Boot arguments | If the power key then works |
+|---|---|---|
+| A | as now, plus `oneios-ubt=SpringBoard,backboardd oneios-ubt-at=240 oneios-ubt-every=60` | (the control; the `oneios-ubt` lines after a press show where the threads wait) |
+| B | A plus `oneios-button-haptics=1` | ButtonResolver's readiness was the stop: keep it (then make it the default) |
+| C | A plus `oneios-actuator=0` (no Actuator device, no `/product/haptics`) | the node is the switch, by another path than ButtonResolver |
+| D | A plus `oneios-bl-mode=0` (CoreBrightness keeps VMBLControl; the slider then does nothing again) | the backlight control's mode is the switch (below) |
+| E | A plus `oneios-hid-buttons-builtin=1` | backboardd did not route the buttons because it took them for an external keyboard (below) |
+
+**The buttons look like an external keyboard to backboardd** [F, the PC boot of 2026-11-14 with `haptics=sim`,
+`oneios-button-haptics=1` and the input script; iOS's log read with `oneios-tool ioslog show ... --proc backboardd`]:
+`Services discovered: [<BKIOHIDService ...; eventSource: externalKeyboard; primaryUsagePage: 0x1; primaryUsage: 0x6;
+name: OneiOS buttons; transport: Virtual>` (the touch screen: `eventSource: builtin; ... authenticated; builtIn`), and
+every volume press as `VolumeIncrement page:0xC usage:0xE9 downEvent:1 source:externalKeyboard senderID:100000219
+down`, `0xC/0xE9/100000219 began: ... destinations:<none>`. No power-key line came from the button processor in the
+8 s between backboardd's start-up and the end of that boot, so the power key's own route on the PC is not seen, and
+SpringBoard had only just become the shell, so `destinations:<none>` may be early. [I] An external keyboard's
+consumer keys are not the hardware buttons SpringBoard listens to. `oneios-hid-buttons-builtin=1` (the HID archive,
+`kernel/patches/oneios-hosted/hid/OneiOSHidInput.cpp`, off by default) publishes `Built-In` and the Consumer Control
+pair (0x0C, 1) on the buttons' event service and interface, as the touch screen's are, once the event driver has
+attached (log `oneios-hid: buttons: Consumer Control, Built-In published on the event service`). The device's own pair
+(1, 6), which the personality matches, stays. Also seen in that boot: ButtonHaptics was `ready in 0.73 s` and
+ButtonResolver opened two HID event system connections, but nothing opened the stand-in `AppleSPUHapticsAudioDriver`
+before the boot ended (8 s later), so whether ButtonResolver uses the AOP interface on iPhone18,2 is not settled.
+The decisive line on the phone: backboardd's `BackBoard:Button` line of a power press (`page:0xC usage:0x30 ...
+source:... destinations:...`) in the 9f6dc38 log.
+
+**The 15:35 boot changed two things, not one** [F git]: it was the first with the Actuator (5e426f3, 15:01) and the
+first with `drivers/brightness/BacklightMode.inc` in the Metal plug-in (7d6d6a3, 15:23), which turns CoreBrightness's
+VMBLControl into BLControl in backboardd. A lock's display-off and a wake's display-on go through backboardd's
+brightness control, so [I] the power key may stop there as well: SpringBoard's lock asks backboardd for the backlight
+off, which BLControl now sends to our backlight service (as brightness 0 or a display power change), and the press
+"does not sleep the display" if that request is taken but the panel is not blanked. The brightness bridge never writes
+0 to the panel (`never 0`, section 7a), so a display-off would show as the lowest brightness, not as a dark panel. The
+9f6dc38 session's "a brightness of 0 put the touch IC to sleep" may be that display-off. So read, before any boot,
+whether the 9f6dc38 xnuhost log has a brightness request of 0 (`ONEIOS BACKLIGHT` / `brightness:` lines) within a
+second or two of a power press (`oneios-hid: buttons:` at +5083..+5175). If it does, iOS locked and the stop is ours:
+the panel is not turned off and on (the bridge's side, fix-brightness-touch's area).
+
+What a lock looks like in iOS's log on its way [V strings of SpringBoard.framework and backboardd 24A446; the order is
+[I]]: backboardd `UISensor mode changing to: ... changeSource: LockButton` (seen in 9f6dc38: the UI mode change comes
+with the lock button), then SpringBoard `Lock button down: state=%d`, `Lock button single press should wait for
+double-press timeout: ...`, `Lock button single press recognized.`, `Lock button single press: state=%d`,
+`lockUIFromSource:%{public}@ options:%{public}@`, then backboardd's backlight factor change and CoreBrightness. A
+wake: `Button press up; waking screen.`, `unlockUIFromSource`. The first of these that is missing names the step.
+
+In iOS's log, B should show backboardd's `_BRController ready: device haptic asset slot count:8` (a default-level line), ButtonResolver's (debug level: they may not be stored)
+`AOP service added`, `isReady: YES loaderReady: YES`, and Haptics' `UpdateSSHBAsset` without `err`. What a working
+press produces [I, from backboardd's and SpringBoard's strings, not traced]: SpringBoard's lock path asks backboardd to
+turn the display off (backlight to 0 and the framebuffer's power state off; on the next press, on); the display and
+backlight drivers see that as a brightness of 0 and then a brightness above 0, or a framebuffer power-state change
+(`kernel/patches/oneios-hosted/display/README.md`, the power word).
+
+### The bridge (`runtime/bridges/haptics/haptic.c`)
+
+- Two backends since 2026-11-15 (section 7e): samsung, the evdev device below (the default, unchanged); treble, the
+  vibrator HAL `android.hardware.vibrator.IVibrator/default` (`on(ms)`, then `setAmplitude(level / 255)` when its
+  capabilities have amplitude control, `off()`; `br_haptic_open_as`).
+- Finds the device by its EV_FF bits (`sec_vibrator_inputff` first), sets `FF_GAIN` 10000 once.
+- One effect, updated for every request: `FF_PERIODIC` / `FF_SINE`, period = 1000 / frequency clamped to 4..10 ms
+  (6 ms when iOS names none), magnitude = 40 + 215 x intensity / 1000 (an LRA does not move below a floor), length
+  = the request's (at most 10 s). Then `EV_FF` play; stop = play 0. A worker thread does the ioctls (each is I2C
+  traffic), the newest request wins.
+- The motor is stopped when the guest resets the device, when the bridge closes, and by the kernel when the file
+  closes (xnuhost exits).
+- Counters (2026-11-13): requests from the guest (vibrate, stop, replaced before the worker started them), effects
+  played, stops, failures; the first 8 effects and every power of two after are logged (`haptics: effect N played on
+  ...`), and `haptics: counters: ...` at 16, 32, ... effects and when the bridge closes.
+- `haptics=` in `xnuhost.conf` (or `--set`): `auto` (the device above, with the bridges on), `off`, `sim`: **a
+  stand-in actuator** for a boot with no vibrator (the PC), with the bridges on or off; it takes every request,
+  counts and logs it, and makes the guest's whole path run (the hello names the haptic channel, so `drivers/haptics`
+  publishes the Actuator device and `/product/haptics`). Host test: `runtime/bridges/tests/test_bridges.c`
+  (`test_haptic`: the counters of the fake motor and of the stand-in, and the bridge channel's).
+
+| iOS | Reaches the phone as |
+|---|---|
+| Ringtone, alert and system-sound patterns (`hertz_millisecs`) | on steps as sine effects at the step's intensity; off steps as silence |
+| Core Haptics continuous events (through the Actuator device) | sine effects following the stream's level and frequency, renewed every 30-40 ms |
+| Core Haptics transients, UI and keyboard taps (Actuator device, 3-20 ms bursts) | a 20 ms sine burst at the tap's peak. [U] how sharp it feels; the ROM "click" waveforms (`FF_CUSTOM` `[1, index]`) are the better fit and are not used yet |
+| Sharpness | frequency, within 100..250 Hz |
+
+### Missing, unknown
+
+- [U] the LRA's resonance (attribute `f0_measured` of class `sec_vib_inputff`): 6 ms (166 Hz) is a guess.
+- [U] whether the buzz generator stops fast enough for taps; if not, map bursts under about 25 ms to ROM clicks.
+  The table of ROM/RAM indices is Samsung's firmware (`cs40l26.wmfw`/`.bin` on the phone), not in the kernel source.
+- Not run on the phone yet: the Actuator device (above). [U] whether iOS 27's VirtualAudio wants the `ActuatorIV`
+  input (current and voltage sense) as well; HackiOS ran iOS 16 without it. [U] whether the HAL asks the Actuator for
+  more than one channel (`LegacyHapticSynth: ... output bus format to 2-chan` in iOS's log is the synth's bus, not
+  the device's): `oneios-actuator-channels=2` if the log shows a refused format (selector 5).
+- [U] iOS 27: `hertz_millisecs` is still in the iOS 26.5 MediaExperience [F iOSPlus10]; that MobileGestalt's
+  closed-loop answer still comes from `/product/haptics` is [V] for iOS 16 only.
+- The key stop (`oneios_vibrator_key`) is not wired: the HID input driver must call it on power and volume presses.
+- The AIDL vibrator HAL is the second route (`IVibrator.compose`, `perform`): it needs a binder client for the AIDL
+  binder (`/dev/binder`, another parcel format than `bt/hidl_parcel.c`). Not written; evdev as root is the first.
+
+## 6. Audio
+
+### The phone [F]
+
+- One ALSA card, `pineapple-mtp-snd-card`. Codec WCD939x (`qcom,wcd939x-codec`, DT line 24679; modules
+  `wcd939x`/`wcd938x`), speaker amplifiers WSA884x on SoundWire (`qcom,wsa884x`, lines 24550 and 24621; modules
+  `wsa884x`/`wsa883x`); the DT also carries two Cirrus `cs35l43` nodes (lines 25216, 25249) named by the sound node's
+  `cirrus-codec-name`. LPASS macros `lpass-cdc-{rx,tx,va,wsa,wsa2}-macro`. The DSP graph is AudioReach
+  (`android_vendor_qcom_opensource_agm`, `arpal-lx` in the same GitHub organisation).
+- `audioserver` runs in a session with `media.audio_flinger` and `media.aaudio`; Samsung's `ISecAudioHal` is the HAL.
+- Android 17 (SDK 37). Properties: `aaudio.mmap_policy` 2 (MMAP when it can), `aaudio.mmap_exclusive_policy` 2,
+  `audio.deep_buffer.media` true (a media track with no flags goes to the deep-buffer output). libaaudio exports
+  `AAudio_setMMapPolicy` and `AAudioStream_isMMapUsed` (AAudioTesting.h). The media stream's volume was 14 of 15
+  (2026-11-12).
+
+### iOS side
+
+UniXNU-droidvm f9121cd's `package/DroidVMAudio.cpp` (two `IOAudio2Device`s, UIDs "Speaker" and "Mic", which
+VirtualAudio turns into routable ports) over `DroidVMVirtioSnd.c` (virtio-snd transport, node `/arm-io/virtio-snd`,
+compatible `droidvm,virtio-snd`, 48 kHz S16, stereo out, mono in, periods of 240 frames, polling).
+
+**Until 2026-11-12 neither was built into the hosted kernel**: iOS had no audio device at all. The five session logs
+on the phone of 2026-11-11/12 show `audio: on: helper ...` and then nothing: the guest never started a stream. Now
+they are the hosted build's audio archive, `oneios-tool kernel gen audio`
+(`liboneiosaudio.a`, force-loaded; `oneios_drivers_start` calls `oneios_audio_start`, weak in `OneiOSBridge.c`):
+the transport unchanged (`-DDROIDVM_DEVICE_DYNAMIC=1`), `DroidVMAudio.cpp` staged with boot arguments, and
+`OneiOSAudio.c` (the start line and a report every 30 s while the counters move). Kernel log lines:
+`ONEIOS AUDIO: on|off: virtio-snd ... IOAudio2 devices: ...`, `DroidVMAudio: published Speaker=1 Mic=1 ...`,
+`ONEIOS AUDIO: speaker running|idle, ... engine N periods, N late, ...; virtio-snd N tx periods, N dropped ...`.
+Boot arguments: `droidvm-snd=0`, `droidvm-audio=0`, `oneios-audio-out-uid=`, `oneios-audio-in-uid=` (default
+Speaker, Mic; `none`: no microphone), `oneios-audio-latency=FRAMES` (the speaker's "output latency", so iOS keeps
+video in step: since 2026-11-15 xnuhost passes the helper's measured latency, its probe before the boot; without it
+the default 720 = 15 ms, the MMAP path's prediction; 6480 = 135 ms before), `oneios-audio-ring=FRAMES` (the
+speaker's ring, default 1920: iOS's I/O buffer is at most 0.375 of it, "Latency end to end" below),
+`oneios-audio-report=0`, `oneios-audio-selftest=SECONDS`
+(1..10: 3 s after the start a 1 kHz sine at -30 dBFS straight into the transport, before iOS's audio server: the
+guest kernel to the speaker without iOS; UniXNU-droidvm's `droidvm-snd-selftest` is a full-scale sawtooth, never with
+a speaker).
+
+VirtualAudio publishes only its Null device when the guest says it is a VM (`vmm-present` 1 in xnuhost's tree):
+the boot argument `owner-hide-vmm=audiomxd,com.apple.WebKit.GPU` (lead's decision of 2026-11-11, Droid-VM-UniXNU's
+`patches/xnu-12377/zzyd-owner-hide-vmm.patch`, in the arch series the build uses) hides it from audiomxd. xnuhost's default boot arguments do not carry it
+yet: the audio test cycle adds it (below).
+
+### The bridge
+
+- `runtime/bridges/devices/virtio_snd.c`: the device (control queue: `PCM_INFO`, `SET_PARAMS`, `PREPARE`, `START`,
+  `STOP`, `RELEASE`; two streams; output periods go to the back end as they arrive; a capture thread fills the
+  receive buffers the guest posted).
+- `runtime/bridges/audio/aaudio_helper.c` -> `bin/oneios-audio`: **a helper process**, because AAudio is a shared
+  library and xnuhost is static. xnuhost starts it (`br_audio_helper(path, &ctx)`, `posix_spawn`, a `SOCK_SEQPACKET`
+  pair); it lives in xnuhost's namespace and cgroup, and the return's SIGKILL of the namespace (or xnuhost's exit,
+  which closes the socket) ends it and with it the stream: audioserver closes a dead client's track.
+  - **No realtime thread, by construction.** AAudio makes a SCHED_FIFO thread only for a data callback (an MMAP
+    stream's or a FAST track's: `AudioStream::createThread_l` registers it, which asks system_server's
+    `scheduling_policy` service; in a session that service is gone). So the helper uses no data callback: one
+    blocking `AAudioStream_write` from its own SCHED_OTHER thread, with a uclamp.min boost (`ONEIOS_AUDIO_UCLAMP`,
+    512 of 1024, `sched_setattr` with the policy and nice kept, as `runtime/bridges/cpu`'s vCPU hint). Measured
+    beside One UI (2026-11-12): every thread of the helper SCHED_OTHER (policy 0), the threads in the parent's
+    cpuset; AudioTrack sets the starting thread's nice to -16 (`ANDROID_PRIORITY_AUDIO`, not realtime). A guard
+    checks every thread after each start and every 10 s and sets one found SCHED_FIFO or SCHED_RR back to
+    SCHED_OTHER (logged).
+  - **Since 2026-11-15 (fix-audio-latency): LOW_LATENCY and MMAP exclusive by default**, the path in "Latency end
+    to end" below: MMAP exclusive (the DSP reads our buffer; nothing asks for a priority), MMAP shared only while
+    system_server runs (audioserver's endpoint thread registers itself through `scheduling_policy` and would wait
+    for it forever in a session), else a mixer track (MMAP refused, LOW_LATENCY: what the rest of this bullet
+    describes). `ONEIOS_AUDIO_MMAP=exclusive|shared|off`, `ONEIOS_AUDIO_PERF=none` (the path before 2026-11-15).
+  - **Performance mode before 2026-11-15: NONE by default; LOW_LATENCY opt-in since 2026-11-13** (`ONEIOS_AUDIO_PERF=low`, not run on the phone), asked only when the MMAP
+    refusal worked (AAudio tries MMAP only for LOW_LATENCY; a stream that says `AAudioStream_isMMapUsed` anyway is
+    closed and opened again with NONE). What it gives a blocking writer, read in AOSP `main` (2026-11-13; not read
+    in One UI's own build): AAudio's legacy path (`AudioStreamTrack::open`) sets `AUDIO_OUTPUT_FLAG_FAST|RAW` for
+    usage MEDIA with no session, but with `TRANSFER_SYNC` ("Note that TRANSFER_SYNC does not allow FAST track");
+    `AudioTrack::createTrack_l` then takes FAST off itself ("AUDIO_OUTPUT_FLAG_FAST denied by client": a synchronous
+    writer gets FAST only from a Java thread) and sends no client thread for a priority boost (`clientTid` is set only
+    for a FAST callback thread). So there is no FAST mixer track and no SCHED_FIFO request: the track is a normal
+    mixer track, AAudio reports performance mode NONE (the open line says `low latency asked, none given`), its burst
+    is the normal track's notification period. What is left of LOW_LATENCY is `AUDIO_OUTPUT_FLAG_RAW`: the audio
+    policy's `selectOutput` prefers an output whose flags have the most requested performance flags, so if the
+    speaker's `fast` mixPort declares RAW the track goes on that output's normal mixer (20-24 ms periods,
+    AudioFlinger's `kMinNormalSinkBufferSizeMs`) instead of `primary-out`; if not, nothing changes (the earlier phone
+    run of LOW_LATENCY, 2026-11-12, saw "the same normal-mixer track"). Whether One UI's `fast` mixPort has RAW: not
+    known ([U]; `grep -B2 -A6 'name="fast"' /vendor/etc/audio_policy_configuration.xml` on the phone says).
+  - Output (rewritten 2026-11-13, fix-audio-latency): the guest's periods go into a ring; the writer moves 240-frame
+    chunks into AAudio (woken by each period, not on a 2 ms poll). **The level follows the server's pulls**: a
+    normal mixer track is read a whole mixer period at a time and only when it holds one (AudioFlinger's
+    `prepareTracks_l`: `desiredFrames` = `mNormalFrameCount`), so `AAudioStream_getFramesRead` jumps once per
+    period. The writer measures the jumps (steps less than 3 ms apart are one pull; the median of the last 16) and
+    the time of the last one, and holds the level (ring + AAudio's unread frames) at the target
+    (`ONEIOS_AUDIO_TARGET_MS`, 20 ms) above what the next pull takes of what came in since the last one: right
+    after a pull only the target. Before that it was a burst plus the target at every moment, so the level the
+    guest's audio started on was up to a whole period (on average half) higher than needed, and then the writer
+    filled AAudio to its 2-burst buffer. Until the pulls are seen (a new stream's first ~170 ms) the old rule holds.
+    Priming (before the guest's first chunk, while it is stopped, after an underrun) keeps that level with silence.
+    An underrun (the level below what the next pull takes) plays what the ring has, primes again and raises the
+    target by 5 ms (at most 80); **each `ONEIOS_AUDIO_TARGET_DECAY_S` (20 s) without one lowers it by 5 ms back to
+    its floor** (before, it only went up for the stream's life, and the stream lingers). Drift and excess: the level
+    averaged over 1 s is held within 5 ms of its aim by playing a chunk of 240 ring frames as 239 or 241 (237 while
+    10 ms above: 1.25 %; linear interpolation). **Silence is cut, sound is not**: while the level is 10 ms above its
+    aim, a chunk at the ring's head that is digital silence (every sample within ±1) is dropped, so a backlog (a new
+    track's stall, a burst of late periods) goes at the first pause instead of over 16 s at 1.25 %. **AAudio's
+    buffer** (AudioFlinger's start threshold, and the most a blocking write leaves queued) is a burst plus the
+    target plus one chunk, set again when the target moves (`ONEIOS_AUDIO_BURSTS=N` fixes it at N bursts as
+    before). Above the target plus 60 ms the ring drops its oldest audio to the target (an overflow). Until the
+    server takes the stream's first frames (a newly opened track takes nothing for about 200 ms) nothing is cut:
+    the ring holds 500 ms, and after the stall its backlog (plus 40 ms) is the limit. A partial blocking write (a
+    stall over 200 ms) is finished, not dropped. The guest's STOP keeps the stream open for `ONEIOS_AUDIO_LINGER_S`
+    (60 s): what the ring holds plays, then silence; iOS stops and starts its device around each sound, and a
+    reopened track stalls again. The price is One UI's speaker path kept on with silence for that minute.
+  - Input: a reader thread, blocking `AAudioStream_read` of 240 frames, input preset VOICE_RECOGNITION, the first
+    channel to xnuhost, performance mode NONE. `backend.c` drops what an earlier recording left in the socket at
+    each input START.
+  - Log (xnuhost's log; the numbers are the host test's): `oneios-audio: ready: performance mode low latency, MMAP
+    exclusive first (shared only with system_server) (a blocking writer at SCHED_OTHER, uclamp.min 512: no data
+    callback, no realtime thread), AAudio buffer a burst + the target + 5 ms, ring 500 ms, target 5 ms on MMAP (a new stream at 10), 20 ms
+    on a mixer (at most 80, down 5 ms per 20 s without an underrun), linger 60 s`; `oneios-audio: probe: speaker
+    latency 720 frames (15 ms) on MMAP exclusive: the DSP reads the buffer: 5 ms below AAudio's read + 10 ms of level
+    when a period comes in` and xnuhost's `audio: speaker latency 720 frames (15 ms) measured by the helper:
+    oneios-audio-latency=720`, then `oneios-audio: iOS is told an output latency of 720 frames (15 ms)`;
+    `oneios-audio: speaker open: 48000 Hz, 2 channel(s), low latency asked, low latency given, sharing exclusive,
+    mmap 1, burst 192, buffer 672 of 3072 frames, device 3, session -1; MMAP exclusive: the DSP reads the buffer`
+    (on a mixer: `...; a mixer track (MMAP not given)` or the reason MMAP was passed over); on a mixer, once the
+    server has pulled five times, `oneios-audio: speaker: the server pulls N frames every N ms: the level follows its
+    pulls`; `oneios-audio: speaker: target N ms (20 s without an underrun)`; every 10 s and at each stop `speaker
+    running|stopped ...: frames in, played, underruns, overflows, slips +N/-N, N frames of silence cut, ring N ms
+    (min..max, target N, peak N), margin N ms, the reader takes frames all the time (MMAP exclusive) | server pulls
+    N frames every N ms, AAudio N ms queued, N xruns; latency about N ms; end-to-end N ms (max N; the guest's period
+    late by N ms + the host N ms; iOS is told N ms)` (`margin`: the level above what the reader takes before the
+    guest's next period, or above the next pull, averaged; it should sit near the target. `end-to-end`: from iOS's
+    sample time to the speaker, per guest period since the last report); the same for the microphone.
+  - Fixed 2026-11-12: the helper's state reports were blocking sends that xnuhost reads only while the microphone
+    runs, so after a few hundred speaker starts the socket would fill and the helper stop for good. They are
+    `MSG_DONTWAIT` now.
+- Why AAudio and not tinyalsa: on this SoC a PCM device plays only after the AudioReach graph is set up through the
+  AGM plug-ins and PAL, which the audio HAL does; opening the card beside it would also fight audioserver.
+- Tests: `runtime/bridges/tests/test_audio_helper.c` (in `make test`, about 50 s of real time): the helper against a
+  fake AAudio whose server thread stands in for AudioFlinger's normal mixer (it starts reading once the track holds
+  its buffer size, then takes a whole period of `pull` frames each period and nothing in a period where the track
+  holds less; burst and pull set apart): no underrun or overflow at 0 and ±2000 ppm, the drift steered the right way
+  over the last 6 s of 9 and the level ending within 10 ms of its aim, latency under 120 ms, the microphone's
+  periods in order, the linger, a 200 ms start stall followed by silence (the backlog cut as silence, a marker 1 s
+  later on time), a guest 40 ms late every 0.5 s (underruns raise the target; it is back at 20 ms 5 s after), the
+  latency per stage at six phases of the pulls (below), MMAP not refused (NONE) and MMAP in use anyway (opened again
+  NONE), LOW_LATENCY only with `ONEIOS_AUDIO_PERF=low`, a clean stop when the socket closes: 11,101 checks (most are the guest's sends; timing checks are skipped, each with a line, when a loaded host runs the test late).
+  Since 2026-11-15 the fake HAL can also give MMAP exclusive or shared, and the test checks the path choice, the MMAP
+  level, the end-to-end figure, the probe and the target's recovery on MMAP (20,213 checks; "Latency end to end"
+  below). `test_bridges.c` checks
+  that virtio-snd takes each output period inside the guest's notify (0 in flight), and that the latency probe of a
+  back end other than the helper is `-ENOTSUP`.
+
+### Measured on the phone (2026-11-12, `bridgectl audio`, One UI running, no session)
+
+| What | Result |
+|---|---|
+| uid 0 opens an AAudio output and input beside One UI | yes, no SELinux denial (`dmesg`: 0 `avc: denied`), domain `ksu` |
+| Track | a normal mixer track (AudioFlinger: flags 0x000, frame count 3200, `Latency 133 ms`), 48 kHz stereo, `mmap 0`; written down as deep-buffer, but [F `/vendor/etc/audio_policy_configuration.xml`] the Speaker's route has only `primary-out`, `fast` and `mmap_no_irq_out`: [I] the track is on `primary-out` |
+| 12 s of a 440 Hz tone at -30 dBFS | 0 underruns, 0 xruns, 0 overflows, 70 slips; a first run had 3 overflows at the start (the track's stall) |
+| Latency (written to presented, AAudio's timestamp) | 128-137 ms: AAudio 128-136 ms (our 67 ms buffer + the deep-buffer path), ring 1-5 ms |
+| Second tone 0.5 s after a stop | the lingering stream: no new open, no stall, 0 underruns |
+| Microphone, 2 s | 92,400 frames (96,000 expected; the stream's start), room noise RMS -52 dBFS, peak -41.5 dBFS |
+
+### In a session (2026-11-12, agent prelink's two sessions: `kernel.kc` `66faa3e8` from main 924a0d9, runtime 0.1.8-dev; read from their `xnuhost.log`)
+
+- Kernel: `ONEIOS AUDIO: on: virtio-snd up: output stream 0, input stream 1 x1 (found 1, stage 3, 2 streams);
+  IOAudio2 devices: Speaker and Mic published`, `DroidVMAudio: published Speaker=1 Mic=1 ... output latency 6480
+  frames`, 1.2 s after xnuhost placed the kernel.
+- audiomxd opens both devices and takes hog mode: `2 clients (hog 106)`, `4 selectors (0 refused, last 6)`, `9 maps`
+  (the status pages and both rings), without `owner-hide-vmm`. In the first session nothing started IO.
+- The second session played iOS's first sound through the whole path: the helper opened its stream (`none, sharing
+  shared, mmap 0, burst 1600, buffer 3200 of 4800`), 12,720 frames (265 ms) came in 0.2 s, and the guest stopped.
+  The guest's report after it: `6 selectors (0 refused, last 1)` (StartIO and StopIO), `engine 53 periods, 9 late,
+  12720 frames played`, `virtio-snd 53 tx periods, 0 dropped, 0 errors`: audiomxd ran IO for 265 ms, and 9 of 53
+  engine periods were late by more than a period (the vCPU ran late; the engine then sends back to back), which is
+  why the frames came in a burst.
+  The helper of that runtime cut 5,760 frames (2 overflows: the new track's stall against an 80 ms limit) and
+  cleared the ring at the STOP: fixed after it (above), not yet run on the phone. `0 underruns`, `0 xruns`; the
+  stream closed after the 15 s linger. Which sound it was and whether it was heard: not known (not my session).
+- With system_server gone the helper opened and played (the stream above): AAudio from uid 0 works in a session.
+
+### "Very slow" playback: the cause (media, 2026-11-12: iOS's logs of the 2026-11-11/12 sessions and the 14:12 session)
+
+- **[F] iOS's audio I/O thread could not start for large I/O buffers.** In every boot audiomxd logs `Throwing Exception:
+  not (kernel_error == 0) AMCP::Utility::Thread_Utilities::configure_thread_for_realtime - thread_policy_set failed.
+  Cycle Size: 1536000 Thread Parameters: 1536000 1200000 1536000 1` (2229115 for the Null device), then `An Exception
+  was thrown during Init`, `IO Stopped Context 80 after 0 frames`, `AQMEIO.cpp:201 timed out after 3.000s` and
+  `System sound finished playing ... total time 2441 ms` (2.4-3.3 s in each boot). The guest's counter runs at
+  19.2 MHz (`host: ... counter 19200000 Hz`): the cycle, 1536000 ticks, is 80 ms (`vaemCalculateAndSetDeviceBufferDuration:
+  duration = 0.080, ... 3840`), and the computation, 1200000 ticks, is 62.5 ms here but 50 ms at Apple's 24 MHz. XNU
+  refuses a computation above `max_rt_quantum` (50 ms = 960000 ticks at 19.2 MHz; osfmk/kern/thread_policy.c). So
+  every sound played with a large buffer (system sounds: buffer 3072 frames; long-form media) got no I/O at all and
+  waited out the 3 s timeout; a 1024-frame buffer (the Settings ringtone preview of the 14:12 session: `IO Stopped
+  Context 96 after 52224 frames`) asks less and played. macOS-DroidVM found the same on its 19.2 MHz board (WebKit's
+  players stopped at their first second). [I] This is the "very slow": sounds seconds late or missing, players that
+  stall.
+- **Fix: hosted 0052** (`kernel/patches/oneios-hosted/0052-rt-computation-held.patch`): a computation above the
+  maximum is held to it when the constraint allows. The guest's scheduler only: no host thread changes its policy.
+  Needs a new `kernel.kc`. Expected in iOS's log after it: no `configure_thread_for_realtime` exception, `IO Stopped
+  Context N after N frames` with N > 0 for system sounds, no `timed out after 3.000s`; in xnuhost's log a
+  `speaker open` at the lock click or a keyboard click, `frames in` close to the sound's length.
+- **The host path's latency** (the rest of the delay, after the fix): 131-142 ms in the 14:12 session (`AAudio 131 ms
+  queued`), as measured beside One UI. It is AAudio's buffer level (one 1600-frame burst plus a 20 ms target, about
+  53 ms) plus the normal mixer and the HAL (about 78 ms). **Superseded on 2026-11-13** by "Latency per stage" below
+  (the helper's level measured in a harness, the burst shown to be the mixer's period, the level, the target, the
+  buffer changed; the reported latency not yet). What was looked at on 2026-11-12:
+  - a non-deep-buffer route: the track is on `primary-out` already (above); the `fast` port needs a FAST track,
+    which AudioFlinger grants only to a callback or a Java writer and then raises that client's thread to SCHED_FIFO
+    through system_server: not allowed (no realtime thread) and not there in a session. MMAP is out the same way.
+  - a smaller buffer: `ONEIOS_AUDIO_BURSTS=1` and `ONEIOS_AUDIO_TARGET_MS=10` are the knobs (xnuhost's environment, which the helper inherits; no `xnuhost.conf` key); not
+    made the default, because the server's mixer period on this phone is not measured (the burst of 1600 is the
+    track's notification period, not the mixer's) and an underrun is worse than 30 ms.
+  - the stream kept open in silence: the linger is 60 s now (above). A sound after a longer pause pays the open
+    and the new track's first 200 ms once.
+  - the latency iOS is told (`oneios-audio-latency`, 6480 frames = 135 ms): it matched the 131-142 ms measured (the new helper: about
+    105 ms predicted, below; the default is unchanged until the phone measures it).
+  - iOS's own buffer: system sounds use a 3072-frame I/O buffer (64 ms) of iOS's choosing; not changed.
+
+### Latency per stage (fix-audio-latency, 2026-11-13; host-tested, not run on the phone; the mixer-track path, superseded as the default by "Latency end to end" below)
+
+The fault (the phone's 23:45 boot of 2026-11-12): `DroidVMAudio: ... output latency 6480 frames`, `oneios-audio:
+ready: performance mode none, MMAP off, AAudio buffer 2 bursts, ring 500 ms, target 20 ms (at most 80), linger 60
+s`, playback about 130-140 ms late.
+
+**What the owner hears.** iOS's HAL adds a device's `output latency` (and its safety offset) to the time stamps it
+gives its clients; AVFoundation's players use them to show a video frame when its sound comes out. So the number
+delays pictures (A/V sync), not the sound: DroidVMAudio's engine plays its ring on its own clock whatever the
+property says. A tap or key click that comes late is the real path below; a reported latency larger than the path
+shows only as video waiting for its sound (sound ahead of the lips), a smaller one as sound behind the lips.
+
+| Stage (the order a sample takes) | Before | After | How it is known |
+|---|---|---|---|
+| iOS's HAL: the I/O buffer it writes ahead (1024-3840 frames, 21-80 ms, iOS's choice per client) plus the safety offset (480 frames, 10 ms) | the same | the same | [F] iOS's logs (`vaemCalculateAndSetDeviceBufferDuration: duration = 0.080`), DroidVMAudio.cpp; iOS's own, as on a device |
+| The guest's engine (hands a period on once it has passed) | 0-5 ms | the same | DroidVMAudio.cpp `run()` |
+| virtio-snd, guest to xnuhost | under 0.01 ms, 0 periods in flight | the same | `test_bridges.c`: each period is with the back end before the guest's notify returns (0.7 us on average, 6 us at most); the guest's 16 slots (`SND_SLOTS`) never fill, so fewer slots would cut nothing |
+| Socket and the helper's ring | 10.5 ms (harness; the writer waited for 244 frames and polled every 2 ms; the phone's reports said 1-5 ms) | 0.1-0.7 ms | harness |
+| AAudio's queue, to the server's read | 62.9 ms (harness: the writer filled AAudio to its 2-burst buffer, 3200 frames) | 32.7 ms (the target plus half a pull) | harness |
+| Android after the read: the normal mixer, the HAL, the DSP | 65-73 ms | the same | [I] the phone's AAudio timestamp latency of 2026-11-12 (128-136 ms written to presented) less the old helper's 63 ms in the harness |
+| **Host path** (the helper's `latency about N ms`) | 131-142 ms (phone) | **about 98-106 ms** [I, predicted] | the two rows above |
+| A new stream's first sound (the open and the new track's ~200 ms before the server reads) | late by the stall, the backlog then played 1.25 % faster for about 16 s | the backlog's silence is cut at the sound's first pause: a marker 1 s after a 200 ms stall went from 268 ms to 22 ms (harness) | harness |
+
+The harness: `test_audio_helper.c`'s latency cases (`stage:` lines), the helper of `origin/main` 3d0644f and the new
+one built against the same fake (pulls of 1600 frames, burst 1600, the guest starting at six phases of the pulls, 60
+markers each), averages:
+
+| Fake server | Helper | Socket + ring | AAudio queue | Guest send to server read (max) |
+|---|---|---|---|---|
+| pulls 1600 (33 ms), burst 1600: the phone's | before | 10.5 ms | 62.9 ms | 73.4 ms (84.3) |
+| | after | 0.1-0.7 ms | 32.7-34.1 ms | 33.4-34.2 ms (44.5-45.0) |
+| pulls 800 (17 ms), burst 1600 | before | 6.4 ms | 55.9 ms | 62.4 ms (72.0) |
+| | after | 0.1 ms | 25.6-27.0 ms | 25.7-27.2 ms (34.4-35.3) |
+| a 200 ms start stall, then 1 s of silence, then markers | before | 201.6 ms | 66.4 ms | 268.0 ms |
+| | after | 0.1-0.2 ms | 21.7-22.0 ms | 21.8-22.1 ms |
+
+(Before, in the harness, also failed 13 of the new test's checks: the drift and level checks and the stall case.)
+
+**The burst is the mixer's period** [I, from AOSP `main`'s sizing, not read in One UI's build]: the phone's track has
+burst 1600 of capacity 4800 (`bridgectl audio`, 2026-11-12). A normal track's notification period (AAudio's burst)
+is its frame count over `nBuffering`, 3 when the frame count is three normal-mixer periods, else 2
+(`PlaybackThread::createTrack_l`), and the frame count is `calculateMinFrameCount` = a whole number of mixer
+periods. 4800 / 1600 = 3 holds only for a mixer period of 1600 frames (33.3 ms), which also means `primary-out` has
+no fast mixer in front (a fast mixer's normal sink is 20-24 ms) and reports a latency of 100-133 ms. The helper now
+measures it (`the server pulls N frames every N ms`).
+
+**What changed, and what each measured** (all in the harness above; the phone has not run any of it):
+1. The level follows the server's pulls (the old one was phase-blind: a burst plus the target at every moment, then
+   AAudio filled to 2 bursts): AAudio's queue 62.9 -> 32.7 ms; with pulls of 800, 55.9 -> 25.6 ms (the burst no
+   longer counts, the pull does).
+2. The writer is woken by each period and plays a chunk as soon as a period is in the ring (slips change the output
+   length instead of waiting for 241 frames): socket + ring 10.5 -> 0.1-0.7 ms.
+3. AAudio's buffer is a burst plus the target plus a chunk (2800 frames on the phone) instead of 2 bursts (3200): it
+   is AudioFlinger's start threshold, so a new stream starts 400 frames (8 ms) lower, and a backlog waits in the
+   ring where its silence can be cut.
+4. Silence in a backlog is cut: after a 200 ms stall the next sound is on time once a pause has come (268 -> 22 ms);
+   continuous sound still loses a backlog only by playing 1.25 % faster (as before).
+5. The target comes back down: 5 ms per 20 s without an underrun (a guest 40 ms late every 0.5 s raised it to
+   25 ms; 5 s on time brought it back to 20). Before, it only went up, for a stream that lingers 60 s after each
+   sound. The floor stays 20 ms: the guest's engine was late by more than a period in 9 of 53 periods on the phone
+   (2026-11-12), and an underrun is a gap.
+6. LOW_LATENCY, opt-in (`ONEIOS_AUDIO_PERF=low`; above, "Performance mode"): no FAST track and no realtime thread for a blocking
+   writer (AOSP source); the RAW flag it carries may move the track to the `fast` output's normal mixer [U]. Nothing
+   to measure on the host: the fake has one output.
+7. The reported latency: NOT changed (6480 = 135 ms, which also leaves the engine's 5 ms out). The new helper predicts 5040
+   frames (105 ms = 5 ms + about 100 ms); a kernel build with that default was stopped at the hand-off of 2026-11-13: set `oneios-audio-latency=5040` (or the measured value) in the boot arguments instead.
+
+**Not done, and why.** A FAST mixer track or MMAP needs a realtime client thread (AAudio's callback path asks
+system_server for SCHED_FIFO), which the way back forbids. [I, AOSP source] AudioFlinger also gives a FAST track
+without any priority request to a `TRANSFER_OBTAIN` client and to a synchronous Java writer (`clientTid` -1): the
+next lever for the 65-73 ms after the read, but only through libaudioclient's private C++ API (no NDK, no stable
+ABI across One UI builds) or a Java writer (app_process) beside xnuhost; not tried. iOS's own I/O buffer and safety
+offset: unchanged (a smaller safety offset would glitch when the guest's audio thread is late).
+
+**On the phone (what waited for it, for the helper of 2026-11-13; superseded by "Latency end to end" below, whose defaults are LOW_LATENCY, MMAP exclusive and the measured output latency).** A session with that runtime (any `kernel.kc`; the kernel was unchanged):
+- xnuhost's log: `oneios-audio: ready: performance mode none ...`; `speaker open: ... none asked, none given, ...
+  mmap 0, burst B, buffer B+1200 of C frames`; `oneios-audio: speaker: the server pulls N frames every M ms`
+  (expected 1600 every 33.3: then the inference above holds); then a second session (or `bridgectl`, below) with
+  `ONEIOS_AUDIO_PERF=low` in xnuhost's environment: `low latency asked, none given` expected (a `mmap 1` or a `given
+  low latency` would be new: then leave it off), and a smaller N means RAW moved the track to the `fast` output;
+  `speaker running|stopped ...: ... margin N ms` near the target (20); `latency about N ms` (AAudio's timestamp:
+  written to presented, plus the ring): expected about 95-105, was 130-137; `0 underruns`, and if there are some,
+  `target N ms (20 s without an underrun)` lines bringing it back. No `thread N was SCHED_FIFO` line.
+- The reported latency: the kernel still says `output latency 6480 frames`. Set `oneios-audio-latency=` to (N + 5) x
+  48 frames, N the helper's `latency about N ms`, in the `boot-args=` line of `xnuhost.conf` (5040 if N is 100), and
+  then make it the default (`tools/oneios-tool/crates/oneios-kernel/src/staged/mod.rs` `output_latency!`, the goldens
+  `tests/kernelgen/golden/synthetic/audio.out`, `stdout.txt`, `staged.sha256`, and a kernel build + prelink).
+- Beside One UI, without a session (the same as 2026-11-12, so the two compare): `bridgectl audio
+  /data/local/tmp/oneios-audio 12`, then once more with `ONEIOS_AUDIO_PERF=low`; the `latency about` of each says
+  what RAW does. `dumpsys media.audio_flinger` while it plays shows which output thread holds the track (its pid) and
+  the thread's frame count (the mixer's period).
+- The owner's ear, end to end (touch to sound): Settings > Sounds & Haptics > Keyboard Feedback > Sound on; record
+  the phone with another device's microphone while tapping keys with a fingernail (the nail's click on the glass is
+  the first click in the recording, the keyboard's sound the second). The gap, over ten taps, before and after; it
+  includes iOS's own I/O buffer, so it is longer than the host path. A/V: a lip-sync test video (a flash with a
+  beep) in Safari, filmed with sound by another device: the beep before the flash means the reported latency is
+  too large, after it too small.
+
+### Latency end to end (fix-audio-latency, 2026-11-15; host-tested and built, not run on the phone)
+
+The fault (the owner, high priority): "audio doesn't play in time, the delay of audio playback is very high". The
+8644ae9 session's `xnuhost.log`: `oneios-audio: ready: performance mode none ..., MMAP off, ...`, `speaker open:
+48000 Hz, 2 channel(s), none asked, none given, sharing shared, mmap 0, burst 1600, buffer 2800 of 4800 frames,
+device 3`, `speaker running: ... ring 0 ms (0..0, target 20, peak 30), margin 20 ms, server pulls 960 frames every
+19.9 ms, AAudio 106 ms queued, 2 xruns; latency about 116 ms` (105-123 ms over the session, the host side alone);
+the kernel's `DroidVMAudio: published ... output latency 6480 frames` (135 ms told to iOS).
+
+Each part, from iOS's mix to the speaker, its cause and the fix:
+
+| Part | Cause | Fix | Before | After |
+|---|---|---|---|---|
+| iOS's I/O buffer: the HAL writes one to two I/O buffers plus the safety offset ahead of the device's clock (a frame waits 1.5 buffers + the safety offset on average) | [F] CoreAudio's `HALS_IOContextDescription::CalculateMaximumIOBufferFrameSize` (24A446's dyld cache, read with `ipsw dyld disass` on the Linux PC): the smallest `io buffer frame size` of the context's devices x 0.375, at most 4096. DroidVMAudio's ring was 8192 frames: at most 3072, which system sounds take (iOS asks 0.080 s, 3840: `vaemCalculateAndSetDeviceBufferDuration`, "system sounds: buffer 3072 frames" above). 0.375 is 3/8: two buffers ahead (3/4 of the ring) and a quarter for the device's read | the speaker's ring 1920 frames (`oneios-audio-ring`; a whole number of periods): at most 720 frames (15 ms) | 1.5 x 3072 + 480 = 5088 frames, 106 ms for a system sound [I, from the cap] | 1.5 x 720 + 240 = 1320 frames, 27.5 ms at the cap [I]; the guest's `speaker engine:` line measures it |
+| The guest's engine | handed a period on once it had passed (+240 frames) behind a safety offset of 480 | hands the period on as it starts; the safety offset is that period (240): the HAL has written it by then | 5 ms after the safety offset | 0 (the safety offset is in the row above) |
+| The ring's wrap (every device) | 8192 is not a whole number of 240-frame periods: once a ring (171 ms) the engine read and zeroed 208 frames past the ring's buffer (the microphone wrote them), and the ring's first 208 frames were never played; the zero time stamp moved only every 245760 frames (5.1 s), when a period happened to end on a wrap | a bounce buffer for a period over the end; the zero time stamp at each wrap | a 4.3 ms piece of the next allocation every 171 ms [I, from the code] | none |
+| virtio-snd, the socket, the helper's ring | (unchanged: 0 periods in flight) | | under 1 ms | under 1 ms |
+| The host: AAudio and Android after it | a normal mixer track (performance mode NONE; LOW_LATENCY cannot get a FAST track for a blocking writer) on `primary-out`: AAudio's queue (the target above a pull of 960-1600 frames) and the mixer, the HAL and the DSP after the read | LOW_LATENCY, MMAP exclusive (the DSP reads our buffer; a blocking SCHED_OTHER writer with uclamp.min 512); the level 5 ms (at least a burst) above what the DSP takes before the guest's next period (on MMAP shared a burst more: the endpoint takes one at a time); a new stream starts at 10 ms; AAudio's xruns and an underrun raise it 5 ms; it comes down 5 ms after 20 s without one only when the latest guest period of those 20 s was 3 ms inside the lower target (the floor of 5 ms needs periods within 2 ms) | 105-123 ms (8644ae9, phone) | [I] about 10-20 ms: the level 5-10 ms + what the HAL and DSP hold below the read (on the phone: the probe's `N ms below AAudio's read`) |
+| What iOS is told (`output latency`) | a fixed 6480 frames | the helper's probe before the boot (`oneios-audio-latency=` from xnuhost) | 135 ms told, about 121 ms true | measured each boot |
+
+So for a system sound (iOS at the cap): about 111 + 116 = 230 ms from iOS's mix to the speaker before [I], about
+27 + 15 = 42 ms after [I]; from iOS's sample time to the speaker (what `output latency` means, and what A/V sync
+uses) 121 ms before, 10-20 ms after [I]. A smaller ring lowers the first part further: `oneios-audio-ring=1440`
+(at most 540 frames) leaves the HAL only 120 frames of slack for a late engine at the cap; 1920 leaves 240 (5 ms).
+
+**Why not a FAST track.** [F, AOSP `main`'s source, not One UI's build] AAudio's legacy path asks
+`AUDIO_OUTPUT_FLAG_FAST` for LOW_LATENCY but with `TRANSFER_SYNC` for a blocking writer, and `AudioTrack::
+createTrack_l` takes FAST off ("denied by client": a synchronous writer gets FAST only with `threadCanCallJava`,
+which AAudio passes false). A FAST track needs a data callback, whose thread AudioFlinger raises to SCHED_FIFO
+(the way back forbids it, and the request through `scheduling_policy` would wait for system_server forever in a
+session). MMAP exclusive needs neither: the DSP itself reads the buffer, `AudioStreamInternal` starts a thread only
+for a callback, and neither `AAudioServiceStreamMMAP` nor AudioFlinger's `MmapThread` asks for a priority. MMAP
+shared does (its endpoint thread in audioserver registers through `android::requestPriority`, which loops on
+`checkService("scheduling_policy")` with `sleep(1)` forever without system_server): kept only while system_server
+runs. What this phone's HAL gives: [U] until the phone runs it. The phone has `aaudio.mmap_policy` 2,
+`aaudio.mmap_exclusive_policy` 2 and a `mmap_no_irq_out` port on the speaker's route (above), so MMAP exclusive is
+expected; the helper's `speaker open` line says it (`sharing exclusive, mmap 1, burst B`).
+
+**End to end, measured (lasting lines).**
+- Host (`oneios-audio: speaker running|stopped ...; end-to-end N ms (max N; the guest's period late by N ms + the
+  host N ms; iOS is told N ms)`): per guest period, its lateness against the guest's schedule (the earliest arrival
+  of the last one to two seconds less its sample time, so that a guest that paused or lost a period is not late for good: the guest's engine hands period n on at its start, on the same counter as the
+  host's `CLOCK_MONOTONIC_RAW`) plus what the ring and AAudio hold ahead of it when it comes in (frames written but
+  not yet presented, from `AAudioStream_getTimestamp`). That is iOS's sample time to the speaker. A kernel from
+  before this change hands a period on 5 ms later than the model says: its figure is 5 ms short.
+- Guest (`ONEIOS AUDIO: speaker engine: N periods, taken late by N us on average (max N); the HAL wrote N..N frames
+  ahead (N on average, N ms: iOS's I/O buffer and safety offset), N periods tight (ring N frames)`, every 30 s while
+  it plays): the HAL's write end (`EngineStatus` +0x20) against the period being taken is iOS's mix to the handoff;
+  `tight` counts periods where the HAL had written within a period of overwriting what was not taken yet (then raise
+  `oneios-audio-ring`). If the HAL does not fill the write end, the line says `the HAL's write end not ahead (last N)`.
+- iOS's mix to the speaker = the guest's average lead + the host's end-to-end.
+- The phone check: `bridgectl audio-loop` (runtime/bridges/README.md, "On the phone"): clicks into the helper, heard
+  by the microphone: the round trip bounds the speaker's part from above.
+
+**Tested on the PC** (`runtime/bridges/tests/test_audio_helper.c`, 20219 checks, 0 failed; the box had a load of 12-40
+on 4 CPUs from other agents' qemu boots and builds, so every timing check was skipped with its line and the figures
+below are under that load): a fake HAL with MMAP exclusive (burst 192 taken at once every 4 ms, a timestamp 240
+frames behind the read): one open, `sharing exclusive, mmap 1`, floor 5 ms, a new stream at 10 ms; the probe
+answered 720 frames (5 ms below the read + the 10 ms level), and the stream it opened was the one the next START used.
+**The CI runner (a lightly loaded 4-CPU VM, PR #51's first run) found one underrun in 9 s on MMAP exclusive at a 5
+ms target, with 0 xruns**: the helper's own "about to run dry" with the ring empty, and so a gap of silence, which
+the phone would hear too. Two causes, both fixed: priming ended when the ring's chunk and AAudio's silence together
+reached the need, so the guest's first chunk went in on whatever the DSP had left of the silence (up to a burst under
+the target), and a slip up came only 5 ms under a 5 ms target (never); and 5 ms leaves a guest period only 3 ms to
+be late, which the runner's (and a phone's busy vCPUs') periods were at times. Now priming fills AAudio itself to
+the need, a level 1 ms under the target slips up, a new MMAP stream starts at 10 ms and comes down only when the
+guest's periods were on time for it. The figures below are from before that fix; over six runs the six
+latency sounds' end-to-end was 16-42 ms (16.3 at the lowest load, 12-15; the guest's lateness 0.8-2.4 ms), AAudio's
+queue 13-34 ms, the target raised by the fake DSP's xruns when the loaded host ran the writer late (each +5 ms),
+against the mixer track's queue 22-41 ms and end-to-end 17-77 ms in the same runs (that fake presents a pull's frames
+from the pull on, so its end-to-end is under its queue); MMAP shared without system_server closed before
+its start and a mixer track opened, with it kept; AAudio_setMMapPolicy refused: a mixer track kept LOW_LATENCY;
+`ONEIOS_AUDIO_PERF=none` and `ONEIOS_AUDIO_MMAP=off`; a guest 40 ms late every 0.5 s on MMAP: 3 underruns, the
+target up to 10-25 ms and back down as far as the guest's lateness allows. `origin/main`'s helper and test under the same load failed 5
+checks (overflows, the stall's silence cut, the markers): this test now skips those, as the other timing checks,
+when the host ran it late. `test_bridges.c`: the probe of a non-helper back end is `-ENOTSUP`. The kernel's edit
+list against the pinned `DroidVMAudio.cpp` and the goldens: `cargo test -p oneios-kernel`; the hosted kernel build
+(`HOSTED_OUT=audiolat`, 1229 s; `compare-golden.sh`: the audio files the same) and its prelink (`kernel.kc`
+`ee72d94886023f31`, audit 0 failures). A PC boot of it was not run: the box's qemu queue had five boots of up to 100
+minutes ahead, and a PC boot plays no iOS sound (the null back end), so it would only show the attach lines.
+**The PC cannot show:** the phone's HAL and DSP (whether MMAP exclusive is given, its burst,
+what it holds below the read), the real end to end, iOS's I/O buffer and the HAL's write end (no iOS sound plays on
+a PC boot with the null back end), the round trip through air.
+
+**On the phone (what waits for it).** A session with this runtime and kernel:
+- xnuhost's log: `audio: speaker latency N frames (N ms) measured by the helper: oneios-audio-latency=N`, the
+  helper's `probe:` line, `speaker open: ... low latency asked, low latency given, sharing exclusive, mmap 1, burst
+  B ...; MMAP exclusive: the DSP reads the buffer` (or the reason it fell back), no `thread N was SCHED_FIFO` line;
+  `speaker running: ... 0 underruns ..., N xruns; latency about N ms; end-to-end N ms (...)`: expected 10-20 ms, was
+  116-121.
+- The kernel's log: `DroidVMAudio: speaker: ring 1920 frames (iOS's I/O buffer at most 720), safety offset 240, each
+  period handed on as it starts; output latency N frames` (N the probe's), and while sound plays `ONEIOS AUDIO:
+  speaker engine: ... the HAL wrote N..N frames ahead ...`: expected 960-1680 (720 x 1..2 + 240), 0 tight.
+- iOS's own log (`oneios-tool ioslog show ... --proc audiomxd`): `vaemCalculateAndSetDeviceBufferDuration` asking
+  what it asks, the HAL taking at most 720 frames; no `Cannot set audio buffer frame size`.
+- Beside One UI: `bridgectl audio /data/local/tmp/oneios-audio 12` (the probe, the path) and `bridgectl audio-loop
+  /data/local/tmp/oneios-audio 10` (the round trip); then the keyboard-click recording above, before and after.
+
+### Missing, unknown
+
+- **Not run yet in a test cycle of mine:** `owner-hide-vmm=audiomxd,com.apple.WebKit.GPU` (VirtualAudio's Null device
+  when the guest says it is a VM; audiomxd took both devices without it, so whether it changes the routes is [U]),
+  the kernel's self-test tone, a sound iOS is asked for (the lock click with the power key; [U] iOS's ringer state:
+  the buttons' Ring Enable bit is 0, which may mean silent, so UI sounds may be muted), the microphone in a session,
+  and the helper with the stall fix. The Mac `kernel.kc` I built before (`61d926d8`, `636ec3fa`) is superseded:
+  `kernel.kc` from main has the archive and boots.
+- Playback from uid 0 with system_server gone works (above). [U] Recording in a session: whether the record app-op
+  silences uid 0 without system_server (AppOpsManager is a system_server service) is not measured yet.
+- [U] Whether VirtualAudio of iPhone18,2 builds its speaker route on "Speaker" and "Mic" (UniXNU-droidvm's iPad
+  UIDs). iOSPlus10's iOS 16 iPhone needed "Speaker" with a silent stereo input and "Hawking"; the UIDs are boot
+  arguments now, a third device would be a change of the staged source.
+- Volume: iOS's volume keys scale the samples in iOS (VirtualAudio's software volume [I from iOSPlus10]); the
+  Android media stream stays at One UI's last volume (14 of 15 on 2026-11-12). Nothing turns it down for a session.
+- Latency: 131-142 ms on the phone before 2026-11-13, 105-123 ms (host side) in the 8644ae9 session; since
+  2026-11-15 MMAP exclusive and the smaller speaker ring ("Latency end to end" above): [U] what the phone's HAL gives
+  and the real figures, until the phone runs it. A FAST track needs a callback's realtime thread (not done).
+- Routing: One UI's audio policy's default for a media stream (speaker; a wired or Bluetooth headset if connected
+  [U]). The earpiece needs a voice-communication stream or AAudio's device id of the earpiece port: not done. Calls
+  are out of scope (no baseband in the guest).
+- The Actuator device (Core Haptics taps, section 5) is an IOAudio2Device of the same archive, but its periods go to
+  the haptics bridge, not to virtio-snd and this helper.
+
+## 7. Camera (fable-camera, 2026-11-11; camera, 2026-11-12)
+
+Built on all three sides. **Where it broke (iOS's own log of the 2026-11-12 sessions): iOS's capture stack never used
+our camera.** CMCapture 27 probes for one of six camera driver classes, found none in 5 s ("Camera driver not
+started in time"), so its device vendor had no create function and every client got error -12786 and no camera;
+the old plug-in was in no image and nothing would have loaded it. **The route now (2026-11-12, built, not run):
+Apple's own plug-in loader.** The kernel publishes `AppleH9CamIn`; for that class CMCapture `dlopen()`s
+`/System/Library/MediaCapture/H9ISP.mediacapture` and makes every device with its `H9ISPCaptureDeviceCreate`; that
+file is our plug-in, on the Data seed and shown there by hosted 0056; it reads frames through AppleH9CamIn's user
+client, which `cameracaptured`'s sandbox allows. No method of CMCapture is replaced. Details and the log lines the
+next session must show: `userland/camera/README.md`. The host side's first phone run (camctl, NDK back end, 2026-11-11):
+the cameras are listed and one opens, no frame arrived; the cause is fixed in the code and the fix has not run on
+the phone yet ("The first phone run" below). Also `runtime/bridges/camera/README.md` (the host, the phone commands),
+`drivers/camera/README.md`.
+
+### The phone [F]
+
+- Sensors (module files in
+  [android_device_samsung_sm8650-common@48c66f6](https://github.com/samsung-sm8650/android_device_samsung_sm8650-common/blob/48c66f6543b31784fce4e7d23ea855897f18ce6e/proprietary-files.txt),
+  slots 0, 1, 2, 3, 6, 12 in the DT, `qcom,cam-sensor*`, lines 15571-16040):
+
+  | Slot | Module file | Sensor | Role [I from the slot names] | Bridge role |
+  |---|---|---|---|---|
+  | 0 | `com.samsung.sensormodule.0_lsi_s5khp2.bin` | Samsung S5KHP2 (200 MP) | rear wide | `wide` |
+  | 1, 12 | `1_lsi_s5k3lu.bin`, `12_lsi_s5k3lu_full.bin` | Samsung S5K3LU (12 MP) | front | `front` |
+  | 2 | `2_sony_imx564.bin` | Sony IMX564 (12 MP) | rear ultra-wide | `ultrawide` |
+  | 3 | `3_sony_imx754_x3.bin` | Sony IMX754 (10 MP) | rear 3x | `tele3` |
+  | 6 | `6_sony_imx854.bin` | Sony IMX854 (50 MP) | rear 5x | `tele5` |
+
+- Services running in a session: the provider HAL `vendor.samsung.hardware.camera.provider`
+  (`ICameraProvider/internal/0`), `media.camera` (cameraserver), and the vendor-facing
+  `android.frameworks.cameraservice.service.ICameraService/default`.
+- Cameras by cameraserver [F the phone, SM-S928B, Android 17 `CP2A.260605.016.S928BXXU6EZIF`, `camctl --backend
+  ndk list` as root, 2026-11-11]. Every one has YUV sizes up to 1920x1080 and the frame rate ranges 15-15, 24-24,
+  15-30, 30-30, 15-60, 60-60:
+
+  | Id | Facing | Focal length (35 mm equivalent) | Sensor array | Turned | Kind | Bridge role |
+  |---|---|---|---|---|---|---|
+  | 0 | back | 6.30 mm (22) | 4080x3060 | 90 | logical multi-camera | `wide` |
+  | 1 | front | 3.30 mm (25) | 4000x3000 | 270 | | `front` |
+  | 2 | back | 2.20 mm (14) | 4000x3000 | 90 | | `ultrawide` |
+  | 3 | front | 3.30 mm (30) | 3392x2544 | 270 | | `other` (not given to the guest) |
+
+  The 3x and 5x telephotos are not cameras of their own: they are physical cameras behind logical camera 0. The
+  bridge lists a logical camera's physical cameras after these and opens one as a physical stream of its logical
+  camera. [U] their ids, and whether the HAL gives such a stream alone (else: camera 0 with a zoom ratio).
+- [U] which ids the provider HAL lists (expected: every sensor and Samsung's hidden ones). Roles are given by
+  facing and 35 mm equivalent focal length (below 18 mm ultra-wide, below 45 wide, below 90 3x, else 5x).
+
+### The first phone run (2026-11-11)
+
+`camctl --backend ndk --camera wide --frames 90 capture`, root through KernelSU, One UI running, runtime 0.1.1:
+camera 0 opened, the 1280x720 30 fps session was made, the repeating request was accepted, and `no frame arrived`,
+with no error.
+
+- **Cause [F AOSP `android17-release`; I that it is the only one]: no binder threads.** cameraserver delivers
+  everything by binder calls into the client: the callbacks, and the pictures (the `AImageReader`'s buffer queue is
+  in the client; cameraserver's request thread calls its `dequeueBuffer`). An app has binder threads from zygote; a
+  plain executable has none and the NDK camera and media libraries start none. The calls made while the client is
+  itself inside a call (open, configure) are served on the calling thread, so those succeed; then cameraserver's
+  first `dequeueBuffer` waits for ever, and the error callback could not arrive either.
+- **Not the cause [F the same sources]:** uid state (uids below 10000 are always active; an idle uid is
+  disconnected with an error, not starved), app-ops (none for a native client below uid 10000), the privacy switch
+  and device policy (they refuse the open). The reader's format (YUV_420_888), its CPU-read usage and the
+  `TEMPLATE_PREVIEW` request with the reader's window as its target were already right.
+- **Fix:** both back ends start the binder thread pool (4 threads, ordinary priority) before anything else; the
+  NDK back end prints every session, device and capture callback and every status by name, and at the stop a
+  `stopped at:` line that names the stage when no picture came (`camctl -v`, `-vv`). Not yet run on the phone.
+- **If it still gives no frame:** the HAL back end (`--backend hal`) becomes the route with One UI running too.
+
+### The path
+
+| Part | Where | State |
+|---|---|---|
+| Helper process `bin/oneios-camera`: opens a camera, NV12 frames with the sensor's time into a memfd ring | `runtime/bridges/camera` | built for Android; 131 host checks with a test picture; on the phone: the list and the open work, no frame yet (above) |
+| xnuhost: the helper's socket and ring, the `oneios,camera` virtio device (`/arm-io/camera`, `XL_DEV_CAMERA`) | `runtime/bridges/camera` (`libonecamera.a`), `runtime/xnuhost/src/main.c` | linked into xnuhost; the device tested on xnuhost's transport against a guest of plain memory |
+| Kernel: the transport and `/dev/oneios-camera` (the `NCFRAME1` layout of iOSPlus10's and HakiOS's node, NV12); `AppleH9CamIn` and its user client (the same session) | `drivers/camera` | compiles with the kernel's records, in the `HOSTED_OUT=cam` kernel; 37 host checks of the pure parts; on the phone (2026-11-12) the transport came up with 3 cameras; the service not run |
+| Kernel: the plug-in's folder over `/System/Library/MediaCapture` | `kernel/patches/oneios-hosted/0056-camera-plugin-mount.patch` | built; not run |
+| Plug-in `H9ISP.mediacapture`: `H9ISPCaptureDeviceCreate`, a FigCaptureDevice with the back and front streams, formats from the device's own `AVCaptureSession.plist`, frames scaled into the graph's pools | `userland/camera` | built with Xcode (arm64e, `macho-check.py` PASS); on the Mac macOS's own `BWFigCaptureDeviceVendor` makes a device with it and a frame reaches an output's handler (35 checks); not run in iOS; placed in the seed by the image hook (a new seed) |
+
+- **Route on the host** [F AOSP android15-release for the reason, I for Samsung's build]: the provider HAL directly
+  when system_server is gone, Camera2 NDK through cameraserver while One UI runs (`auto`). cameraserver refuses every
+  client outside its own process without system_server: its camera-permission check asks the `permission_checker`
+  service, waits 10 s for it and denies (uid 0 too). The uid-state and app-op checks would pass. The HAL needs
+  nothing of system_server. Both back ends are in the helper and in `camctl`.
+- **No ISP in the guest**: the HAL's pictures are finished. Exposure, focus and gain commands of a raw-sensor reader
+  are accepted and ignored.
+- **A frame**: NV12, at most 1920x1080, 4:2:0 BT.601 full range (iOS's `420f`), a sequence number that rises by one
+  per frame the camera made, the sensor's time, the camera's role and how it is turned. Copies: gralloc buffer ->
+  ring (conversion), ring -> guest buffer, guest buffer -> reader (read()), reader -> IOSurface.
+- **What iOS needs** [F the 24A446 cache for the loader; F iOSPlus10 `docs/laurel_sprout/camera.md` section 3 for the
+  rest]: Apple's ISP firmware protocol cannot be served by another camera, so the IOKit side is only a name:
+  `AppleH9CamIn`, which CMCapture's probe matches and for which it loads `H9ISP.mediacapture` from
+  `/System/Library/MediaCapture` (on iOS 16 HakiOS had to replace `+[BWFigCaptureDeviceVendor
+  sharedCaptureDeviceVendor]` instead; iOS 27 takes the create function from the plug-in it loads). The plug-in's
+  FigCaptureDevice hands CVPixelBuffers to the capture graph. The app needs, in order: the capture servers running,
+  a FigCaptureDevice with a steady preview stream, a still from the same stream, and only then the Camera icon's
+  device tree nodes (`/arm-io/isp` `camera-rear`, `camera-front`; `/product/camera`): with the nodes and no frame
+  path the launch hangs.
+
+### Missing, unknown
+
+- **The first session with the plug-in** (`userland/camera/README.md`, "What the next session's logs must show"):
+  whether the 27 capture graph takes the device as it is, and which properties it asks for that are not answered.
+  The device tree nodes for MobileGestalt and the camera permission are after that.
+- [U] on the phone: the capture again with the fix, the telephotos, the diagnostic run if no frame arrives
+  (`runtime/bridges/camera/README.md`, "On the phone" and "When no frame arrives"), and "In a
+  session" (the HAL back end with system_server stopped; whether Samsung's HAL takes a plain YCbCr_420_888 stream
+  from a client that is not cameraserver; what a killed helper leaves in the provider).
+- oneos: if a killed helper leaves the camera "in use" in the provider, the provider's init service has to be
+  restarted at the return; its name is not known yet (`getprop | grep -i 'init.svc.*camera'` on the phone).
+- Stills above 1920x1080, exposure/focus/zoom/flash from iOS, two cameras at once: not done.
+
+## 7a. Panel backlight and ambient light (fable-brightness, 2026-11-11)
+
+Details and the phone test: `runtime/bridges/brightness/README.md`, `drivers/brightness/README.md`.
+
+### The phone
+
+- Panel: `E3_S6E3HAF_AMB679FN01`, command mode, `qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_dcs"`,
+  `qcom,mdss-dsi-bl-min-level = <1>`, `qcom,mdss-brightness-default-level = <0x9f6>` (2550) [F DT lines 9233-9243].
+  The node carries no `bl-max-level` of its own (the `PBA_BOOTING` stand-in panels have 0x639c = 25500 and 0xfff).
+  Brightness is a DCS command that Samsung's panel driver (`ss_dsi_panel`, a vendor module, not in the kernel
+  repository) builds from its candela tables (`samsung,ss_candela_map_table_revA`).
+- The backlight class device: expected `/sys/class/backlight/panel` (Samsung's name; Qualcomm's is
+  `panel0-backlight`) [I, not read on the phone]. `max_brightness` [U]: `brightctl info` prints both.
+- Light: `als_rear` = Sensortek STK6D2x, I2C address 0x47, `stk,als_scale = <1000>` [F DT line 11736,
+  `drivers/optics/stk6d2x_sec.c`, `stk6d2x.h:25`]. Samsung's rear flicker sensor: it faces away from the screen.
+  Off until `1` is written to the input device's `enable` attribute; then one report per frame of its FIFO:
+  `REL_X` infrared, `REL_RX` UV, `REL_RY` clear (each the gain-normalised average + 1), `ABS_Y/Z/RX` the gains
+  (`stk_sec_report`). `/sys/class/sensors/als_rear/` has `als_ir`, `als_clear`, `als_uv`, `als_raw_data`. No lux in
+  this mode; the scale to lux is not calibrated [U].
+- The front light sensor is on the sensor hub (SSC), reachable only through the sensors HAL: not used.
+
+### iOS side (`drivers/brightness`, port of iOSPlus10 `2201-laurel-backlight-panel-power.patch` and `9005-laurel-backlight-calibration.patch`)
+
+- `OneiOSBacklight` (service name `AppleARMBacklight`): `backlight-control`, `IODisplayParameters`, `max-nits`,
+  `min-nits`, `brightness-nits`, `backlight-calibration-parameters`, `backlight-marketing-table`; takes
+  `{brightness, FadePeriod}` and `brightness-nits` and sends `OB_BRIGHT_SET` on the bridge channel. Since
+  2026-11-12 also iOS 27's keys (from UniXNU-sheng's working iPadOS 27 service): `IODisplayParameters.BrightnessMilliNits`,
+  `LmaxProduct`/`LmidProduct`/`LminProduct`, `NativeSandboxGrantProcess = backboardd`; `brightness-nits` signed.
+  Since the 15:35 session also `DisplayBrightness` (the slider's position 0..1, or a dictionary `{Brightness, Commit,
+  Period}`, read in 24A446's CoreBrightness): taken as the slider's level when its value is unambiguous (a float's bits,
+  data or text; not the integers 0 and 1), and logged with what it held (`drivers/brightness/README.md`,
+  "DisplayBrightness"). Host-tested decoder; not run.
+- **The slider, nits 0 and the touch IC (fix-brightness-touch, 2026-11-14).** Phone, 2026-11-13 (main 9f6dc38): iOS
+  sent `brightness-nits` 0 with its display on; the panel went to its floor and the bridge slept the touch IC (dead
+  touch until woken by hand); Control Center's slider sent only `DisplayBrightnessSliderPosition` and
+  `DisplayBrightness`, both dropped. Read in 24A446 [F]: IOKit's serializer turns a CFNumber float into its truncated
+  integer (`Brightness number 0x0 (31 bits)`: 31 is Float32's width there), so `DisplayBrightness` cannot carry the
+  position; `DisplayBrightnessSliderPosition` and `brightness-nits-cap` are SInt32 16.16. Now: the slider position is
+  the slider's level (the sliders work, no iOS-side code), the cap is kept and holds `brightness-nits` under it, nits
+  of 0 or less are no level (the panel keeps its own), and the touch IC follows iOS's display power: backboardd's
+  `IOMobileFramebufferRequestPowerChange` (selector 12, seen by hosted `0069`, sent as `OB_BRIGHT_POWER`) sleeps it at
+  off and wakes it at on, and every power-key press wakes it (xnuhost's evdev reader). The return writes One UI's value
+  and wakes the IC as before. Host tests: `test_bl_request` 2038, the bridge's brightness 81, `runtime/bridges/tests`
+  (the channel's `OB_BRIGHT_POWER`), xnuhost (the power-key hook); the driver compiles (`oneios-tool kernel drivers
+  --check`); the kernel with hosted 0069 and the new driver built (HOSTED_OUT=fixbr, xnu.macho 122efae5) and prelinked (audit 0
+  failures, stubs 666 good, kernel.kc 7632e390); the
+  boot is not done (not on the PC: no phone panel, touch IC or power key there). Details: `drivers/brightness/README.md` ("The slider, the cap
+  and nits 0"), `runtime/bridges/brightness/README.md` ("The touch IC follows the display").
+- **Only a change goes to the host (fix-gpu-perf, 2026-11-15).** A Control Center drag sends about 550
+  `DisplayBrightnessSliderPosition` requests a second, most of them the level the one before had; each was a bridge
+  message (whose fade the host started again) and a re-publish of `IODisplayParameters` and `brightness-nits` (nine
+  objects made and freed). Now a request whose level, fade and flags are the last one sent is not sent again within a
+  second, and the two properties are set only when they change (`oneios_bl_request.h` `obl_send_wanted`,
+  `obl_publish_wanted`; iOS's display power request makes the next level go whatever it is). `setProperty` sends no
+  IOKit notification, so this was CPU and bridge traffic, not a cause of iOS redrawing (`docs/newtodo.md`, update of
+  2026-11-15, "the storms"). Line: `ONEIOS BACKLIGHT: N requests repeated the level last sent (L of 65535): not sent
+  again, nothing re-published` (every 1024). Host test: `test_bl_request` 2044 checks. Not run on the phone.
+- **Why the slider did nothing** (phone, 2026-11-12): vmm-present makes MobileGestalt answer `IsVirtualDevice`, and
+  24A446's CoreBrightness then runs `VMBLControl` (log: `Set VM Mode 3 BLControl`), which sends brightness to a
+  Virtualization.framework host over remote XPC and never to the service. `drivers/brightness/BacklightMode.inc`,
+  built into the Metal plug-in that runs in backboardd, gives `initBLControl:` mode 1 (BLControl) in backboardd only.
+  Evidence, addresses and the next boot's lines: `drivers/brightness/README.md`. Built, not yet run.
+- The original `AppleARMBacklight` class is in the kernel collection (AppleARMPlatform) [F kernelcache 24A446], so
+  the class cannot have that name; conformance for CoreBrightness's `IOObjectConformsTo` is made by linking the
+  class under the original's metaclass at run time (`oneios_bl_conform=0` turns it off).
+- Light: `OB_BRIGHT_ALS` readings are kept in the kernel. The way to CoreBrightness is a HID device for the
+  original `AppleUSBALSService` (AppleHIDALSService is in the collection): `OneiOSALSDevice.cpp`, built into the
+  hosted kernel's HID archive against the collection's `IOHIDDevice` layout (section 7b) and started after the
+  touch screen and the buttons.
+
+### The bridge (`runtime/bridges/brightness`)
+
+- Route: the backlight sysfs node as root (no system_server, no surfaceflinger, no binder). Slider squared over
+  `1..ceiling`; never 0; One UI's value written back at the stop.
+- `als_rear` read by evdev without a grab; clear counts x `ONEIOS_ALS_SCALE` millilux.
+- Two backends (section 7e): samsung, the above; treble, the standard backlight class by named paths
+  (`panel0-backlight`, `panel1-backlight`, `backlight`, `lcd-backlight`, `panel`), the whole range, the touch IC left
+  alone, no light sensor yet. `runtime/bridges/brightness/README.md`, "The two backends".
+
+### Missing, unknown
+
+- [U] everything on the phone: the node's name and range, writing it in the session's namespace, the sensor's
+  `enable` file, the counts in known light.
+- [U] everything in iOS: no session reaches backboardd yet.
+- The HID light sensor device is built and starts (`ONEIOS ALS: on` in a PC boot) and `AppleUSBALSService`
+  attaches to it; no reading has gone through, and whether CoreBrightness uses its events is [U]. A rear sensor is a poor
+  input for auto-brightness in any case (dark when the phone lies face up).
+- iOS's `IOMFBBrightnessLevel` on the framebuffer is not handled here (the display driver is UniXNU-droidvm's).
+- **EDR and nits (fix-display-colour, 2026-11-13).** QuartzCore takes the display's EDR headroom and nits from the
+  brightness capabilities (`IOMFBDisplay::update_brightness_capabilities`: `MaxNits`, `MinNits`, `MaxNitsEDR`,
+  `EDRPotentialHeadroom`) [F, 24A446]. The real iPhone18,2 tree has them on `/backlight` and `/exbright` [F,
+  `out/kernel-inputs/24A446/devicetree.bin`, 16.16 numbers divided out]: `EDRPotentialHeadroom` 8.0,
+  `EDRReferenceHeadroom` 12.0, `edr-max-nits` 1600, `user-accessible-max-nits` 1060, `override-boot-brightness-nits`
+  80, `panel-gamma` 2.2, `LmaxProduct` 3000, `LminProduct` 10, `DBVMin` 117, `DBVMax` 2047. This service publishes
+  `BrightnessMilliNits` 0.038-500 nits and `LmaxProduct` 500 and no EDR key, and the Metal plug-in holds the headroom
+  at 1 in backboardd, so iOS renders no EDR here; with the 8-bit sRGB display path that is right. The S24 Ultra
+  panel's own luminance is in the display helper's `panel colour mode ...; HDR types ..., luminance max ...` line (not
+  read yet); EDR keys for this service wait for that number and the half-float path
+  (`kernel/patches/oneios-hosted/display/README.md`, "Colour, depth and the panel").
+
+## 7b. Touch screen and buttons (fable-hid, 2026-11-11)
+
+Details, the layout header's evidence and the log lines: `kernel/patches/oneios-hosted/hid/README.md`.
+
+### The phone
+
+- Read on the phone on 2026-11-12 (One UI 8, `getevent -lp`, `/sys/class/sec/tsp`): `event0` `gpio-keys` (Volume Up only),
+  `event1` `pmic_pwrkey` (Power), `event2` `pmic_resin` (Volume Down only), `event8` `sec_touchscreen` (the screen,
+  `INPUT_PROP_DIRECT`), `event9` `sec_touchpad` (a pointer device with the same axes, not taken). The numbers can
+  change between boots; xnuhost finds the devices by their bits, not by number. Neither key device has `EV_REP`.
+- The touch IC: Synaptics S3916T, firmware SY35030014. Multitouch protocol B: 10 slots, `ABS_MT_POSITION_X/Y` 0..4095
+  each, `ABS_MT_TOUCH_MAJOR/MINOR` 0..255, tracking ids 0..65535, no pressure axis. Its `cmd` interface offers, among
+  others, `set_game_mode`, `dead_zone_enable`, `set_grip_data`, `blocking_palm` and `get_status` (read: `WET:0,NOISE:32,FREQ:0`).
+  Nothing of OneiOS writes those; the report rate and the edge rejection One UI left are what a session gets [U: not
+  measured].
+- The volume keys are one rocker: holding both ends at once can chatter (session of 2026-11-12: 6 key events in 3 s).
+  The fork's return chord tolerates releases under 0.5 s since OneOS `7839e4b`.
+- No Home key and no ringer switch.
+
+### The path
+
+1. xnuhost (`runtime/xnuhost/src/input.c`) opens every event device that has multitouch positions or one of the
+   three side keys, **read only and without `EVIOCGRAB`**, and puts the events, unchanged, on one virtio-input
+   device (`/arm-io/input-0`) with the panel's own axis ranges in its configuration. The switch's Volume Up +
+   Volume Down watcher reads the same key devices beside it. Each touch frame also carries its scan time (`EV_MSC` /
+   `MSC_TIMESTAMP`, in counter ticks), and after `SYN_DROPPED` the device's state is read again so that no lift is
+   lost (`docs/booter.md` 2.8).
+2. In the kernel, UniXNU-droidvm's `DroidVMVirtioInput.c` (staged with `OneiOSSideKeys.inc`) reads the queue: the
+   finger set goes to the digitizer, a side key's state to the buttons.
+3. Two HID devices of UniXNU's `NativeHidInput`, subclasses of the collection's original `IOHIDDevice`
+   (`OriginalHidDeviceABI.h`): "OneiOS touch screen" (Digitizer / Touch Screen, ten fingers, each axis 0..32767,
+   Built-In, DisplayIntegrated) and "OneiOS buttons" (Consumer Menu, Power, Volume Increment and Decrement,
+   Telephony Ring Enable, a boot keyboard).
+4. Apple's IOHIDFamily and IOHIDEventDriver, unchanged in `kernel.kc`, parse the reports and make the HID events
+   backboardd reads. The touch reports are handed over with the frame's scan time (`handleReportWithTime`), so the
+   events carry the time of the scan, not of their arrival.
+
+Where the time of one touch goes and the log lines that measure each step: `kernel/patches/oneios-hosted/hid/README.md`,
+"Latency".
+
+Coordinates: each axis of the panel's range is scaled to the digitizer's full range, which iOS maps to the whole
+display, so the panel's range covers the guest's mode (the panel's own 1440 x 3120 by default) when the guest's
+frame fills the panel. Home is the swipe up from the bottom edge: a finger that lands in the bottom 4 % starts on the edge, and
+edge contacts carry the edge flag SpringBoard's gestures need.
+
+### Keys
+
+| Key | evdev code | iOS usage |
+|---|---|---|
+| Power | `KEY_POWER` 116 | Consumer / Power |
+| Volume up | `KEY_VOLUMEUP` 115 | Consumer / Volume Increment |
+| Volume down | `KEY_VOLUMEDOWN` 114 | Consumer / Volume Decrement |
+| (none on this phone) | `KEY_HOMEPAGE` 172 | Consumer / Menu (Home) |
+| (none on this phone) | `KEY_MUTE` 113, each press flips it | Telephony / Ring Enable (the ringer switch) |
+
+The side keys stay ungrabbed: iOS and the switch's watcher both see every press, including the two of the
+Volume Up + Volume Down chord that ends the session.
+
+### Missing, unknown
+
+- [U] everything on the phone: the touchscreen's axis ranges and rate, whether it reports while One UI's framework
+  is stopped, palm rejection, the feel of the edge band.
+- [U] whether iOS 27 reads Ring Enable = 1 as "ring"; nothing sets it on this phone.
+- A guest frame that does not fill the panel (letterboxed) needs an offset in the transport's scaling; not written.
+- No trackpad, no motion sensors (the transport's code for them is compiled and finds no such device). The S Pen: section 7f
+  (off by default, `pen=auto`).
+
+## 7c. Battery (battery bridge, 2026-11-11)
+
+Details and the phone test: `runtime/bridges/battery/README.md`, `drivers/battery/README.md`.
+Two backends since 2026-11-15 (section 7e): samsung, the `power_supply` nodes below (the default, unchanged); treble,
+the health HAL (`android.hardware.health.IHealth/default`, `getHealthInfo`).
+
+- **Before this**: iOS showed a near-empty battery with no charging state. [I] nothing published an `IOPMPowerSource`
+  under the hosted kernel (none of the classes that do has its hardware here); no log or registry dump confirmed it.
+- **Route**: `runtime/bridges/battery` reads `/sys/class/power_supply/` in xnuhost (read only, one normal-priority
+  thread, every 3 s only while iOS listens); `OB_CH_BATTERY` carries one `struct ob_battery_state`, at once for a
+  change of level or charging state, the rest at most every 30 s; `drivers/battery/OneiOSBattery.cpp` publishes it.
+- [F 24A446 `powerd`, disassembled] it matches `IOServiceMatching("IOPMPowerSource")`, and its reader needs
+  `BatteryInstalled` = true, `CurrentCapacity` and `MaxCapacity`.
+- **The order** (since 2026-11-13, `drivers/battery/oneios_battery_props.h`): the guest asks the host before its service
+  exists; the host's first reading is in the service's registry properties before `registerService()`, so powerd's first
+  match reads the real ExternalConnected; that first publish sends no `kIOPMMessageBatteryStatusHasChanged`, and a later
+  host message sends one only when a published value changed. Host-tested (`drivers/tests/host.sh`: 21 checks;
+  `runtime/bridges/battery`: 65, among them the phone on its charger: the real state at the query, no report while it
+  stays, an unplug and a plug each reported). The code before 2026-11-13 already put the first reading in before
+  `registerService()`; it also messaged (to no client yet) at that publish. PC boot with a fake
+  charger (2026-11-13): `ONEIOS BATTERY: on: IOPMPowerSource published at 100%, on power (ExternalConnected true, ...
+  before registerService)` 3 s in, minutes before launchd.
+- **The charging chime** [F 24A446 powerd and SpringBoard, disassembled; `drivers/battery/README.md` "The charging
+  chime"]: powerd publishes `Play Charging Chime` = ExternalConnected; SpringBoard's `SBChargingController` chimes for
+  an unmarked power source with it true, and at startup marks the connected ones silently only when its startup
+  context has the boot overlay (backboardd's boot UI) or is dark. Phone, 2026-11-12 23:45 and again on a later boot
+  (c1223f8, iOS log read): the "plugged in" sound played before the lock screen. **Proven** from that log: the boot
+  overlay was still up (`addOverlay(1-init 2)`, `Current bootUI is an Apple Logo`) but its boot-UI activity assertion
+  had timed out at 37 s before SpringBoard's startup context tested it, so the startup took the chime branch; no
+  `isChimeDisabled:` line (not powerd, not a late power-source change). The battery service is not the cause; what the
+  startup context's overlay test reads is the backboardd-saved overlay that a clean iOS shutdown leaves and the next
+  boot restores. A session ends by killing xnuhost, so iOS never shuts down cleanly and nothing is saved: every boot
+  looks like a boot after a crash. The fix is the return's graceful shutdown (`docs/booter.md` "The return",
+  `return-graceful-ms`): ask iOS to power off before the kill so it saves its overlay. Host side built and tested; the
+  guest half (iOS actually powering off) is the Mac's to build and is not yet verified.
+
+| Android node | iOS key | Mapping |
+|---|---|---|
+| `battery/capacity` | `CurrentCapacity` (`MaxCapacity` = 100) | percent, clamped to 0..100 |
+| `battery/status` | `IsCharging`, `FullyCharged` | Charging -> IsCharging; Full, or Not charging at 100 % on power -> FullyCharged |
+| `usb,ac,wireless,pogo /online` (any > 0), or status Charging/Full | `ExternalConnected`, `ExternalChargeCapable`, `AppleRawExternalConnected` | never `otg` (a device on the port draws power from the phone) |
+| `battery/present` | `BatteryInstalled` | missing: taken as present |
+| `battery/temp` (tenths C) | `Temperature` (hundredths C [I]) | x 10 |
+| `battery/voltage_now` | `Voltage` (mV) | numbers >= 100000 are µV, others mV |
+| `battery/current_now` | `Amperage`, `InstantAmperage` (mA, + into the battery) | unit learned from size (>= 20000 is µA, sticky), sign from `status` |
+| `battery/charge_full`, `charge_full_design` | `NominalChargeCapacity`, `AppleRawMaxCapacity`, `DesignCapacity` | numbers >= 100000 are µAh, others mAh; 5000 mAh if neither exists |
+| computed: `charge_full` x percent | `AppleRawCurrentCapacity` | percent is the source of truth for the level |
+| `battery/cycle_count` or Samsung's `battery_cycle` | `CycleCount` | |
+| computed: remaining mAh / current | `TimeRemaining` (minutes) | 0xFFFF while unknown |
+
+### Missing, unknown
+
+- [F owner's phone, 2026-11-11, on USB] supplies: `ac battery max77775-charger max77775-fuelgauge max77775-otg mfc-charger
+  otg pca9481-charger pogo sec-direct-charger usb wireless`. `usb/online`=1, `ac`, `wireless`, `pogo` 0; `battery/online`=19 is
+  a cable type and is not read. `capacity`=100, `status`=Full, `temp`=389, `voltage_now`=4294000 (µV), `current_now`=74,
+  `charge_full` and `charge_full_design`=5000000 (µAh), `cycle_count` empty, `battery_cycle`=1103.
+- [U] `current_now`'s unit: 74 fits both 74 mA and 74 µA at Full. A reading of 20000 or more under load settles it (the
+  learned unit); until then the number is taken as mA. Its sign in charging and discharging is not read either; the
+  status gives it. `batteryctl` prints them; `ONEIOS_BATTERY_SUPPLIES`, `ONEIOS_BATTERY_MAH` and
+  `ONEIOS_BATTERY_CURRENT_UNIT` override.
+- [U] that SpringBoard's status bar and BatteryCenter follow `powerd` here, which is the point of the first session.
+- [U] that `/sys/class/power_supply` is visible in xnuhost's session namespace (it is read from there).
+- Battery health: `powerd`'s `AppleSmartBatteryPack` paths (health, per-cell data) find nothing and stay off.
+
+## 7d. Thermal (thermal, 2026-11-12)
+
+Details: `runtime/bridges/thermal/README.md` (sensors, levels, the step, `thermalctl`), `drivers/thermal/README.md`.
+The sensors have two backends since 2026-11-15 (section 7e): samsung, the files below (the default, unchanged);
+treble, the thermal HAL (`android.hardware.thermal.IThermal/default`, `getTemperatures`). The levels and the step are
+the same for both.
+
+### "It runs damn hot, why" (9f6dc38 session, 2026-11-14; fix-thermal-log)
+
+Measured from outside at about +6060 s: `/proc/vmstat` pswpin +12190 and pswpout +10291 pages in 5 s (zram
+compressing the guest's RAM: the memory fix is fix-ram-fit's), top 800 % with 226 % sys and 167 % user, xnuhost
+148-155 %, battery 40.3 C charging (1.6 A at the boot); in the guest backboardd 291-364 %, Spotlight 78-107 %,
+SpringBoard about 70 %. Two new lines say where the heat goes at the next boot, and what decides each part:
+
+- `thermal: 30 s: host CPU ...` (the bridge, every 30 s: the host's busy, sys, user, irq; swap in and out KiB/s;
+  xnuhost's own CPU; the battery's temperature, status and current; case and SoC): `runtime/bridges/thermal/README.md`.
+- `oneios-cpu-sys: 10 s: ...` after each `oneios-cpu:` line (the gpu archive, `OneiOSAdreno.cpp`): the same busiest
+  processes' kernel time. **backboardd's 300 %:** its share in kernel time is its system calls, faults and IOKit calls,
+  among them the framebuffer swap. A BGRA frame is presented from the surface's own pages (no copy in the guest; the
+  copy into the display's buffer is xnuhost's device thread, `display: 10 s: flushes N, copy mean ...`, and the
+  helper's into the Android buffer is the helper's); a half-float `RGhA` frame without `oneios-display-wide=1` and
+  without the GOP presenter's GPU hand-off is converted to 8-bit sRGB by the CPU in the swap (`NativeLegacyDisplay`
+  `convertHalfRows`, a full 1440x3120 frame each time), after waiting for the GPU's work in 100 us sleeps up to
+  200 ms (`LegacyDisplayProbe.cpp` `waitForGpuWork`). Which one runs is the boot's `oneios-display: the compositor swaps
+  format '...'` and `oneios-display: half-float frames: ...` lines. Mostly user time instead is Core Animation's and
+  Metal's own work (metal2vulkan's translation, Turnip's command building): `oneios-ubt=backboardd` samples named
+  with `oneios-tool sym` say which. Nothing is changed in the display path until those lines are read [the CPU
+  conversion as a cause is a guess].
+- **Spotlight:** the guest's `Spotlight` is the app (`/Applications/Spotlight.app`), the indexer jobs are
+  `com.apple.searchd` and `com.apple.spotlight.IndexAgent` (24A446's launchd cache); `com.apple.spotlightknowledged` and
+  `com.apple.hybridsearchd` are already disabled (`userland/config/daemons.toml` base). iOS runs its indexing as
+  maintenance work, and plugged-in time is when its scheduler runs such work [Apple's documented behaviour for
+  background tasks, not read in this build]. The least-risk test, no seed: one boot with
+  `oneios-disable-jobs=com.apple.accessibility.axassetsd,com.apple.searchd,com.apple.spotlight.IndexAgent` (hosted
+  0053; keep axassetsd, the default, in the list). It writes the Data store's `disabled.plist`, so it stays for later
+  boots until `oneios-enable-jobs=com.apple.analyticsd,com.apple.searchd,com.apple.spotlight.IndexAgent` (0044) turns
+  them on again. Cost while off: search finds nothing new (apps, settings, mail, notes are not indexed). Not run.
+
+### The phone in a session [F, the phone, 2026-11-12]
+
+- Kept running: the kernel's 81 thermal zones (`step_wise`), LMh, `thermal-engine-v2` (empty
+  `/vendor/etc/thermal-engine.conf`), `vendor.samsung.hardware.thermal-service`, the charger's own temperature limits.
+  Gone with system_server: Samsung's case-temperature policy (SSRM) and the power HAL's boosts.
+- The kernel's trips are junction trips: X4 90 C (`cpufreq-cpu7`), GPU 95 C (KGSL devfreq), DDR 90 C, the cores pause
+  at 108-110 C, `xo-therm` 78/80 C, the BCL levels. They cap every Linux thread, xnuhost's too; nothing caps on the
+  case temperature any more. xnuhost's thermal step does (inside the process only: thread affinities; no cpufreq,
+  devfreq or `/sys/power` node is written, so a SIGKILL leaves nothing to restore).
+- Sensors: `cpu-*`, `cpuss-*`, `gpuss-0..7`, `ddr`, `xo-therm` zones; `/sys/class/sec/sec-{ap,cf,lp,pa,wf}-thermistor`;
+  `power_supply/battery/temp` and `lrp`. No `skin` zone. `lrp` is the case sensor Samsung's charger limits current by
+  (device tree: 37-39 C with the screen on, 46 C `mix_v2_lrp_cond`).
+- One UI's limits move: `policy7/scaling_max_freq` read 3187200, 3302400 and 3340800 kHz within a minute (hardware top
+  3398400); the power HAL raised `scaling_min_freq` of all four policies to near their top in bursts.
+
+### iOS's side [F 24A446]
+
+thermalmonitord is product-tuned: `/System/Library/ThermalMonitor/V54AP-Info.plist` asks for an SMC
+(`usesSMCSensorExchange`, group `zETM`), HID temperature sensors by name (`Tarc`, `NAND CH0 temp`, the camera dies) and
+a die-temperature PID (`DieTempHS`, target 90); its battery sensor `TG0B-IOPMPowerSource` reads an `IOPMPowerSource`'s
+`Temperature` (ours publishes it, section 7c). None of the SMC and PMU sensors exist here, so it reports nominal. The
+pressure level iOS's frameworks read is the notify state `com.apple.system.thermalpressurelevel` (0, 10, 20, 30, 40,
+50: `OSThermalNotification.h`); `oneios-thermal` sets it from the host's level. Not proven in a guest.
+
+### Measured (thermalctl watch, every 10 s; the phone on USB, so "battery mA" is the net current, not the draw)
+
+Bringup's sessions of 2026-11-12, read only from outside (runtime 0.1.7-dev without the thermal bridge; kernel.kc
+9476a867):
+
+| | One UI, screen on, between sessions | session 3, boot to lock screen (08:43-08:48) | session 4, lock screen after boot (08:52-08:56) |
+|---|---|---|---|
+| CPU zones (hottest) | 33-46 C | 55-82 C | 60-77 C (boot: 94.6 C) |
+| GPU zones | 30-35 C | 46-56 C | 50-60 C |
+| board (`sec-ap-thermistor`) | 29-35 C | 44-50 C | 48-55 C |
+| case (`lrp`) | 29-33 C | 37-39 C | 40.7-43.2 C, still rising at 4 min |
+| battery | 26-30 C | 33 C | 36-37 C |
+| GPU clock | 231 MHz | 231-1000 MHz (1000 most of the time) | 231-1000 MHz |
+| CPU in use (800 = all cores) | 30-240 | 360-530 | 300-500 |
+| xnuhost / the whole session | - | 235-410 / 300-480 | 240-420 / 300-500 |
+
+Where a still lock screen's CPU goes (`thermalctl top`, session 4, 10 s after the first frame): xnuhost 281%, all of it
+the eight vCPU threads (`xnu-cpu0` 55% ... `xnu-cpu7` 6%), the iOS processes 80% (two at 26% and 23%). The vCPU
+threads run the guest kernel, so the kernel, not iOS's user space, keeps the phone hot. Session 3's stop line: cpu2
+emulated 104 million trapped instructions in 400 s (260,000 a second; cpu3 62 M, cpu4 37 M, the E vCPUs about 1 M),
+each a signal round trip on its thread.
+
+**The cause, found in a session of mine (09:19, runtime 0.1.7-thermal, kernel.kc 9476a867):** xnuhost's new count
+(SIGQUIT, `emulated: insn ...`) had `0xd5087e42` (`dc cisw, x2`, clean and invalidate by set/way) 115 million times in
+about 3 minutes, with CLIDR, CSSELR and CCSIDR accesses 112,280 times each. That is XNU's `cpu_idle` ->
+`platform_cache_idle_enter()` -> `FlushPoU_Dcache` (`osfmk/arm/caches.c`, `osfmk/arm64/caches_asm.s`
+`DCACHE_SET_WAY`: this board is not `APPLE_ARM64_ARCH_FAMILY`): a set/way flush of L1 at every idle entry, 1024 trapped
+`dc` each (256 sets x 4 ways of the geometry xnuhost's CCSIDR gives), about 600 idle entries a second. On a host process
+the flush does nothing. xnuhost now ends that loop after its first trap (`setway-skip`, on by default: the operand
+becomes the level's last set and way; `docs/booter.md` 2.5). The fix in the kernel (`platform_cache_idle_enter` empty
+under `XNU_HOSTED`) is asked of hosted-xnu on the board; it was not built because Mac-built `kernel.kc`s panic on the
+phone today.
+
+My two sessions, one after the other, lock screen untouched, the same kernel and runtime; B with `setway-skip=1` in the
+image's `xnuhost.conf` (logs in `out/phone-baseline/2026-11-12/thermal/`):
+
+| Lock screen, after the first frame | One UI, screen off (09:13-09:18) | A: one trap per line (09:22-09:24) | B: setway-skip (09:31-09:35) |
+|---|---|---|---|
+| CPU in use, the phone (800 = all cores) | 40 | 480 | 334 |
+| xnuhost / the whole session | - | 334 / 409 | 197 / 264 |
+| vCPU threads (`thermalctl top`, 30 s) | - | 310% (`xnu-cpu2` 62, `cpu3` 54, `cpu0` 54, `cpu1` 54, `cpu4` 40, `cpu5` 24, `cpu6` 14, `cpu7` 8) | 233% (`cpu0` 56, `cpu1` 56, `cpu2` 38, `cpu3` 32, `cpu4` 22, `cpu5` 14, `cpu6` 9, `cpu7` 5) |
+| `dc cisw` traps per flush | - | 1024 | 1 (192,940 flushes in 4 min) |
+| CPU zones (mean) | 38.3 C | 50.1 C | 44.4 C |
+| GPU zones | 36.2 C | 42.6 C | 38.9 C |
+| board thermistor | 35.5 C | 40.5 C | 37.8 C |
+| case (`lrp`) | 34.3 C (cooling from bringup's session) | 35.3 C | 34.4 C |
+| GPU clock (mean of samples) | 231 MHz | 441 MHz | 417 MHz |
+| battery current | about 0 mA: on USB and full, so not the phone's draw | same | same |
+
+The sessions were 5 and 7 minutes (the coordinator's rule: short sessions, each ended with `return.request`), so the
+case had not reached its level: compare the CPU lines, not the case. Not measured: 15 minutes, a scroll or animation
+load (nothing can touch the panel from the Mac), the drain off USB.
+
+What is left in B: the E vCPUs (`cpu0`, `cpu1`, 56% each) run most of iOS's system calls (1.5 million task traps each
+in session 3 against 0.3 million on a P vCPU); interrupts are about 2,900 a second (`ICC_IAR1_EL1` 688,826 in 4 min);
+each idle entry still traps 6 times (CLIDR twice, CSSELR, CCSIDR twice, the one `dc`). The kernel fix removes those too.
+
+### One UI's limits stay in a session
+
+One UI (Samsung's SSRM in system_server, and the HALs it drives) caps the clocks when the phone is warm: at 09:18
+`policy0..7/scaling_max_freq` read 1689600, 2035200, 2035200, 2035200 kHz (the hardware's 2265600, 3148800, 2956800,
+3398400) and `/sys/kernel/gpu/gpu_max_clock` 500 MHz (owner `system`, written at 08:58, after a return). KGSL shows that
+cap as `thermal_pwrlevel` 9 (`max_gpuclk` 500000000; its devfreq and `gpu` cooling devices were at state 0, so the
+kernel's thermal zones did not set it). The switch stops system_server, so whatever cap One UI last set stays for the
+whole session (sessions A and B ran with these; bringup's sessions 3 and 4, after a cool One UI, had 3340800 and 1000
+MHz). A session that starts after a warm One UI is slowed for its whole length, and one that starts cool has no case
+policy but ours. **The OneOS fork now saves and lifts them** (branch `oneios`, `oneios_switch.sh` `clocks_save` /
+`clocks_tops`, `oneios_return.sh`; the fork's `docs/oneios.md`, "Session flow"): at the baseline it saves Samsung's
+`/sys/devices/system/cpu/cpufreq_limit/cpufreq_max_limit` and `cpufreq_min_limit`, `scaling_min_freq` and `scaling_max_freq` of each policy, `/sys/kernel/gpu/gpu_max_clock` and KGSL's `max_gpuclk`
+(`control/base/clocks`); once system_server is gone it writes the hardware's range (`cpuinfo_min_freq`,
+`cpuinfo_max_freq`, the top of the GPU tables) and logs each node `old -> new` in `switch.log`; the return writes One
+UI's values back before Gate A and zygote, on every way back but the reboot (a SIGKILL of xnuhost does not skip the
+return), and logs them in `return.log`. The kernel's thermal zones, trips and cooling devices and `/sys/power` are not
+written: the kernel's junction trips, LMh and xnuhost's thermal step are the session's caps. Tested against a fake
+sysfs (`OneiosScriptTest`). The first phone run (prelink's session of 10:28) lifted the GPU (`gpu_max_clock` 500 -> 1000,
+`thermal_pwrlevel` 0) but not the CPUs: `scaling_max_freq` still read 1689600/2035200 after the write. The holder is
+Samsung's `cpufreq_limit` driver (`drivers/cpufreq/cpufreq_limit.c` of the SM8650 kernel, read at 809f7ed): SSRM writes
+one value to `cpufreq_max_limit` and the driver keeps a freq QoS max request per cluster of its own, which a write of
+`scaling_max_freq` cannot lift; `-1` releases it. All cooling devices were at 0, `msm_performance` `cpu_max_freq`
+unlimited and WALT's `sched_fmax_cap` only on cluster 0 (1804800). The fork now releases `cpufreq_limit` first and puts
+it back last (fork 2nd commit; tested against a fake sysfs, not yet on the phone). xnuhost itself writes none of them.
+
+### Missing, unknown
+
+- Run on the phone: the thermal bridge in xnuhost (`thermal: on: 29 zones; case 32.7 C (lrp), SoC 48.1 C (cpu-1-2-0),
+  battery 30.8 C; nominal`); the level stayed nominal (case below 39 C), so no step was taken. Not run: the step, the
+  driver (it needs a new `kernel.kc`), the helper (the helpers are in no image yet: `docs/userland.md` 7).
+- [U] Whether the "heavy" and "critical" levels change what iOS does (frame rate, the cool-down screen).
+- [U] The case thresholds are a guess on Samsung's scale, not Samsung's policy.
+- The GPU: drm2kgsl's burst rule (`docs/gpu.md` 2.2) and its constraint are the gpu agent's; at heavy pressure they
+  could stop constraining (a note on the board). The KGSL constraint stays under the thermal devfreq limit [inference].
+
+## 7e. Hardware backends: samsung (the default) and treble (hw-backend, 2026-11-15)
+
+The owner's decision of 2026-11-15: the Samsung paths stay the default and keep working exactly as on the S24 Ultra;
+a second, vendor-neutral backend, `treble`, sits beside them so that the image can later run on other Android phones
+(other Samsung phones first). Device profiles (the fork's) come later: `oneos/interface.md`, "The hardware backend".
+
+**The settings** (`runtime/bridges/include/bridges/hw_backend.h`; xnuhost's `config.c`; `docs/booter.md` 1):
+
+| Setting | Values | What |
+|---|---|---|
+| `hw-backend` | `samsung` (default), `treble` | every bridge |
+| `hw-backend-<bridge>` | `samsung`, `treble` | one bridge, over `hw-backend`: `backlight`, `battery`, `thermal`, `haptics`, `touch`, `keys`, `audio`, `camera`, `wifi`, `bluetooth`, `display` (for tests, or a phone whose one part is Samsung's) |
+| `hw-backend-fallback` | `0` (default), `1` | a treble bridge whose interface is missing uses its samsung form (1) or stays off (0) |
+
+In xnuhost.conf (the image set's or the overlay's), with `--set KEY=VALUE`, or as `--hw-backend treble`,
+`--hw-backend-battery treble`; the command line wins per setting. The ctl tools (`brightctl`, `batteryctl`,
+`thermalctl`, `bridgectl`) read `ONEIOS_HW_BACKEND`, `ONEIOS_HW_BACKEND_<BRIDGE>` and `ONEIOS_HW_FALLBACK`.
+
+**The log** names each bridge's backend and why, one line each: `hw: battery: backend treble (hw-backend=treble)`,
+`hw: thermal: backend samsung (the default)`, `hw: touch: backend samsung (the default); keys: backend samsung (the
+default): the same lookup in both ...`. A treble interface that is missing is one line:
+`hw: battery: treble: missing: android.hardware.health.IHealth/default (no service: ...); the bridge stays off
+(hw-backend-fallback=0)` or `...; falling back to samsung (hw-backend-fallback=1)`.
+
+**The way back applies to both.** No treble path grabs an input device (the side keys are found by their capabilities
+and read only), starts a realtime thread, leaves xnuhost's cgroup, writes under `/sys/power` or restarts anything.
+Treble lookups never walk a directory of sysfs or /proc: a HAL is asked for by name from servicemanager
+(`IServiceManager.getService`, handle 0 of `/dev/binder`), a sysfs class device by a named path, an evdev device as
+`/dev/input/eventN` for N = 0..31 probed by its ioctl capabilities. The binder client is the Wi-Fi supplicant's
+(`wifi/aidl_binder.c`, `aidl_parcel.c`): no Android library.
+
+### The audit table
+
+Every hardware path of xnuhost, the bridges, the phone tools and the fork's session scripts (read only here), its
+Samsung form (today's, the default) and its Treble form. Status: **done** (both backends in code, host-tested and
+tested on the stand-in phone), **same** (one form, already vendor-neutral: both backends use it), **next** (not yet;
+who or what it waits for).
+
+| Path | Where | Samsung form (default) | Treble form | How treble finds it (no walk) | Status |
+|---|---|---|---|---|---|
+| Backend choice | `bridges/hw/`, `xnuhost/src/config.c` | - | - | settings above | **done** (this PR) |
+| Panel backlight | `bridges/brightness/brightness.c` | `/sys/class/backlight/panel`, then `panel0-backlight`, then the class folder listed; Samsung's doubled ranges (510, 51000) halved | the standard backlight class: the first of `panel0-backlight`, `panel1-backlight`, `backlight`, `lcd-backlight`, `panel` with a `max_brightness`; the whole range (`ONEIOS_BRIGHT_MAX` caps it) | named paths only | **done** (this PR: test_brightness, hw-backend.sh) |
+| Touch IC power | `bridges/brightness/brightness.c` | `/sys/class/sec/tsp*/enabled` whose `input/name` is `sec_touchscreen` (folder listed), `2,0`/`2,1` and `1,0`/`1,1` | none: no vendor-neutral node; the panel driver's own notifier handles it [I]; one line, left alone | - | **done** (treble: nothing written) |
+| Ambient light | `bridges/brightness/brightness.c` | evdev `als_rear` by name (`/dev/input` listed), its `/sys/class/input/eventN/device/enable` | the sensors HAL (AIDL `android.hardware.sensors.ISensors/default`): events come through an FMQ, not written yet; missing line, `hw-backend-fallback=1` uses the samsung lookup | - | next |
+| Battery | `bridges/battery/battery.c` | `/sys/class/power_supply/battery/*`, `usb,ac,wireless,pogo/online`; 5000 mAh default | the health HAL: `android.hardware.health.IHealth/default`, `getHealthInfo()` | servicemanager by name | **done** (test_battery, test_hal_binder, hw-backend.sh) |
+| Thermal sensors | `bridges/thermal/thermal.c` (`br_thermal_find`, `br_thermal_read`) | `/sys/class/thermal/thermal_zone*` (folder listed; types `cpu-*`, `cpuss-*`, `gpuss-*`, `ddr`, `xo-therm`), `/sys/class/sec/sec-ap-thermistor/temperature`, `power_supply/battery/{temp,lrp}` | the thermal HAL: `android.hardware.thermal.IThermal/default`, `getTemperatures()`: CPU, GPU, BATTERY, SKIN | servicemanager by name | **done** (test_thermal, test_hal_binder, hw-backend.sh) |
+| Thermal load line | `bridges/thermal/thermal.c` (`br_host_load_read`) | `/proc/stat`, `/proc/vmstat`, `/proc/self/stat`, `power_supply/battery/{current_now,status}` | the same (standard Linux, named files) | named files | same |
+| Thermal policy, CPU step | `thermal.c` (`br_thermal_decide`), `xnuhost/src/main.c` | Samsung's scale (lrp) | not touched here (fix-ram-locked's) | - | same |
+| Vibrator | `bridges/haptics/haptic.c` | evdev force feedback: `/dev/input` listed for FF_PERIODIC + FF_SINE, `sec_vibrator_inputff` first | the vibrator HAL: `android.hardware.vibrator.IVibrator/default`, `setAmplitude`, `on(ms)`, `off()` | servicemanager by name | **done** (test_hal_binder, hw-backend.sh) |
+| Touch screen | `xnuhost/src/input.c` | `/dev/input/event0..31`: multitouch X/Y with `INPUT_PROP_DIRECT`, the first one | the same | eventN by ioctl capabilities | same (spen owns the lookup function) |
+| Side keys | `xnuhost/src/input.c` | `/dev/input/event0..31` with `KEY_POWER`, `KEY_VOLUMEUP` or `KEY_VOLUMEDOWN`, read only, never grabbed | the same | eventN by ioctl capabilities | same |
+| Power key -> touch IC | `xnuhost/src/main.c`, `br_bright_key` | wakes the `sec_touchscreen` IC | nothing to wake (no touch IC node in treble) | - | **done** (br_bright_key wakes nothing in treble) |
+| CPU topology, placement | `bridges/cpu/topology.c` | `/sys/devices/system/cpu/...` (standard) | the same | named files | same (fix-host-overhead's) |
+| Audio | `bridges/audio/aaudio_helper.c` | AAudio (NDK, `libaaudio.so`) | the same | - | same |
+| Camera | `bridges/camera/backend_hal.c`, `backend_ndk.c` | AIDL `android.hardware.camera.provider.ICameraProvider/internal/0`; Camera2 NDK | the same; another vendor may name its provider otherwise [I]: from servicemanager's list (`listServices`) | servicemanager | same; the instance name next |
+| Wi-Fi | `bridges/wifi/` | `wlan0` (AF_PACKET, nl80211), AIDL `android.hardware.wifi.supplicant.ISupplicant/default` | the same interfaces; the interface's name from nl80211 instead of `wlan0` | nl80211 | next (after fix-settings-wifi-cpu merges) |
+| Bluetooth | `bridges/bt/hci_hidl.c` | HIDL `android.hardware.bluetooth@1.1::IBluetoothHci/default` on `/dev/hwbinder` | AIDL `android.hardware.bluetooth.IBluetoothHci/default` (Android 13+), HIDL as before | servicemanager, hwservicemanager | next (after fix-bt-virtual merges) |
+| Display (drm mode) | `xnuhost/src/display.c` | `/dev/dri/card0` | the DRM card found at run time: `/dev/dri/card0..7` by `DRM_IOCTL_VERSION` and a connected connector | eventN-style probe of named nodes | next (after fix-boot-black merges) |
+| Display (shm mode) | `runtime/display` (the helper) | SurfaceControl (Java, app_process) | the same | - | same |
+| GPU 3D | `xnuhost/src/gpu3d_kgsl.c`, drm2kgsl | KGSL (`/dev/kgsl-3d0`), `/dev/dma_heap/system`, `/dev/udmabuf` | KGSL when present (Qualcomm), else 2D | named nodes | next (Qualcomm only today) |
+| RAM fix, KGSL memory | `xnuhost/src/ramfix.c` | `/sys/class/kgsl/kgsl/proc/PID`, the session cgroup | the same on Qualcomm | named files | same (fix-ram-locked's) |
+| Phone tool: backlight, touch | `oneios-tool phone backlight`, `phone touch` | `/sys/class/backlight/panel0-backlight`, `/sys/class/sec/tsp/enabled` | the backlight names above; no touch IC | named paths | next (the tool) |
+| Session scripts (the fork's; read only) | `switcher/assets/oneios_switch.sh`, `oneios_return.sh`, `oneios_root.sh` | `/sys/class/backlight/*/brightness` (glob), `/sys/kernel/gpu/gpu_max_clock` and `/sys/devices/system/cpu/cpufreq_limit/*` (Samsung's), `/sys/class/kgsl/kgsl-3d0/max_gpuclk`, `/sys/class/power_supply/usb/online`, `/sys/class/udc/*/state`, watchdogs, `/sys/class/input/event*/device/enable` | cpufreq `policy*/scaling_max_freq` (standard), the KGSL devfreq, the backlight names above, `/sys/class/udc` | the fork's device profiles | next (the fork) |
+
+### What each treble form does
+
+The sections below say, per bridge, what the treble form reads or calls, how it maps to what the bridge gives iOS, and
+how it was tested. Until a bridge's step is done its row above says next.
+
+**Backlight** (`runtime/bridges/brightness`, README "The two backends"). Treble: the backlight class device by its
+standard names, `/sys/class/backlight/{panel0-backlight,panel1-backlight,backlight,lcd-backlight,panel}/max_brightness`
+read in that order (named files), the whole range, One UI's value back at the close; the touch IC's power is left
+alone and the light sensor is off (one line each). Tested: `test_brightness.c` (both backends on one fake sysfs:
+samsung takes `panel` and halves 51000, treble takes `panel0-backlight` whole and never writes `tsp/enabled`; a
+vendor's own name: treble's one missing line and NULL, samsung with the fallback; 105 checks), the stand-in phone
+(`tests/phone/hw-backend.sh`: an S24, another phone, an odd one; 9 checks). On the phone the default proves itself by
+`hw: backlight: backend samsung (the default)` followed by the same `brightness: panel on: ...` and `brightness:
+touch: 1 IC ...` lines as before; a treble boot (`--hw-backend-backlight treble`) by `brightness: panel on:
+/sys/class/backlight/panel0-backlight/brightness, 1..N of N` and the touch line `treble: no vendor-neutral power node`.
+
+**The HAL client** (`runtime/bridges/hal/`): `br_hal_open` opens `/dev/binder` (the Wi-Fi supplicant's client,
+`wifi/aidl_binder.c`), asks servicemanager for the instance by name (`getService`; no wait, no list walked), checks
+the object's descriptor (`_NTF`) and reads its version; then plain calls. Each treble bridge has its own connection (one
+binder looper thread each, SCHED_OTHER, idle: no HAL calls back into it); samsung opens none. A HAL that is not registered is the bridge's
+one missing line. The method codes are the order of AOSP's frozen AIDL files (stable AIDL only appends), [I] until a
+phone answers. The tests' fake servicemanager and HALs: `tests/fake_hal.c` (`build/host/fake-hal DIR`, values read
+from files at every call), used by `tests/test_hal_binder.c` and the stand-in phone.
+
+**Battery** (`runtime/bridges/battery`, README "The two backends"). Treble: the health HAL,
+`android.hardware.health.IHealth/default`, one `getHealthInfo()` per read; `HealthInfo` becomes what the nodes would
+have said and the same mapping follows. Read only (`update()` and callbacks never called). Tested: `test_battery.c`
+(the parcel both ways, an older HAL's shorter one, a bad one, the mapping; 83 checks, the 65 samsung ones unchanged),
+`test_hal_binder.c` (against the fake on a real binder driver: a read, a change, the HAL's death, not registered, the
+fallback), the stand-in phone (6 checks: `batteryctl` on the S24's nodes and through the fake health HAL, a phone
+with only the HAL). On the phone: `hw: battery: backend samsung (the default)` then the same `battery: on:
+/sys/class/power_supply, ...` line; a treble boot by `battery: on: the health HAL
+android.hardware.health.IHealth/default (version N), ...` and the same `ONEIOS BATTERY` line in iOS's log.
+
+**Thermal sensors** (`runtime/bridges/thermal`, README "The two backends of the sensors"). Treble: the thermal HAL,
+`android.hardware.thermal.IThermal/default`, one `getTemperatures()` per reading: cpu, gpu, soc (CPU, GPU, SOC), the
+battery, and the case from the HAL's SKIN sensor (samsung: Samsung's `lrp`). The policy is untouched and the same for
+both: a SKIN of 41.2 C gives the level `lrp` 41.2 C gives. Tested: `test_thermal.c` (81 checks, the 72 samsung ones
+unchanged), `test_hal_binder.c` (a reading, a hotter one to HEAVY, the HAL's death, not registered, no
+temperature), the stand-in phone (4 checks: `thermalctl` on the S24's zones and through the fake HAL, another
+phone's CPU/SOC/skin). On the phone: `hw: thermal: backend samsung (the default)` then the same `thermal: on: N zones;
+case ... (lrp)` line; a treble boot by `thermal: on: the thermal HAL android.hardware.thermal.IThermal/default
+(version N), K temperatures; case ... (SKIN)`.
+
+**Vibrator** (`runtime/bridges/haptics/haptic.c`). Treble: the vibrator HAL,
+`android.hardware.vibrator.IVibrator/default`, behind the same worker, mapping and counters: an effect is `on(length)`
+(no callback) then, when `getCapabilities()` has `CAP_AMPLITUDE_CONTROL`, `setAmplitude(level / 255 x gain)` (AOSP's
+vibrator service orders them so); a stop and the close are `off()` (the close always sends one: the motor is stopped
+whatever the worker believed). The period has no place in `on()`: the HAL plays at its own resonance. Not registered:
+one missing line and no actuator for iOS, or the evdev search with `hw-backend-fallback=1`. Tested: `test_hal_binder.c`
+(on and amplitude for two intensities, a stop, the close, no amplitude control, not registered, the fallback), the
+stand-in phone (3 checks: `bridgectl haptic 40` with the fake HAL's call log). The samsung tests (`test_bridges.c`)
+unchanged. On the phone: `hw: haptics: backend samsung (the default)` then the same `haptics: on: /dev/input/eventN
+...` line; a treble boot by `haptics: on: the vibrator HAL android.hardware.vibrator.IVibrator/default (version N,
+capabilities 0x...)` and `haptics: effect N played on the vibrator HAL`.
+
+### Tested (2026-11-15, the hw-backend branch) and what is next
+
+- `runtime/host-tests.sh`: all pass (loader, xnuhost incl. the config checks, display, bridges incl. test-binder,
+  camera, links, package). One run on a box at load 17 failed one timing check of the virtio-gpu lanes
+  (`test_xnuhost.c` 951, a 2 s wait; nothing of this branch), which passed in two runs alone and in `make -C
+  runtime/xnuhost test` (13883 checks, the test kernel booted). The bridges: `hw_backend` 55, brightness 105, battery 83, thermal 81, `hal binder` 37,
+  bridges 295, wifi 162 checks, 0 failures; the samsung checks that were there before are unchanged.
+- The stand-in suites (`tests/phone/modes.sh`, both `/proc` modes): phone 222 (22 of them `hw-backend.sh`), app 65,
+  cycle 103, all ok. The cycle suite needs a short run folder in a worktree with a long path (`MODES_RUN=/tmp/...`):
+  its tmux socket path is longer than a Unix socket allows otherwise (`File name too long`), a fault of the suite
+  (main a591c08), not of this branch.
+- Not run on a phone (no phone on the build box). With nothing set the phone is samsung everywhere; the only new
+  lines are the `hw: <bridge>: backend samsung (the default)` ones.
+- Next: the light sensor's treble form (the sensors HAL: events through an FMQ); Wi-Fi (the interface's name from
+  nl80211), Bluetooth (the AIDL `IBluetoothHci`) and the display (the DRM card found at run time) after
+  fix-settings-wifi-cpu, fix-bt-virtual and fix-boot-black merge; the camera provider's instance from
+  servicemanager's list; `oneios-tool phone backlight` with the treble names; the fork's device profiles
+  (`oneos/interface.md` 6b). The first phone boot with `--hw-backend treble` checks the HALs' codes ([I] above).
+
+## 7f. S Pen (spen, 2026-11-15; off by default)
+
+The S24 Ultra's S Pen (a Wacom EMR digitizer under the panel; writing needs no battery and no Bluetooth link) as an
+Apple Pencil in iOS: hover, contact, pressure, tilt, the side button. **Off by default** until a phone session shows it:
+xnuhost `pen=auto` (`--set pen=auto`, or `pen=auto` in `xnuhost.conf`), which also gives the guest `oneios-pen=1`.
+
+### The phone
+
+- [F] The pen's input device is `sec_e-pen` (event11 on the owner's phone on 2026-11-10, `docs/agents.md`; numbers move
+  between boots, so xnuhost goes by bits and name). Its axes, ranges, resolution, tilt and distance bits are **not read
+  yet** [U]: the first session's `pen:` line prints them. One UI keeps the hardware; `/sys/class/sec/sec_epen` holds
+  Samsung's controls, which nothing of OneiOS reads or writes (no sysfs walk, no wake writes).
+- [I] No `EVIOCGRAB` is needed: in a session zygote and system_server are gone, so nothing else reads the device (as for
+  the touch screen, `oneos/interface.md` 1); evdev gives every reader every event, and an ungrabbed device is One UI's
+  again at the return as it was. xnuhost never grabs it.
+- [U] Whether Samsung's pen driver reports while One UI's framework is stopped (the touch IC needed a wake, 7b; the pen
+  may too). The `pen: the first event from ...` line says whether anything came.
+- [U] The digitizer's frame against the panel's: `pen-rotate=auto` turns a landscape digitizer under the portrait panel
+  a quarter clockwise (a guess); `pen-rotate=270`, `180` and `pen-mirror=1` cover the other ways. Check: a Notes stroke
+  from the top left corner must start there.
+- [U] Palm rejection: the touch IC reports a resting hand as fingers; iOS's own handling of fingers while a pencil is in
+  range is all there is.
+
+### What iOS needs (read in 24A446's shared cache on the Linux PC with `out/bin/ipsw`, 2026-11-15)
+
+| Need | Where | Code read [F] or guess |
+|---|---|---|
+| A service that is Built-In with primary usage page / usage 0x0d / 0x20 (Digitizer / Stylus) is backboardd's "pencil digitizer" (`*** acquired pencil digitizer`); 0x0d/0x04 is the main display's, 0x0d/0x01 the AOP's; a second pencil service is refused (`*** already have a pencil digitizer`) | BackBoardHIDTouchEventProcessor, `__59-[BKHIDDirectTouchEventProcessor matcher:servicesDidMatch:]_block_invoke` (`isBuiltIn`, then `primaryUsagePage << 16 \| primaryUsage` against 0xd0001 / 0xd0004 / 0xd0020) | [F] |
+| A touch is `UITouchTypePencil` (type 2) when its digitizer event's transducer type (field 0xb0004) is 0 (`kIOHIDDigitizerTransducerTypeStylus`); otherwise 1 (indirect) or 0 (direct, by DisplayIntegrated). No idiom check, no MobileGestalt answer, no pairing state on that path | UIKitCore `_UITouchSetBasicTouchPropertiesFromEvent` (`-[UITouch _setType:]`, ivar +0x160 = `-[UITouch type]`); `_UIEventHIDGetChildStylusEvent` | [F] |
+| Hover: the feature flag PencilAndPaper/Hummingbird on, a stylus child whose Z (0xb0002) is not 0, and a maximum Z in the event's digitizer attributes | UIKitCore `_UIEventHIDShouldAllowHoverEventGeneration`, `_UIEventHIDPencilMaximumPositionZForEvent` (`BKSHIDEventGetDigitizerAttributes`); `/System/Library/FeatureFlags/Domain/PencilAndPaper.plist` in the image: Hummingbird Enabled true | [F] |
+| The maximum Z and the maximum force backboardd puts in those attributes come from the service's `MaxHoverHeight` and `AccurateMaxDigitizerPressureValue` | both strings are in 24A446's BackBoardHIDTouchEventProcessor [F]; how they are read: UniXNU-droidvm's reading of iPadOS 27's backboardd (`ipados27/scripts/build-droidvm-hid-input.py`) | [I] for iPhone |
+| A pencil's force is the event's pressure / 120 (an Apple Pencil's 0..4.17 for 0..500 under a maximum of 500); PencilKit widens its ink by that force | droidvm's reading (`-[UITouch _unclampedForce]`, PencilKit `InputPoint`) | [I] |
+| Altitude and azimuth: UIKit reads the stylus event's polar orientation (`kIOHIDEventFieldDigitizerAltitude` 0xb000f, `Azimuth` 0xb0010) | droidvm's reading of `-[UITouch _updateWithChildEvent:]` | [I] |
+| Apple's IOHIDEventDriver makes a stylus transducer of a Stylus collection; takes In Range, Tip Switch, Barrel Switch (button 1), Eraser (button 2), Tip Pressure, Z; **drops X and Y Tilt** and parses no azimuth or altitude | IOHIDFamily-2238.120.5 (the profile's pin) `IOHIDEventDriver.cpp` | [F] source at the pin |
+| `IOHIDEvent::setFixedValue` is slot 26 (after getFixedValue's 25), discriminator 0x6e23 | `IOHIDEvent.h` at the pin; `__builtin_ptrauth_string_discriminator("_ZN10IOHIDEvent13setFixedValueEjij")` = 0x6e23, as the same builtin gives NativeHidInput's known 0xf637 for getFixedValue; and 24A446's kernelcache itself (`ipsw kernel cpp out/kernel-inputs/24A446/kernelcache.macho -c IOHIDEvent --methods`): slot 25 pac 0xf637, slot 26 pac 0x6e23, 37 slots | [F] |
+| The event's IOHIDDigitizerEventData is 0xa0 bytes with orientationType at +0x58 (1 = polar) | droidvm (HID.framework `+polarDigitizerEvent:`); the wrapper checks size and type before it writes and counts a mismatch | [I], checked at run time |
+| MobileGestalt `DeviceSupportsApplePencil`: not read by UIKitCore (no such string there); PencilKit, NotesSupport, Preferences, AnnotationKit read it (UI and settings). libMobileGestalt has a `supports-apple-pencil` string beside the `/product` `supports-*` names, and 24A446's iPhone device tree has no `supports-apple-pencil` | strings | [F] strings; [I] that the answer is that `/product` property and so false here. Not set by OneiOS: strokes do not need it; what Notes or PencilKit show differently with it is [U] |
+| The side button: UIKit's pencil barrel events (double tap, squeeze) are generic-gesture HID events (type 0x27) of the pencil's own service, not the digitizer's button mask | UIKitCore `_UIEventHIDIsPencilBarrelEvent` | [F]; so the S Pen's button reaches iOS as the digitizer's Barrel Switch, which no iOS code is known to act on [U] |
+| Pairing (PencilPairingUI, `com.apple.pencil.pairing.app`) is a Bluetooth Apple Pencil's; not needed for the digitizer's touches | | [I] |
+
+### The path
+
+1. **Host** (`runtime/xnuhost/src/pen.c`; `docs/booter.md` 2.8 "The pen"). `xh_pen_lookup` (one function, replaceable by
+   another hardware backend) finds the device by its bits (`BTN_TOOL_PEN`, `ABS_X/Y`, `ABS_PRESSURE`; ranked up for
+   `ABS_TILT_X`, `BTN_STYLUS`, `ABS_DISTANCE` and a pen's name; never a device with a side key or multitouch) and opens
+   it read only. The filter turns each frame into one sample in fixed units (x, y 0..32767 turned to the panel; pressure
+   0..4095 while the tip is down; height 1..255 while hovering; tilt in degrees; tip, side button, eraser end), sends
+   only what changed, skips a frame like the last, and reads the state again after `SYN_DROPPED`.
+2. **The channel**: a second virtio-input device, `/arm-io/input-1` ("OneiOS pen"), with those fixed ranges, read on
+   input.c's thread. The touch screen's device is unchanged.
+3. **Guest transport**: the staged `DroidVMVirtioInput.c` (UniXNU-droidvm's code, unchanged: `KIND_PEN`) takes a device
+   with `INPUT_PROP_DIRECT`, `BTN_TOOL_PEN` and `ABS_X/Y` as a pen and sends each frame to the pen sink: flags, x, y,
+   pressure, distance, tilt, and the altitude and azimuth it computes from the tilt.
+4. **Guest HID device** (`kernel/patches/oneios-hosted/hid`, `staged/hid_pen.rs`; with `oneios-pen=1`): "OneiOS pen", a
+   third NativeHidInput, Transport SPI, report 4 in a Digitizer / Stylus collection (Tip Switch, Barrel Switch, In Range,
+   Eraser, X, Y 0..32767, Z 0..255, Tip Pressure 0..4095, X/Y Tilt -90..90), Built-In, DisplayIntegrated,
+   DigitizerCollectionDispatch, MaxHoverHeight 1, AccurateMaxDigitizerPressureValue 500. The SPI / Digitizer
+   personality that takes the touch screen takes it too (IOHIDEventDriver at once).
+5. **The event driver's dispatch** (NativeHidInput's edge wrapper, now on the pen's driver too) completes each stylus
+   event: polar orientation, altitude, azimuth, pressure 0..500, Z 0..1. OneiOSHidInput.cpp publishes Built-In,
+   DisplayIntegrated, PrimaryUsagePage 0x0d, PrimaryUsage 0x20, MaxHoverHeight and AccurateMaxDigitizerPressureValue on
+   the event service and its interface once it attaches.
+6. backboardd acquires it as the pencil digitizer; UIKit makes `UITouchTypePencil` touches with force, altitude and
+   azimuth, and hover where the flag and Z allow.
+
+### Tested
+
+- Host: `test_pen` (`make -C runtime/xnuhost test`): the lookup's test (a pen's bits, the rank, never side keys or
+  multitouch), the sample (pressure scaling, hover height never 0 and half way without the axis, tilt by resolution, as
+  degrees and by range, the four turns and the mirror, the eraser end, a tip without `BTN_TOOL_PEN`, out of range all
+  zero), the frames (only what changed, nothing for a still pen in the air, the tip and the button, `SYN_DROPPED` read
+  again), the guest device's configuration, `pen-rotate=auto`, the script's pen lines and the demo script.
+- Generator: `cargo test -p oneios-kernel --test golden`, `the_pen_edits_fit_the_pinned_source` (the edits against
+  NativeHidInput 24f1f3f after the phone's).
+- PC boot (2026-11-15, Linux PC, qemu-aarch64 under `flock /tmp/oneios-qemu.lock`, 8 vCPUs, `--ram 4G`, a fresh Data
+  store from the PC image set, `--no-input --input-script runtime/xnuhost/tools/input-demo.script --set pen=auto`;
+  kernel.kc c99c179c of this branch: audit 0 failures, `stubs-check` 666 good, 0 bad; stopped by hand after 9.5 min, no
+  panic). xnuhost: `pen: the guest's pen device is /arm-io/input-1 (the input script's pen); oneios-pen=1`, then 87 times
+  `pen: in range 1988 ms: 70 frames (8 hovering, 62 touching), 2 strokes, pressure up to 3800/4095, tilt x 0..40 y -30..0
+  degrees, the side button pressed 1 time; 0 unchanged frames not sent`. Guest: `droidvm input /arm-io/input-1: OneiOS
+  pen, pen`, `virtio-input: 2 device(s) in the device tree, 2 started`, `pen: HID device started under IOHIDResource`,
+  `pen: event driver IOHIDEventDriver attached`, `pen: Digitizer/Stylus, Built-In, ... published on the event service;
+  edge wrapper 0` (printed before the first report: the wrapper is put on the pen's driver at its first report),
+  `pen: 1 user client(s) on the event service: IOHIDEventServiceUserClient (pid 54, backboardd)`; at the end
+  `pen: 6141 pen frames, 6141 HID reports (last result 0x0), 6141 sent (6055 stylus events given the pencil's angles,
+  pressure and height, 0 of a layout not known)` (the 86 others are the out-of-range reports, for which the driver
+  makes no event: its "multiple untouch" rule) and `pen: 3780 HID events queued for the service's client(s), 0 dropped`.
+  So the event data's layout is the one the wrapper knows, in 24A446. **iOS's own log** (`oneios-tool ioslog show
+  out/pcboot/data/data.img --proc backboardd --grep digitizer`): `digitizer attached (sender 100000216)
+  service:<BKIOHIDService ...; eventSource: builtin; primaryUsagePage: 0xD; primaryUsage: 0x20; name: OneiOS pen;
+  transport: SPI; ...>` and `*** acquired pencil digitizer` (beside `*** acquired main display digitizer` for the touch
+  screen); and (`--grep encil`) 41 `touchstats 100000216-<main> ...: [ down: 2, up: 2, rangeIn: 1, rangeOut: 1, pencil: 2,
+  pathsSeen: 4, destinations: { ... touchIDs: ... } ]`: backboardd counts the strokes as pencil touches and routes them
+  to a destination. Not shown on the PC: an app drawing them (the boot shows no UI to the script), UIKit's hover, and
+  the stroke's width.
+- Not run on the phone.
+
+### On the phone: the lines that prove it
+
+With `pen=auto` in the session's `xnuhost.conf` (or `--set pen=auto`):
+
+| Step | Line |
+|---|---|
+| The device found, read only | xnuhost.log `pen: /dev/input/eventN "sec_e-pen": read only, not grabbed; x ..., y ..., pressure ..., distance ..., tilt x ...; keys: tool pen, ..., stylus (the side button); turned D degrees (...)` |
+| The guest has the device | `pen: the guest's pen device is /arm-io/input-1 (the host's pen); oneios-pen=1`; guest `droidvm input /arm-io/input-1: OneiOS pen, pen` |
+| The pen service published | `oneios-hid: pen: HID device started under IOHIDResource`; `oneios-hid: pen: event driver IOHIDEventDriver attached (...)`; `oneios-hid: pen: Digitizer/Stylus, Built-In, DisplayIntegrated, MaxHoverHeight, AccurateMaxDigitizerPressureValue published on the event service; edge wrapper 0` (0 before the first report) |
+| backboardd holds it | `oneios-hid: pen: 1 user client(s) on the event service: IOHIDEventServiceUserClient (pid N, backboardd)` |
+| Events arrive | `pen: the first event from sec_e-pen`; per time in range `pen: in range T ms: F frames (H hovering, C touching), S strokes, pressure up to P/4095, tilt x ... degrees, the side button pressed B times`; guest `oneios-hid: pen: N pen frames, N HID reports (last result 0x0), N sent (N stylus events given the pencil's angles, pressure and height, 0 of a layout not known); the last: ...` and `oneios-hid: pen: N HID events queued for the service's client(s), 0 dropped` |
+| iOS takes it as a pencil | `oneios-tool ioslog show DATA.img --proc backboardd --grep 'pencil digitizer'`: `*** acquired pencil digitizer` (not `already have`); `--grep 'digitizer attached'` lists the service |
+| Pencil touches | Notes (or any PencilKit canvas): strokes whose width follows the pressure. `oneios-tool ioslog show DATA.img --proc backboardd --grep stylus`, `--grep 'ignoring digitizer event'` (must be absent for the pen's service), `--proc Notes --grep pencil` |
+
+`N of a layout not known` above 0 with `0 stylus events given ...` means the event data is not the layout orient()
+knows: tilt and pressure then stay as the driver made them (pressure 0..1, no angles).
+
+## 7g. Video encoder (hevc-encoder, 2026-11-15; host done, guest archive not yet built)
+
+The phone's hardware video encoder (Qualcomm's Codec2 `c2.qti.hevc.encoder` / `c2.qti.avc.encoder`) for iOS, so
+VideoToolbox encodes HEVC and H.264 and **CMPhoto writes HEIC**: chronod's widget snapshots, screenshots, the photo
+library and Live Photos (then the camera's recording, screen recording and FaceTime). Host side:
+`runtime/bridges/encoder`; guest side: `kernel/patches/oneios-hosted/codec`.
+
+**The fault (session 8644ae9, 2026-11-15).** Home-screen widgets rendered white: chronod logged 58 times `Error
+[com.apple.imageio:chronod] writeImageAtIndex: *** CMPhotoCompressionSessionAddImage: err =
+kCMBaseObjectError_UnsupportedOperation [-N] (codec: 'hvc1')`, then `finalizeDestination: session write failed`, and
+WidgetRenderer then `Content load failed: unable to find or unarchive file for key: ...systemSmall...` for Weather,
+Calendar, News and Maps, sending 50 `WidgetRendererErrorDomain/1` replies to SpringBoard. The owner chose real
+HEVC/HEIC through the phone's encoder, not a JPEG fallback.
+
+### The route [F the 24A446 cache, read on the Linux PC 2026-11-15]
+
+VideoToolbox 3350.77.1.6 carries a whole **paravirtualized** encoder and decoder
+(`ParavirtualizedVideoEncoder_CreateInstanceWithSpecification`, `..._EncodeFrame/EncodeTile`,
+`paravirtualizedVideoEncoder_HandleMessageFromHost`; symbols in the cache) and uses them for every eligible codec
+once `VTParavirtualizationIsRunningInGuest` — i.e. once the service **`AppleVideoToolboxParavirtualizationDriver`**
+(string in `VideoToolboxParavirtualizationSupport` 71.0.14) is published. CMPhoto 488.22.4's HEIC path takes it:
+`_CMPhotoSupportsHEVCHWEncode`'s block calls `VTSelectAndCreateVideoEncoderInstance` with
+`kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder` = true and `kCFBooleanTrue`, and sets
+`hwSupported` from whether an encoder is returned (disassembled at `0x1a676e924`). The paravirtualized encoder
+answers `UsingHardwareAcceleratedVideoEncoder` true, so CMPhoto sees hardware HEVC and `AddImage(codec: 'hvc1')`
+stops failing. [F] these cache reads; [I] that iOS 27's encode graph takes the device unchanged (the next session's
+log confirms, `codec/README.md`).
+
+**Route chosen: publish Apple's own paravirtualization service** (the guest kernel archive is UniXNU-droidvm's
+`DroidVMVTParavirt.cpp` + `DroidVMVTHost.cpp` + `DroidVMVirtioMedia.c`, proven to the iPad home screen on iPadOS 27),
+with the real encoding in the host over Android's MediaCodec. **Not** an AVE2 user-client emulation (the `ave`
+device-tree node is `compatible = "ave2"`, `soc-id "t8150"`, and `AppleAVE2` 913.43.1's firmware command ABI is
+Apple's, not serveable by another encoder) and **not** a `.videoencoder` bundle of ours (CMPhoto requires a
+*hardware* encoder; a plain bundle registers as software). This is the route the code already supports: the Metal and
+camera plug-ins are likewise iOS-side code built on Apple's own loaders.
+
+### The host side (`runtime/bridges/encoder`) — done, proven on the PC
+
+A stateful V4L2 encoder device, `droidvm,virtio-media` (`/arm-io/virtio-media-0`), on xnuhost's transport: OUTPUT is
+tightly packed NV12 (the IOSurfaces VideoToolbox gives, copied by `DroidVMVTHost` into the pool), CAPTURE is the
+HEVC/H.264 bitstream (Annex-B NAL units, parameter sets). The real encoding runs in the **oneios-encoder helper**
+(xnuhost is static, MediaCodec is a shared library, as with the camera and audio helpers); the helper runs the NDK's
+`AMediaCodec` (`video/hevc` → `c2.qti.hevc.encoder`), one keyframe and constant quality for a still. The MMAP'd V4L2
+buffers live in a 48 MiB **media pool** carved after the GPU pool, inside the 64 MiB the hosted kernel already lets a
+task map (`0024-gpu-pool.patch`, so no new pmap patch). Off by default (`encoder=auto`).
+
+- **Code [F]:** `media_device.c` (the device), `backend_ndk.c` (MediaCodec), `backend_helper.c` + `helper.c` (the
+  helper split), `encctl.c` (the phone test). The message layout and the V4L2 ioctl set are what `DroidVMVTHost.cpp`
+  issues.
+- **Tested [F]:** `make test` — 69 checks, the device driven over xnuhost's real transport (`virtio.c`) by a guest of
+  plain memory, replaying `DroidVMVTHost`'s encoder sequence (OPEN, S_FMT HEVC+NV12, REQBUFS/QUERYBUF/MMAP, STREAMON,
+  QBUF a NV12 test pattern, the coded DQBUF, ENCODER_CMD STOP → EOS) through the **real helper process** built for the
+  host with the stand-in encoder; it checks the pool MMAP and that the NV12 pattern reaches the encoder and returns a
+  well-formed HEVC Annex-B access unit (VPS/SPS/PPS + IDR with the frame's dims and checksum). The Android build
+  (`oneios-encoder`, `encctl`, `liboneencoder.a`) builds with NDK r28c; xnuhost links it.
+- **Guess [I]:** NV12 as `COLOR_FormatYUV420SemiPlanar` ByteBuffer input to `c2.qti.hevc.encoder` (not yet run on the
+  phone); the still-image CQ settings. `encctl` checks this on the phone.
+
+### The guest side (`kernel/patches/oneios-hosted/codec`) — written, not yet built
+
+`OneiOSCodec.c` (`oneios_codec_start`, a weak hook in `drivers/bridge/OneiOSBridge.c`) brings up the virtio-media
+transport and publishes the paravirtualization service. It stages the three UniXNU-droidvm files unchanged. The
+generator `oneios-tool kernel gen codec` and the `build-hosted.sh` wiring are the **remaining step** (they need a
+kernel build to produce and freeze; `codec/README.md` says exactly what the Mac builds). The weak hook and xnuhost's
+`droidvm-vt-paravirt=1` (added with `encoder=auto`) are in place, so a kernel built with the archive starts it and a
+kernel without it is unchanged.
+
+### What the Mac must build and stage
+
+1. `make -C runtime/bridges/encoder` → ship `build/android/oneios-encoder` as `bin/oneios-encoder` (0755) in the
+   runtime package; `encctl` to the phone for the check above.
+2. Add `oneios-tool kernel gen codec` + the `build-hosted.sh` wiring (`codec/README.md`), build `kernel.kc`, boot with
+   `encoder=auto`.
+
+### The phone lines that prove it
+
+- `xnuhost.log`: `encoder: on: mediacodec-helper backend, media pool 48 MiB at ...`; `ONEIOS CODEC: 1 virtio-media
+  device(s), 1 up; VideoToolbox paravirtualization registered (stage 2)`.
+- `oneios-tool ioslog`: **no** `CMPhotoCompressionSessionAddImage ... (codec: 'hvc1')` /
+  `kCMBaseObjectError_UnsupportedOperation`; WidgetRenderer **without** `Content load failed`; `oneios-gpu-pixels:
+  WidgetRenderer_ ... drawn`; a screenshot saved as HEIC (`....ftypheic`).
+
+## 8. Sources
+
+| What | Repository and commit |
+|---|---|
+| Stock device trees (decompiled): CPUs, haptics, audio, Wi-Fi, Bluetooth, camera slots | [samsung-sm8650/android_kernel_samsung_sm8650-devicetrees@2f6a973](https://github.com/samsung-sm8650/android_kernel_samsung_sm8650-devicetrees/tree/2f6a9734e556f2f7680b0094bec4ad4671157f8b) (`samsung/e3q_eur_openx_w00_r09.dts`, `qcom/pineapple-v2.dts`) |
+| Samsung's kernel source: CS40L26 and sec_vib_inputff drivers, `e3q_defconfig`, `drivers/optics/stk6d2x*.c` (the light sensor) | [samsung-sm8650/android_kernel_samsung_sm8650@809f7ed](https://github.com/samsung-sm8650/android_kernel_samsung_sm8650/tree/809f7edaad95be2f60ce09f577fe5104d8940214) |
+| Common device tree: HAL binaries (Bluetooth HIDL 1.1, vibrator service, camera provider, sensor modules) | [samsung-sm8650/android_device_samsung_sm8650-common@48c66f6](https://github.com/samsung-sm8650/android_device_samsung_sm8650-common/tree/48c66f6543b31784fce4e7d23ea855897f18ce6e) |
+| e3q device tree: Wi-Fi and Bluetooth firmware names | [samsung-sm8650/android_device_samsung_e3q@fb2ba30](https://github.com/samsung-sm8650/android_device_samsung_e3q/tree/fb2ba3010d59c0f38ddf81aef7fd9c78e2172860) |
+| Other trees seen, not used: Samsung OSS builds with KernelSU, the Gunyah kernel | `YuzakiKokuban/android_kernel_samsung_sm8650` (7c7f8dd), `Andy312432/android_kernel_samsung_sm8650_gunyah` (bacbd93) |
+| iOS-side ports | iOSPlus10 (local, read-only): `patches/laurel/xnu/2700-laurel-pmi632-haptics.patch`, `2600-laurel-bluetooth-wcn3990.patch`, `docs/laurel_sprout/{haptics,bluetooth,camera,audio}.md` |
+| Guest drivers taken unchanged | UniXNU-droidvm f9121cd (`external/UniXNU-droidvm/package/`), `docs/references.md` |
+| The owner's phone | board notes of 2026-11-10 in `docs/agents.md` (shell and root reads) |
+
+Only single files were fetched from the kernel and device repositories (raw downloads at the pinned commit) and one
+shallow clone of the 748 KiB devicetrees repository; nothing of them is in this repository.

@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: MIT
+// The thermal bridge: the phone's temperatures and a thermal pressure level for iOS, and the step by which
+// xnuhost holds itself back. Reads Linux's thermal zones (/sys/class/thermal), Samsung's board thermistors
+// (/sys/class/sec/sec-*-thermistor) and the battery's own sensors (/sys/class/power_supply/battery), read only.
+// README.md here has the sensors, the levels and why.
+//
+// In a session One UI's system_server is gone, and with it Samsung's skin-temperature policy (SSRM). The kernel's
+// own trips (the CPU and GPU junction at 90-110 C, LMh in hardware) keep running and cap every process, xnuhost's
+// threads too. Nothing else acts on the case temperature: this bridge does, inside xnuhost only.
+//
+// Two backends for the sensors (bridges/hw_backend.h, hw-backend-thermal): samsung, the files above (unchanged); treble,
+// the thermal HAL android.hardware.thermal.IThermal/default (getTemperatures: CPU, GPU, SOC, BATTERY, SKIN). The policy
+// (br_thermal_decide, the step) is the same for both; the load line reads the same standard files in both.
+#ifndef ONEIOS_BRIDGE_THERMAL_H
+#define ONEIOS_BRIDGE_THERMAL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define BR_THERMAL_UNKNOWN INT32_MIN      // a reading that is missing (all readings are tenths of a degree C)
+#define BR_THERMAL_POLL_MS 5000u          // how often the sensors are read while someone listens
+#define BR_THERMAL_REPORT_MS 30000u       // a sample is sent at least this often, and at once on a new level
+#define BR_THERMAL_MAX_ZONES 96u
+
+// iOS's thermal pressure levels (OSThermalNotification.h of the iPhoneOS SDK: kOSThermalPressureLevel*).
+enum { BR_THERMAL_NOMINAL = 0, BR_THERMAL_LIGHT = 10, BR_THERMAL_MODERATE = 20, BR_THERMAL_HEAVY = 30, BR_THERMAL_TRAPPING = 40,
+       BR_THERMAL_SLEEPING = 50 };
+// Which rule set the level (br_thermal_state.reason).
+enum { BR_THERMAL_BY_SKIN = 1u, BR_THERMAL_BY_SOC = 2u, BR_THERMAL_BY_BATTERY = 4u };
+
+// One reading of every sensor, tenths of a degree C, BR_THERMAL_UNKNOWN when missing.
+typedef struct {
+  int32_t cpu, gpu, ddr, soc;             // the hottest CPU core or cluster zone, GPU zone, the DDR zone; soc = the hottest of the three
+  char    soc_zone[24];                   // the zone that gave soc
+  int32_t xo;                             // xo-therm: the crystal, near the SoC on the board
+  int32_t ap;                             // sec-ap-thermistor: Samsung's board thermistor by the SoC
+  int32_t battery;                        // power_supply/battery/temp
+  int32_t lrp;                            // power_supply/battery/lrp: Samsung's case sensor, by which its charger limits current
+  int32_t skin;                           // the case: lrp, or ap when there is no lrp
+} br_thermal_raw;
+
+// Thresholds, tenths of a degree C. skin[k] turns on LIGHT, MODERATE, HEAVY, TRAPPING, SLEEPING for k = 0..4;
+// soc[k] and battery[k] turn on HEAVY and TRAPPING. A level stays until its reading is `*_hyst` below its threshold.
+typedef struct {
+  int32_t skin[5], skin_hyst;
+  int32_t soc[2], soc_hyst;
+  int32_t battery[2], battery_hyst;
+} br_thermal_limits;
+
+typedef struct {
+  unsigned level;                         // BR_THERMAL_* (the highest of the three rules)
+  unsigned reason;                        // BR_THERMAL_BY_* of the rules at that level
+  unsigned skin_level, soc_level, battery_level;      // each rule's own level (its hysteresis follows it)
+  unsigned cap;                           // xnuhost's step: br_thermal_cap_for (0, or BR_THERMAL_CAP_CRITICAL)
+  br_thermal_raw raw;
+} br_thermal_state;
+
+// ---- pure ---------------------------------------------------------------------------------------
+void br_thermal_limits_default(br_thermal_limits *l);
+// "390,420,440,460,500" into l->skin (and the same for soc, battery with two values). 0, or -1 (l unchanged).
+int br_thermal_limits_parse(const char *text, int32_t *out, unsigned count);
+// The next state from a reading and the previous state (NULL: nothing before).
+void br_thermal_decide(const br_thermal_limits *l, const br_thermal_raw *raw, const br_thermal_state *prev, br_thermal_state *out);
+// xnuhost's step (since fix-ram-locked, 2026-11-15): 0, all CPU cores, unless the temperature is critical: the case rule
+// at SLEEPING (50 C) or the battery rule at TRAPPING (50 C); then BR_THERMAL_CAP_CRITICAL, only the slowest P domain and
+// the E cores. The SoC is the kernel's (its own trips and LMh). br_cpu_thermal_mask (bridges.h) turns a step into CPUs
+// (it still knows steps 1 and 3: thermalctl prints them).
+#define BR_THERMAL_CAP_CRITICAL 2u
+unsigned br_thermal_cap_for(const br_thermal_state *s);
+const char *br_thermal_level_name(unsigned level);
+// Whether a new state is worth a message: a new level or cap at once, otherwise after BR_THERMAL_REPORT_MS.
+bool br_thermal_changed(const br_thermal_state *sent, const br_thermal_state *now, uint32_t ms_since_sent);
+
+// ---- sysfs --------------------------------------------------------------------------------------
+typedef struct {
+  char path[160];
+  char type[24];
+  uint8_t group;                          // 0 cpu, 1 gpu, 2 ddr, 3 xo
+} br_thermal_zone;
+
+typedef struct {
+  char root[128];                         // "" on the phone; a fixture's directory in tests (prefixed to every path)
+  br_thermal_zone zone[BR_THERMAL_MAX_ZONES];
+  unsigned nzone;
+} br_thermal_sensors;
+
+// Finds the zones of interest under root/sys/class/thermal (cpu-*, cpuss-*, gpuss-*, ddr, xo-therm). 0, or -1 when no
+// sensor of any kind can be read (no zone, no thermistor, no battery temperature).
+int br_thermal_find(const char *root, br_thermal_sensors *s);
+void br_thermal_read(const br_thermal_sensors *s, br_thermal_raw *raw);
+// The treble backend (hw-backend-thermal): the thermal HAL's temperatures (hal/hal.h) as a reading: cpu, gpu the hottest of
+// their type; soc the hottest of CPU, GPU and SOC (its name in soc_zone); battery; skin (the case) the hottest SKIN. ddr, xo,
+// ap and lrp (Samsung's) stay unknown. Implausible values (below -40 C, above 200 C) are skipped.
+struct hal_temperature;
+void br_thermal_from_hal(const struct hal_temperature *temps, unsigned n, br_thermal_raw *raw);
+
+// ---- where the heat comes from (2026-11-14) -------------------------------------------------------
+// One sample of the host's load, from named files only (never a folder list): root/proc/stat's "cpu" line and its cpuN
+// count, root/proc/vmstat's pswpin and pswpout, root/proc/self/stat's utime and stime (this process: xnuhost), and
+// root/sys/class/power_supply/battery/{temp,current_now,status}. A field that cannot be read is 0 with its have_* false.
+typedef struct {
+  bool have_cpu, have_swap, have_self, have_current;
+  unsigned ncpu;                          // cpuN lines of /proc/stat
+  uint64_t user, nice, system, idle, iowait, irq, softirq, steal;   // the "cpu" line, ticks summed over every CPU
+  uint64_t pswpin, pswpout;               // pages since boot
+  uint64_t self_ticks;                    // utime + stime of root/proc/self/stat
+  int64_t current;                        // current_now as the phone gives it (Samsung: mA; + charging, - discharging)
+  char status[16];                        // "Charging", "Discharging", "Full", "Not charging", or ""
+  uint64_t ms;                            // when (CLOCK_MONOTONIC; the caller may set it in tests)
+} br_host_load;
+
+#define BR_THERMAL_LOAD_MS 30000u         // the "thermal: load" line's period
+
+void br_host_load_read(const char *root, br_host_load *out);
+// The one line between two samples, after "thermal: ":
+//   "30 s: host CPU 800% of 800 (sys 226%, user 167%, irq 12%), swap in 9520 out 8040 KiB/s, xnuhost 152%;
+//    battery 40.3 C, Charging 1600 mA; case 41.0 C, SoC 78.0 C (cpu-1-2-1)"
+// Percentages are of one CPU, as top shows them (all busy = ncpu x 100). Missing parts say "-". `page` is the host's
+// page size in bytes (for swap KiB/s). Returns the length written (out is always terminated).
+size_t br_host_load_line(const br_host_load *was, const br_host_load *now, const br_thermal_raw *raw, unsigned page,
+                         char *out, size_t size);
+
+// ---- the session --------------------------------------------------------------------------------
+typedef struct {
+  const char *root;                       // NULL: the phone's paths
+  uint32_t poll_ms;                       // 0: BR_THERMAL_POLL_MS
+  const br_thermal_limits *limits;        // NULL: the defaults and ONEIOS_THERMAL_SKIN, _SOC, _BATTERY
+  uint32_t load_ms;                       // 0: BR_THERMAL_LOAD_MS, the "thermal: N s: host CPU" line's period
+  int      backend;                       // BR_HW_SAMSUNG, BR_HW_TREBLE (bridges/hw_backend.h); 0: the process's hw-backend
+  const char *binder;                     // treble: the binder device; NULL: ONEIOS_BINDER, else /dev/binder
+} br_thermal_options;
+
+typedef void (*br_thermal_fn)(void *ctx, const br_thermal_state *state);
+typedef struct br_thermal br_thermal;
+
+// NULL (with a log line) when there is nothing to read. The worker runs from the start: the cap is the host's
+// own protection and does not wait for the guest. options NULL: the phone and the environment.
+br_thermal *br_thermal_open(const br_thermal_options *options);
+// The last state (read at open, then by the worker).
+void br_thermal_get(br_thermal *t, br_thermal_state *out);
+// Two listeners: `cap` (xnuhost: runs on each new cap), `report` (the bridge device: on br_thermal_changed). fn runs on
+// the worker thread without the bridge's locks. NULL stops that listener.
+void br_thermal_on_cap(br_thermal *t, br_thermal_fn fn, void *ctx);
+void br_thermal_on_report(br_thermal *t, br_thermal_fn fn, void *ctx);
+// BR_HW_TREBLE when the thermal HAL is read, BR_HW_SAMSUNG for the files.
+int  br_thermal_backend(const br_thermal *t);
+void br_thermal_close(br_thermal *t);
+
+#endif

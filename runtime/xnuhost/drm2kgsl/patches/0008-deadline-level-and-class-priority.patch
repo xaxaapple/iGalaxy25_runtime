@@ -1,0 +1,256 @@
+--- a/src/drm/drm2kgsl/drm2kgsl_renderer.c
++++ b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+@@ -96,6 +96,7 @@
+ #include "msm/msm_proto.h"
+ #include "drm2kgsl/msm_kgsl.h"
+ #include "drm2kgsl/drm2kgsl_renderer.h"
++#include "oneios_gpu_policy.h"   /* ONEIOS (0008): the classes and their KGSL priorities */
+ 
+ /*
+  * The VBO reserves the guest's entire GPU VA range.  It is virtual-only
+@@ -517,6 +518,13 @@
+    unsigned constrained_next;
+    bool constraint_on;   /* the constrained queue's KGSL context has its constraint set now (kgsl_constraint_update) */
+    bool constraint_rate;   /* ONEIOS: the rate rule's own last answer, which its hysteresis follows (not a burst's) */
++   /* ONEIOS (0008): the owner's class (enum og_class, drm2kgsl_renderer_set_class), whether a background context's queues carry
++    * KGSL's lowest level now, and which of its queues do (a context has a queue per Vulkan queue: up to four followed). */
++   unsigned oneios_class;
++   bool oneios_lowest;
++   uint32_t oneios_low_queue[4];
++   bool oneios_low_on[4];
++   char oneios_name[40];      /* the guest's name for the context (xnu:<process>) */
+ 
+    /* Whether the guest asked for its fault count (MSM_PARAM_FAULTS): then this context's GPU resets count in the shmem's
+     * global_faults (kgsl_note_reset). A guest that reads global_faults from the shmem alone (Linux turnip) never asks, and keeps
+@@ -1547,6 +1555,13 @@
+  * DRM2KGSL_PWR_CONSTRAINT (read once): unset, the queues that ask; 0, none; "all", every queue (a measurement). */
+ #define DRM2KGSL_SUBMITQUEUE_DEADLINE 0x80000000u
+ #define KGSL_RING_IDX_CONSTRAINED 0x100u
++/* ONEIOS (0008): a background context's queue, made with KGSL_CONTEXT_PWR_CONSTRAINT so that it can carry the lowest level. */
++#define KGSL_RING_IDX_LOWEST 0x200u
++#define KGSL_RING_IDX_FLAGS (KGSL_RING_IDX_CONSTRAINED | KGSL_RING_IDX_LOWEST)
++/* ONEIOS (0008): the level is xnuhost's (src/gpu3d_kgsl.c, oneios_gpu_policy.h) once it has set one: the deadline queues carry
++ * the top level while g_oneios_top, and the clock hold runs only from drm2kgsl_renderer_set_level. Before that (gpuctl) the rules
++ * of 0002-0006 stay. */
++static bool g_oneios_driven, g_oneios_top;
+ 
+ static bool
+ kgsl_queue_constrained(uint32_t queue_flags)
+@@ -1578,6 +1593,8 @@
+     * a second or more too (upstream), anything slower and steady to the governor. */
+    static uint64_t burst = 2;
+    static bool read;
++   if (__atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE))
++      return kctx->oneios_class != OG_CLASS_BACKGROUND && __atomic_load_n(&g_oneios_top, __ATOMIC_ACQUIRE);   /* ONEIOS (0008) */
+    if (!read) {
+       kgsl_parse_u64_env("DRM2KGSL_PWR_CONSTRAINT_MIN_RATE", &min_rate);
+       kgsl_parse_u64_env("DRM2KGSL_PWR_CONSTRAINT_BURST", &burst);
+@@ -1612,10 +1629,21 @@
+ }
+ 
+ /* The context's power constraint: the GPU's highest level while a submission that asks for it runs. */
++static bool kgsl_set_pwr_level(int fd, uint32_t drawctxt_id, bool on, unsigned which);
++
+ static bool
+ kgsl_set_pwr_constraint(int fd, uint32_t drawctxt_id, bool on)
+ {
+-   struct kgsl_device_constraint_pwrlevel level = { .level = KGSL_CONSTRAINT_PWR_MAX };
++   return kgsl_set_pwr_level(fd, drawctxt_id, on, KGSL_CONSTRAINT_PWR_MAX);
++}
++
++/* ONEIOS (0008): the same at either of the two levels KGSL lets a client ask for (KGSL_CONSTRAINT_PWR_MAX, _MIN: its highest and
++ * its lowest, both inside KGSL's thermal limits). KGSL keeps the device's constraint until it expires and takes a new one only if
++ * it is faster, so a background context's lowest level never slows the render server's top one. */
++static bool
++kgsl_set_pwr_level(int fd, uint32_t drawctxt_id, bool on, unsigned which)
++{
++   struct kgsl_device_constraint_pwrlevel level = { .level = which };
+    struct kgsl_device_constraint constraint = {
+       .type = on ? KGSL_CONSTRAINT_PWRLEVEL : KGSL_CONSTRAINT_NONE,
+       .context_id = drawctxt_id,
+@@ -1633,7 +1661,8 @@
+    }
+    static uint32_t logged;
+    if (p_atomic_inc_return(&logged) <= 16)
+-      _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: power constraint %s\n", drawctxt_id, on ? "at the highest level" : "off");
++      _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: power constraint %s\n", drawctxt_id,
++               !on ? "off" : which == KGSL_CONSTRAINT_PWR_MIN ? "at the lowest level" : "at the highest level");
+    return true;
+ }
+ 
+@@ -1874,8 +1903,12 @@
+             drm_err("clock hold: off (%s): the governor alone picks the clock between frames", strerror(errno));
+          } else {
+             pthread_detach(thread);
+-            _drm_log(VIRGL_LOG_LEVEL_WARNING, "clock hold: the top level from the render server's submissions to %llu ms after them\n",
+-                     (unsigned long long)hold_ms);
++            if (__atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE))
++               _drm_log(VIRGL_LOG_LEVEL_WARNING, "clock hold: the top level only for frames that need it (xnuhost's deadline policy), "
++                        "to %llu ms after them\n", (unsigned long long)hold_ms);
++            else
++               _drm_log(VIRGL_LOG_LEVEL_WARNING, "clock hold: the top level from the render server's submissions to %llu ms after them\n",
++                        (unsigned long long)hold_ms);
+          }
+       }
+       if (!g_hold.failed) {
+@@ -1913,6 +1946,58 @@
+    pthread_mutex_unlock(&g_hold.lock);
+ }
+ 
++/* ONEIOS (0008): the level from xnuhost's policy (src/gpu3d_kgsl.c). The top: the deadline queues carry KGSL's highest level at
++ * their next submission and the hold runs to DRM2KGSL_PWR_HOLD_MS after this call. The governor's: their constraint goes off at
++ * their next submission and the hold stops now (KGSL lets the last renewal expire, its idle timer, then the governor decides).
++ * Replaces 0002-0006's rules: every render-server submission at the top and 150 ms after it, whatever the frame needed. */
++void
++drm2kgsl_renderer_set_level(int top)
++{
++   __atomic_store_n(&g_oneios_top, top != 0, __ATOMIC_RELEASE);
++   __atomic_store_n(&g_oneios_driven, true, __ATOMIC_RELEASE);
++   if (top) {
++      oneios_hold_extend();
++      return;
++   }
++   pthread_mutex_lock(&g_hold.lock);
++   const uint64_t now = oneios_now_ns();
++   if (g_hold.until > now)
++      g_hold.until = now;
++   pthread_mutex_unlock(&g_hold.lock);
++}
++
++/* ONEIOS (0008): a background context's queue, at its submission: KGSL's lowest level while the context is told so
++ * (drm2kgsl_renderer_set_class), none otherwise; an ioctl only where that changes. */
++static void
++oneios_lowest_update(struct kgsl_context *kctx, uint32_t drawctxt_id)
++{
++   unsigned slot = 4;
++   for (unsigned i = 0; i < 4 && slot == 4; i++)
++      if (kctx->oneios_low_queue[i] == drawctxt_id)
++         slot = i;
++   for (unsigned i = 0; i < 4 && slot == 4; i++)
++      if (!kctx->oneios_low_queue[i]) {
++         kctx->oneios_low_queue[i] = drawctxt_id;
++         kctx->oneios_low_on[i] = false;
++         slot = i;
++      }
++   const bool want = kctx->oneios_lowest;
++   if (slot == 4) {                        /* more queues than followed: say it every time */
++      kgsl_set_pwr_level(kctx->base.fd, drawctxt_id, want, KGSL_CONSTRAINT_PWR_MIN);
++      return;
++   }
++   if (want != kctx->oneios_low_on[slot] && kgsl_set_pwr_level(kctx->base.fd, drawctxt_id, want, KGSL_CONSTRAINT_PWR_MIN))
++      kctx->oneios_low_on[slot] = want;
++}
++
++void
++drm2kgsl_renderer_set_class(struct virgl_context *vctx, unsigned cls, bool lowest)
++{
++   struct kgsl_context *kctx = to_kgsl_context(to_drm_context(vctx));
++   kctx->oneios_class = cls;
++   kctx->oneios_lowest = lowest && cls == OG_CLASS_BACKGROUND;
++}
++
+ void
+ drm2kgsl_renderer_hold_stats(uint64_t *holds, uint64_t *keepalives)
+ {
+@@ -1927,7 +2012,8 @@
+ static void
+ kgsl_constraint_update(struct kgsl_context *kctx, uint32_t drawctxt_id)
+ {
+-   oneios_hold_extend();
++   if (!__atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE))
++      oneios_hold_extend();                /* ONEIOS (0008): xnuhost holds the clock itself (drm2kgsl_renderer_set_level) */
+    const bool want = kgsl_constraint_now(kctx);
+    if (want != kctx->constraint_on && kgsl_set_pwr_constraint(kctx->base.fd, drawctxt_id, want)) {
+       kctx->constraint_on = want;
+@@ -1944,21 +2030,49 @@
+     * PER_CONTEXT_TS made DRAWCTXT_CREATE return EINVAL; a priority (bits 12-15)
+     * is taken with these flags.
+     */
++   /* ONEIOS (0008): the priority is the owner's class (oneios_gpu_policy.h og_kgsl_priority: the render server and the front app 4,
++    * the default and background processes 8: never 12, a lower ringbuffer has no bound on its fences, fix-gpu-widgets;
++    * ONEIOS_GPU_PRIORITY=off: the guest's queue priority as upstream), and a background
++    * context's queues can carry KGSL's lowest level. A priority this KGSL refuses: the queue is made without one, once said. */
++   static int by_class = -1;
++   if (by_class < 0) {
++      const char *env = getenv("ONEIOS_GPU_PRIORITY");
++      by_class = !env || strcmp(env, "off");
++   }
++   const bool background = kctx->oneios_class == OG_CLASS_BACKGROUND;
++   const uint32_t priority = by_class ? ((og_kgsl_priority(kctx->oneios_class) << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK)
++                                      : kgsl_priority_flags(prio);
+    struct kgsl_drawctxt_create req = {
+       .flags = KGSL_CONTEXT_SAVE_GMEM |
+                KGSL_CONTEXT_NO_GMEM_ALLOC |
+                KGSL_CONTEXT_PREAMBLE |
+                KGSL_CONTEXT_USER_GENERATED_TS |
+-               (constrained ? KGSL_CONTEXT_PWR_CONSTRAINT : 0) |
+-               kgsl_priority_flags(prio),
++               (constrained || (by_class && background) ? KGSL_CONTEXT_PWR_CONSTRAINT : 0) |
++               priority,
+    };
+ 
+-   if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
++   int failed = kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
++   if (failed && priority) {
++      const int error = errno;
++      req.flags &= ~(uint32_t)KGSL_CONTEXT_PRIORITY_MASK;
++      failed = kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
++      static uint32_t said;
++      if (!failed && p_atomic_inc_return(&said) <= 4)
++         drm_err("DRAWCTXT_CREATE with priority %u refused (%s): made with the kernel's default", priority >> KGSL_CONTEXT_PRIORITY_SHIFT,
++                 strerror(error));
++   }
++   if (failed) {
+       drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
+       return -errno;
+    }
+ 
+    *out_id = req.drawctxt_id;
++   static uint32_t logged;
++   if (p_atomic_inc_return(&logged) <= 64)
++      _drm_log(VIRGL_LOG_LEVEL_WARNING, "queue %u of %.*s: %s, KGSL priority %u%s\n", req.drawctxt_id, (int)sizeof(kctx->oneios_name),
++               kctx->oneios_name[0] ? kctx->oneios_name : "?", og_class_name(kctx->oneios_class),
++               (req.flags & KGSL_CONTEXT_PRIORITY_MASK) >> KGSL_CONTEXT_PRIORITY_SHIFT,
++               req.flags & KGSL_CONTEXT_PRIORITY_MASK ? "" : " (none asked: the kernel's default)");
+    return 0;
+ }
+ 
+@@ -2024,9 +2138,12 @@
+       if (!rsp->ret) {
+          q->id = id;
+          if (constrained)
+-            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: constrained while it submits at an animation's rate\n", id);
++            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: %s\n", id, __atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE)
++                     ? "a deadline queue: at the top level only for frames that would miss their deadline (xnuhost's policy)"
++                     : "constrained while it submits at an animation's rate");
++         const bool lowest = kctx->oneios_class == OG_CLASS_BACKGROUND && (!getenv("ONEIOS_GPU_PRIORITY") || strcmp(getenv("ONEIOS_GPU_PRIORITY"), "off"));
+          unsigned ring_idx = (MIN2(q->prio, g_nr_timelines - 1) + 1) |
+-                             (constrained ? KGSL_RING_IDX_CONSTRAINED : 0);
++                             (constrained ? KGSL_RING_IDX_CONSTRAINED : 0) | (lowest && !constrained ? KGSL_RING_IDX_LOWEST : 0);
+          _mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
+                                  (void *)(uintptr_t)id,
+                                  (void *)(uintptr_t)ring_idx);
+@@ -2600,10 +2717,12 @@
+       free(kcmds);
+       return -EINVAL;
+    }
+-   unsigned ring_idx = (uintptr_t)entry->data & ~KGSL_RING_IDX_CONSTRAINED;
++   unsigned ring_idx = (uintptr_t)entry->data & ~KGSL_RING_IDX_FLAGS;
+    if ((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED)
+       kgsl_constraint_update(kctx, req->queue_id);
+-   else
++   else if ((uintptr_t)entry->data & KGSL_RING_IDX_LOWEST)
++      oneios_lowest_update(kctx, req->queue_id);   /* ONEIOS (0008): a background context, never the hold */
++   else if (!__atomic_load_n(&g_oneios_driven, __ATOMIC_ACQUIRE))
+       oneios_hold_follow();
+    if (kctx->report_resets && kctx->shmem)
+       kgsl_note_reset(kctx, req->queue_id);
+@@ -3510,6 +3629,8 @@
+ 
+    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
++   if (debug_name)                /* ONEIOS (0008): for its queues' log lines */
++      snprintf(kctx->oneios_name, sizeof(kctx->oneios_name), "%.*s", (int)strnlen(debug_name, debug_len), debug_name);
+    kctx->unbind_freed = !getenv("NCTX_KEEP_FREED_RANGES");
+    if (!kctx->unbind_freed)
+       drm_log("context %.*s: freed guest BOs stay bound (NCTX_KEEP_FREED_RANGES)",

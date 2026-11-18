@@ -1,0 +1,506 @@
+# OneiOS's one workflow (docs/releases.md, "CI and releases"): the runtime package and the OneOS app (the fork,
+# submodule app/) built at the same time on two runners, and a release that carries both.
+#
+#   plan ──┬── runtime    (ubuntu-24.04) script checks, host tests, runtime/package.sh, the Apple-file refusal,
+#          │                             elf-check, drm2kgsl, the package's members, bin/oneios-tool for the
+#          │                             phone and oneios-tool-VERSION-android-arm64 beside the package
+#          ├── apk        (ubuntu-24.04) app/ at the head of the fork's branch, JDK 21, tribalfs' packages,
+#          │                             ./gradlew test assembleFullDebug, the APK's assets checked
+#          ├── apk-macos  (macos-15)     ./gradlew test of the same checkout on a Mac (core:root's script tests)
+#          └──────────────── release     needs runtime and apk; a tag v* or a dispatch only
+#
+# Triggers: a pull request or a push to main builds both and releases nothing. A tag vN.N.N[-suffix] on main builds
+# both and releases both. A dispatch (Actions, "build and release", Run workflow) on main takes a version and
+# "both", "runtime only" or "apk only".
+# The runtime job never checks out app/: the fork's tree cannot reach the package. Nothing of Apple's, Samsung's,
+# Google's or OPPO's is downloaded or uploaded here: runtime/package.sh refuses Apple files (`oneios-tool package`),
+# and .github/scripts/check-apk.sh refuses an APK that carries a package set, an image or firmware.
+name: build and release
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version N.N.N or N.N.N-suffix (the release is the tag v + version, made at this commit when missing)'
+        required: true
+        type: string
+      build:
+        description: 'What to build and release'
+        required: true
+        type: choice
+        options: [both, runtime only, apk only]
+        default: both
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  # Builds of a branch or a pull request give way to a newer push; a release never does.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      runtime: ${{ steps.plan.outputs.runtime }}
+      apk: ${{ steps.plan.outputs.apk }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: What this run builds and whether it releases
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          release=false version=0.0.0-ci runtime=true apk=true
+          if [ "$EVENT" = push ] && [[ $REF == refs/tags/* ]]; then
+            release=true version=${REF_NAME#v}
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            release=true version=${IN_VERSION#v}
+            case "$IN_BUILD" in both) ;; "runtime only") apk=false ;; "apk only") runtime=false ;;
+              *) echo "::error::build '$IN_BUILD' is not both, runtime only or apk only"; exit 1 ;; esac
+          fi
+          if [ "$release" = true ]; then
+            [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$ ]] || { echo "::error::version '$version' is not N.N.N[-suffix]"; exit 1; }
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_SHA is not on main"; exit 1; }
+          fi
+          echo "release=$release version=$version runtime=$runtime apk=$apk"
+          { echo "release=$release"; echo "version=$version"; echo "runtime=$runtime"; echo "apk=$apk"; } >> "$GITHUB_OUTPUT"
+
+  runtime:
+    needs: plan
+    if: needs.plan.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache the pinned NDK (setup-build.sh's sdkmanager install becomes a restore after the first run)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /usr/local/lib/android/sdk/ndk/28.2.13676358
+          key: ci-ndk-28.2.13676358
+      - name: Cache the Rust toolchain and cargo (the tool's warm build rides in the target dir)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo
+            tools/oneios-tool/target
+          key: ci-cargo-${{ runner.os }}-rust-stable-${{ hashFiles('tools/oneios-tool/**/Cargo.lock') }}
+          restore-keys: |
+            ci-cargo-${{ runner.os }}-rust-stable-
+      - name: The fork's tree is not in this checkout (app/ stays an empty submodule folder)
+        run: |
+          set -euo pipefail
+          [ "$(git ls-files -s app | cut -d' ' -f1)" = 160000 ] || { echo "::error::app is not a submodule"; exit 1; }
+          [ -z "$(ls -A app 2>/dev/null)" ] || { echo "::error::app/ has files: the runtime job must not check out the fork"; exit 1; }
+      - name: No firmware or large binaries in git
+        run: .github/scripts/check-tracked-files.sh
+      - name: Script syntax
+        run: |
+          set -euo pipefail
+          git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+          git ls-files -z '*.py' | xargs -0 python3 -m py_compile
+          shellcheck -S error $(git ls-files 'kernel/*.sh' 'runtime/*.sh' '.github/*.sh')
+      - name: NDK 28.2.13676358, the Rust target and oneios-tool
+        run: .github/scripts/setup-build.sh
+      - name: Sources the runtime links (Droid-VM's virglrenderer for drm2kgsl, the 3D GPU)
+        # Without this checkout xnuhost and gpuctl build 2D-only and say so at run time (runtime 0.1.1's GPU check
+        # failed on the phone with "this build has no drm2kgsl"). A release must have it; every build gets it, so a
+        # pull request builds what a release builds. Fetched before the host tests (docs/releases.md).
+        run: |
+          set -euo pipefail
+          scripts/setup/get-references.sh virglrenderer
+          test -f external/virglrenderer/src/drm/drm2kgsl/drm2kgsl_renderer.c || { echo "virglrenderer checkout has no drm2kgsl"; exit 1; }
+      - name: Host tests
+        run: |
+          set -euo pipefail
+          runtime/package/elf-check-test.sh
+          runtime/package/test.sh
+          kernel/tests/host.sh
+          # Other areas: any executable tests/host.sh below the repository runs here (git ls-files does not
+          # enter the submodule app/).
+          for t in $(git ls-files '*/tests/host.sh' | grep -v '^kernel/'); do echo "== $t"; "$t"; done
+      - name: Kernel from the kernel release, when one is pinned
+        # kernel/release-kernel.txt (optional): "KERNEL_TAG SHA256" of an xnu-<build id>.tar.zst that
+        # kernel/publish.sh uploaded from a build machine. The package step checks its build record again.
+        run: |
+          set -euo pipefail
+          [ -s kernel/release-kernel.txt ] || { echo "no kernel pinned: runtime only"; exit 0; }
+          read -r ktag ksha < kernel/release-kernel.txt
+          mkdir -p out/kernel/current out/kernel/dl
+          gh release download "$ktag" --repo "$GITHUB_REPOSITORY" --pattern 'xnu-*.tar.zst' --dir out/kernel/dl
+          echo "$ksha  $(ls out/kernel/dl/xnu-*.tar.zst)" | sha256sum -c -
+          zstd -dc out/kernel/dl/xnu-*.tar.zst | tar -x -C out/kernel/current
+      - name: Package (refuses Apple files and what Android cannot load)
+        run: runtime/package.sh "$VERSION"
+      - name: The package's xnuhost and gpuctl have drm2kgsl
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d); zstd -dc out/release/oneios-runtime-$VERSION-arm64.tar.zst | tar -x -C "$d"
+          for b in bin/xnuhost bin/gpuctl; do
+            if strings "$d/$b" | grep -q 'this build has no drm2kgsl'; then echo "$b was built without drm2kgsl"; exit 1; fi
+          done
+      - name: Android can load the package's libraries and dynamic helpers
+        # runtime/package.sh refused a stage with such a file already; this reads the archive that is uploaded.
+        # liboneios-display.so of 1f7dd1f linked with a symbol none of its NEEDED libraries has, and the phone could
+        # not load it (2026-11-14; docs/releases.md).
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d); zstd -dc out/release/oneios-runtime-$VERSION-arm64.tar.zst | tar -x -C "$d"
+          runtime/package/elf-check.sh "$d"
+      - name: The package holds the runtime's own folders only
+        # runtime.json, NOTICE, LICENSE, bin/, lib/, scripts/, kernel/xnu.macho and its record: nothing of the
+        # fork's tree (app/) or any other part of the checkout.
+        run: |
+          set -euo pipefail
+          a=out/release/oneios-runtime-$VERSION-arm64.tar.zst
+          ( cd out/release && sha256sum -c "$(basename "$a").sha256" )
+          zstd -dc "$a" | tar -t | tee members.txt | grep -Ev '^(runtime\.json|NOTICE|LICENSE|(bin|lib|scripts)/[^/].*|kernel/xnu\.macho(\.build\.json)?)$' && { echo "::error::the package has members outside the runtime's folders (above)"; exit 1; }
+          [ "$(head -n 1 members.txt)" = runtime.json ] || { echo "::error::runtime.json is not the first member"; exit 1; }
+          echo "$(wc -l < members.txt) members, runtime.json first"
+      - name: The phone's oneios-tool is the package's bin/oneios-tool, stripped, with its .sha256
+        # runtime/package.sh builds tools/oneios-tool for aarch64-linux-android into bin/oneios-tool and writes the
+        # same bytes beside the package (docs/releases.md, "oneios-tool for the phone"). The OneOS app runs it as root.
+        run: .github/scripts/check-phone-tool.sh "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oneios-runtime
+          path: |
+            out/release/*.tar.zst
+            out/release/*.sha256
+            out/release/*.runtime.json
+            out/release/oneios-tool-*-android-arm64
+          if-no-files-found: error
+          retention-days: 14
+
+  apk:
+    needs: plan
+    if: needs.plan.outputs.apk == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read   # tribalfs' Maven packages
+    outputs:
+      file: ${{ steps.apk.outputs.file }}
+      sha256: ${{ steps.apk.outputs.sha256 }}
+      version_name: ${{ steps.apk.outputs.version_name }}
+      version_code: ${{ steps.apk.outputs.version_code }}
+      fork_commit: ${{ steps.fork.outputs.commit }}
+      fork_branch: ${{ steps.fork.outputs.branch }}
+      packages_token: ${{ steps.apk.outputs.packages_token }}
+      signed_with: ${{ steps.apk.outputs.signed_with }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The fork at the head of its branch (app/)
+        id: fork
+        run: |
+          set -euo pipefail
+          git submodule update --init --remote app
+          branch=$(git config -f .gitmodules submodule.app.branch)
+          commit=$(git -C app rev-parse HEAD)
+          pinned=$(git ls-tree HEAD app | awk '{print $3}')
+          echo "app/: $(git config -f .gitmodules submodule.app.url) branch $branch at $commit (recorded in OneiOS: $pinned)"
+          { echo "branch=$branch"; echo "commit=$commit"; } >> "$GITHUB_OUTPUT"
+      - name: Which token reads tribalfs' packages
+        env:
+          RUN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECRET_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SECRET_USER: ${{ secrets.GH_PACKAGES_USER }}
+        run: .github/scripts/packages-token.sh
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+      - name: Android SDK platform 37
+        run: |
+          sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | tail -n 1)
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"
+      # Optional: one debug key for every run (the fork's secret of the same name, set here too), so a new APK installs
+      # over the last one. Without it each run signs with a key of its own.
+      - name: Debug key
+        env:
+          KEYSTORE_B64: ${{ secrets.ONEIOS_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "SIGNED_WITH=the debug key of the secret ONEIOS_DEBUG_KEYSTORE_B64" >> "$GITHUB_ENV"
+          else
+            echo "SIGNED_WITH=a debug key made for this run: uninstall an earlier build before installing this one" >> "$GITHUB_ENV"
+          fi
+      - name: Guest app (the in-guest app the full edition pins; a debug build for a debug host)
+        run: app/scripts/build-guest-manager.sh --debug
+      # Android's /system/bin/sh is mksh, and it counts in 32 bits. The script tests (TestShell, OneiosScriptTest)
+      # run under it too when it is installed.
+      - name: mksh for the script tests
+        run: sudo apt-get install -y --no-install-recommends mksh || echo "::warning::mksh could not be installed; the script tests run under dash only"
+      - name: Unit tests and the debug APK (full edition, no packed sets)
+        working-directory: app/app-android
+        run: ./gradlew --max-workers=3 test assembleFullDebug
+      - name: Name the APK, its version
+        id: apk
+        run: |
+          set -euo pipefail
+          src=app/app-android/app/build/outputs/apk/full/debug/app-full-debug.apk
+          [ -s "$src" ] || { echo "::error::no $src"; exit 1; }
+          "$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$src" > badging.txt
+          badging=$(sed -n 1p badging.txt)
+          echo "$badging"
+          vname=$(sed -n "s/.* versionName='\([^']*\)'.*/\1/p" <<< "$badging")
+          vcode=$(sed -n "s/.* versionCode='\([0-9]*\)'.*/\1/p" <<< "$badging")
+          [ -n "$vname" ] && [ -n "$vcode" ] || { echo "::error::no versionName or versionCode in the APK"; exit 1; }
+          grep -q "versionCode = $vcode\$" app/app-android/app/build.gradle.kts >/dev/null 2>&1 ||
+          [ "$vcode" -gt 143 ] || { echo "::error::the APK's versionCode $vcode did not grow past v0.1.10's 143 (the fork's build.gradle.kts reads the version from its git history now)"; exit 1; }
+          mkdir -p out/apk
+          out="OneOS-oneios-$vname-debug.apk"
+          cp "$src" "out/apk/$out"
+          ( cd out/apk && sha256sum "$out" > "$out.sha256" && cat "$out.sha256" )
+          {
+            echo "file=$out"; echo "sha256=$(cut -d' ' -f1 "out/apk/$out.sha256")"
+            echo "version_name=$vname"; echo "version_code=$vcode"
+            echo "packages_token=$PACKAGES_TOKEN_USED"; echo "signed_with=$SIGNED_WITH"
+          } >> "$GITHUB_OUTPUT"
+      - name: The APK carries no package set, no image and no firmware
+        run: .github/scripts/check-apk.sh "out/apk/${{ steps.apk.outputs.file }}" app/app-android/packages
+      - name: Summary
+        env:
+          OUT: ${{ steps.apk.outputs.file }}
+          VNAME: ${{ steps.apk.outputs.version_name }}
+          VCODE: ${{ steps.apk.outputs.version_code }}
+          FORK: ${{ steps.fork.outputs.commit }}
+        run: |
+          {
+            echo "### OneOS APK"
+            echo "- \`$OUT\`: versionName $VNAME, versionCode $VCODE, $(stat -c %s "out/apk/$OUT") bytes, SHA-256 \`$(cut -d' ' -f1 "out/apk/$OUT.sha256")\`"
+            echo "- fork commit \`$FORK\` (akshaynexus/OneOS, the head of its branch)"
+            echo "- tribalfs' packages were read with: $PACKAGES_TOKEN_USED"
+            echo "- signed with $SIGNED_WITH"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oneos-apk
+          path: |
+            out/apk/*.apk
+            out/apk/*.apk.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # The owner's Mac runs `./gradlew test assembleFullDebug` (oneios-tool cycle app); this proves the `test` half on
+  # macOS. Homebrew's folders are taken off PATH for the tests, so core:root's harness uses its own stand-ins for
+  # GNU stat, sha256sum, timeout and tac over macOS's own tools (the fork's docs/oneios.md): the case of a Mac without
+  # coreutils. Not a release gate: the release needs runtime and apk only.
+  apk-macos:
+    needs: plan
+    if: needs.plan.outputs.apk == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The fork at the head of its branch (app/)
+        run: |
+          set -euo pipefail
+          git submodule update --init --remote app
+          echo "app/: branch $(git config -f .gitmodules submodule.app.branch) at $(git -C app rev-parse HEAD)"
+      - name: Which token reads tribalfs' packages
+        env:
+          RUN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECRET_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          SECRET_USER: ${{ secrets.GH_PACKAGES_USER }}
+        run: .github/scripts/packages-token.sh
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+      - name: Android SDK platform 37
+        run: |
+          sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | tail -n 1)
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"
+      - name: Guest app
+        run: app/scripts/build-guest-manager.sh --debug
+      - name: Unit tests on macOS (./gradlew test, core:root's script tests among them)
+        working-directory: app/app-android
+        env:
+          WATCHDOG_MIN: 30
+        run: |
+          set -euo pipefail
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -Ev '^(/opt/homebrew|/usr/local)(/|$)' | paste -sd: -)
+          export PATH
+          for t in gstat gsha256sum gtimeout gtac gsed; do command -v "$t" > /dev/null && echo "note: $t is still on PATH: $(command -v "$t")"; done
+          echo "macOS $(sw_vers -productVersion), sh: $(ls -l /bin/sh | awk '{print $NF}'), stat: $(command -v stat)"
+          # Every test's start and end in the log (.github/scripts/gradle-test-events.gradle). The watchdog: a run
+          # that is not done after WATCHDOG_MIN minutes prints the processes and the test JVMs' threads (where it
+          # hangs), then stops Gradle, so that the failed tests and the reports below still come out (the first
+          # runs, 2026-11-15, hung in :core:root:testDebugUnitTest until the job's limit cancelled everything).
+          ./gradlew --max-workers=3 --continue --init-script "$GITHUB_WORKSPACE/.github/scripts/gradle-test-events.gradle" test &
+          g=$!
+          s=0
+          while kill -0 "$g" 2>/dev/null; do
+            sleep 10; s=$((s + 10))
+            if [ "$s" -ge $((WATCHDOG_MIN * 60)) ]; then
+              echo "::error::./gradlew test is still running after $WATCHDOG_MIN minutes: the processes and the test JVMs' threads follow, then Gradle is stopped"
+              ps -axww -o pid,ppid,etime,state,command | grep -Ev ' (/System/|/usr/libexec/|/usr/sbin/|/sbin/launchd)' | cut -c1-400
+              for p in $(jps -l | awk '/Gradle Test Executor|GradleWorkerMain/ { print $1 }'); do echo "=== jstack $p"; jstack "$p" | awk '/^"/ { keep = /Test worker|main/ } keep'; done
+              ./gradlew --stop || true; kill "$g" 2>/dev/null || true
+              exit 1
+            fi
+          done
+          wait "$g"
+      - name: Failed tests
+        if: failure()
+        working-directory: app/app-android
+        run: |
+          {
+            echo "### Failed unit tests on macOS"
+            grep -rl '<failure' --include='*.xml' . 2>/dev/null | grep '/build/test-results/' | while read -r f; do
+              awk '/<testcase /{ n = $0; sub(/.*<testcase name="/, "", n); sub(/".*/, "", n); c = $0; sub(/.*classname="/, "", c); sub(/".*/, "", c) }
+                   /<failure/{ m = $0; sub(/.*message="/, "", m); sub(/".*/, "", m); print "- " c " > " n ": " substr(m, 1, 400) }' "$f"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: oneos-tests-macos
+          path: |
+            app/app-android/**/build/reports/tests/
+            app/app-android/**/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    needs: [plan, runtime, apk]
+    if: >-
+      always() && !cancelled() && needs.plan.outputs.release == 'true' &&
+      (needs.runtime.result == 'success' || needs.runtime.result == 'skipped' && needs.plan.outputs.runtime == 'false') &&
+      (needs.apk.result == 'success' || needs.apk.result == 'skipped' && needs.plan.outputs.apk == 'false')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release-v${{ needs.plan.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: v${{ needs.plan.outputs.version }}
+      HAS_RUNTIME: ${{ needs.plan.outputs.runtime }}
+      HAS_APK: ${{ needs.plan.outputs.apk }}
+      APK: ${{ needs.apk.outputs.file }}
+      APK_SHA256: ${{ needs.apk.outputs.sha256 }}
+      APK_NAME: ${{ needs.apk.outputs.version_name }}
+      APK_CODE: ${{ needs.apk.outputs.version_code }}
+      FORK_COMMIT: ${{ needs.apk.outputs.fork_commit }}
+      FORK_BRANCH: ${{ needs.apk.outputs.fork_branch }}
+      PACKAGES_TOKEN: ${{ needs.apk.outputs.packages_token }}
+      SIGNED_WITH: ${{ needs.apk.outputs.signed_with }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: The tag is this commit's
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_SHA is not on main"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            at=$(git rev-parse "refs/tags/$TAG^{commit}")
+            [ "$at" = "$GITHUB_SHA" ] || { echo "::error::$TAG is at $at, not at the built commit $GITHUB_SHA: a tag is never moved"; exit 1; }
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.runtime == 'true'
+        with:
+          name: oneios-runtime
+          path: out/release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.apk == 'true'
+        with:
+          name: oneos-apk
+          path: out/release
+      - name: The files and their checksums
+        run: |
+          set -euo pipefail
+          cd out/release
+          files=()
+          if [ "$HAS_RUNTIME" = true ]; then
+            r=oneios-runtime-$VERSION-arm64.tar.zst
+            sha256sum -c "$r.sha256"; files+=("$r" "$r.sha256")
+            t=oneios-tool-$VERSION-android-arm64
+            sha256sum -c "$t.sha256"; files+=("$t" "$t.sha256")
+          fi
+          if [ "$HAS_APK" = true ]; then
+            sha256sum -c "$APK.sha256"
+            [ "$(cut -d' ' -f1 "$APK.sha256")" = "$APK_SHA256" ] || { echo "::error::$APK is not the file the apk job checked"; exit 1; }
+            files+=("$APK" "$APK.sha256")
+          fi
+          printf '%s\n' "${files[@]}" > ../release-files.txt
+          ls -l "${files[@]}"
+      - name: Notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Built by [run $GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) from OneiOS commit \`$GITHUB_SHA\`."
+            echo
+            if [ "$HAS_RUNTIME" = true ]; then
+              echo "- **Runtime** \`oneios-runtime-$VERSION-arm64.tar.zst\` (+ \`.sha256\`): the runtime package for the OneOS fork (branch \`oneios\`). OneiOS's own code only: no Apple firmware; the iOS image set is built locally. See [docs/releases.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/docs/releases.md)."
+              echo "- **oneios-tool for the phone** \`oneios-tool-$VERSION-android-arm64\` (+ \`.sha256\`): the package's \`bin/oneios-tool\` by itself (OneiOS's Rust tools for Android arm64, stripped), which the OneOS app runs as root from the staged runtime."
+            else
+              echo "- **No runtime** in this release (built as \"apk only\"): it is not marked latest, so the app's runtime download keeps the latest release that has one."
+            fi
+            if [ "$HAS_APK" = true ]; then
+              echo "- **OneOS app** \`$APK\` (+ \`.sha256\`, SHA-256 \`$APK_SHA256\`): versionName **$APK_NAME**, versionCode **$APK_CODE**, the full edition's debug build of [akshaynexus/OneOS](https://github.com/akshaynexus/OneOS) branch \`$FORK_BRANCH\` at commit [\`$FORK_COMMIT\`](https://github.com/akshaynexus/OneOS/commit/$FORK_COMMIT) (the head of the branch when it was built). Signed with $SIGNED_WITH. It carries no system image and no package set (checked by \`.github/scripts/check-apk.sh\`): the Android sets are downloaded by the app, the iOS image set is one you build yourself."
+            else
+              echo "- **No APK** in this release (built as \"runtime only\")."
+            fi
+          } > notes.md
+          cat notes.md
+      - name: Release (assets are added, never replaced)
+        run: |
+          set -euo pipefail
+          mapfile -t files < out/release-files.txt
+          flags=()
+          [[ $VERSION == *-* ]] && flags+=(--prerelease)
+          [ "$HAS_RUNTIME" = true ] || flags+=(--latest=false)
+          if [ "$HAS_RUNTIME" = true ]; then title="OneiOS runtime $VERSION"; else title="OneiOS $VERSION"; fi
+          [ "$HAS_APK" = true ] && title="$title, OneOS $APK_NAME"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$title" "${flags[@]}" --notes-file notes.md
+          else
+            echo "release $TAG exists: its notes get this run's part"
+            { gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body; echo; echo "---"; echo; cat notes.md; } > notes-all.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes-all.md
+          fi
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.digest)"')
+          up=()
+          for f in "${files[@]}"; do
+            want="sha256:$(sha256sum "out/release/$f" | cut -d' ' -f1)"
+            on=$(awk -v n="$f" '$1 == n { print $2 }' <<< "$have")
+            if [ -z "$on" ]; then up+=("out/release/$f")
+            elif [ "$on" = "$want" ]; then echo "$f is on $TAG already, the same bytes"
+            else echo "::error::$f is on $TAG with other bytes ($on): an asset is never replaced (docs/releases.md)"; exit 1; fi
+          done
+          [ ${#up[@]} = 0 ] || gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "${up[@]}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[] | "  \(.name) \(.size)")'

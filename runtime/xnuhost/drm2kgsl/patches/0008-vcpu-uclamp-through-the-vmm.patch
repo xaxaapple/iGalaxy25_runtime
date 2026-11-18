@@ -1,0 +1,32 @@
+--- a/src/drm/drm2kgsl/drm2kgsl_renderer.c
++++ b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+@@ -1683,6 +1683,9 @@
+    return (uint32_t)MIN2(chosen, 1024);
+ }
+ 
++/* OneiOS (0008): the VMM's own way to give its vCPUs' work the clamp; returns how many vCPU threads it set. Weak: crosvm has none. */
++extern int drm2kgsl_vcpu_uclamp(uint32_t value) __attribute__((weak));
++
+ static void
+ kgsl_vcpu_animating(int delta)
+ {
+@@ -1694,7 +1697,18 @@
+    animating = MAX2(animating + delta, 0);
+    const bool now = animating > 0;
+    const uint32_t value = was != now && now ? kgsl_vcpu_uclamp_value() : 0;
+-   if (was != now && value != applied) {
++   /* OneiOS (0008): a VMM that runs its guest's threads outside its vCPU threads (xnuhost: each iOS thread is a thread of
++    * its task's own process) takes the clamp itself, through this hook: a clamp on its vCPU threads alone reached nothing
++    * (xnuhost names them xnu-cpuN, so the walk below found "0 of 0 threads"), and the walk reads a directory, which the
++    * phone's rules forbid. */
++   if (was != now && value != applied && drm2kgsl_vcpu_uclamp) {
++      const int given = drm2kgsl_vcpu_uclamp(value);
++      applied = value;
++      static uint32_t told;
++      if (p_atomic_inc_return(&told) <= 16)
++         _drm_log(VIRGL_LOG_LEVEL_WARNING, "vCPU uclamp.min %u: given to the VMM (%d vCPU threads, and the guest threads they run)\n",
++                  (unsigned)value, given);
++   } else if (was != now && value != applied) {
+       unsigned threads = 0, set = 0;
+       DIR *tasks = opendir("/proc/self/task");
+       if (tasks) {

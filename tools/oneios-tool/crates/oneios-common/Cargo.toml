@@ -1,0 +1,17 @@
+[package]
+name = "oneios-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# job: the process's nice value and scheduling class (setpriority, sched_getscheduler)
+libc.workspace = true
+# pytar: the 512-byte ustar block (Header), which Python's tarfile and this write field for field.
+tar = { version = "0.4", default-features = false }

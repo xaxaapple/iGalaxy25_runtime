@@ -1,0 +1,1287 @@
+# kernel/patches/oneios-hosted: XNU as a process under xnuhost
+
+Owner: hosted-xnu. The machine layer that lets xnu-12377 run with no EL1 and no MMU, against xnuhost's
+host-call ABI (`runtime/xnuhost/include/xnuhost/hostcall.h`). Date: 2026-11-10.
+
+**State, plainly.** The hosted kernel builds on Linux and boots under xnuhost in `qemu-aarch64` through
+`arm_init`, the whole VM bootstrap and into the first kernel thread (`kernel_bootstrap_thread`). It stops in
+corecrypto's start-up self-test. No user-mode code path has run. Nothing has run on the phone. Details below.
+
+The archives of this layer (the disks, software AES, the key store, the Wi-Fi, HID, audio, the GPU, the display) are
+each built by `oneios-tool kernel gen NAME` (`tools/oneios-tool/crates/oneios-kernel`, one module per archive), which
+`kernel/build-hosted.sh` adds to the board's archives. Until 2026-11-13 these were Python scripts in the archives'
+folders (`NAME/build-oneios-NAME.py`); where a comment in a source or a patch here still names one, it means the
+module `build_oneios_NAME.rs` (the scripts' outputs are frozen in `tools/oneios-tool/tests/kernelgen/golden`).
+
+## Build and run
+
+```sh
+scripts/bg.sh kernel-hosted env HOSTED_OUT=lead kernel/build-hosted.sh     # -> out/kernel/current-hosted/xnu.macho
+```
+
+Linux (stock clang and xnu-linux-toolchain) or macOS (Xcode's clang and iphoneos SDK; `ALLOW_XCODE=1` for an Xcode
+other than the pin): [kernel/README.md](../../README.md) "Build", [docs/building.md](../../../docs/building.md) 2.
+
+`build-hosted.sh` does not touch the VM kernel's build: own output root (`out/kernel-hosted`), own copy of
+`kernel/device` (as committed) with `series` of this directory added to the board's patch series, defconfig
+`kernel/device/configs/oneios_hosted_defconfig` (`CONFIG_XNU_HOSTED=y`, which reaches C and assembly as
+`-DXNU_HOSTED=1` through `makedefs/MakeInc.def`). Every change in the patch is under `#if XNU_HOSTED`, but the
+patch has **not** been built with the flag off: it is not in the board's series, so `kernel/build-linux.sh` is
+unchanged.
+
+The kernel needs the `kernel_map` / `kernel_unmap` host calls and `xh_info.kva_base/kva_size`, which the booter
+landed in `runtime/xnuhost` (commit `bbe3bcc`). `hostcall.h` in the patch is my copy from before that: the same
+structures, older comments; replace it with the booter's when the patch is next regenerated. Run (STAGE from
+`runtime/build.sh STAGE`; checked with the committed xnuhost and a kernel built from scratch by `build-hosted.sh`):
+
+```sh
+qemu-aarch64 -cpu cortex-a710 STAGE/bin/xnuhost --mode bench --image IMG --kernel out/kernel/current-hosted/xnu.macho \
+  --data DATA --cpus 1 --ram 1G --display none --no-input --no-tasks --width 64 --height 64 \
+  --boot-args "debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 \
+armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 sched_preemption_disable_debug_mode=0 wdt=-1"
+```
+
+`-cpu cortex-a710`, not qemu's default `max`: `max` has a 512-byte `DC ZVA` block and XNU's `bzero` assumes
+the 64 bytes every Arm core (and the S24 Ultra's) has; with `max` the first large `bzero` wipes its own stack.
+
+## How far it boots (qemu-aarch64 -cpu cortex-a710, 8 vCPUs, 4 GiB, `kernel.kc`, the real image set)
+
+Seen on 2026-11-11 with series 0001-0015 and a collection from `kernel/prelink` (277 original kernel functions still
+on the panic stub). In order, with the console in xnuhost's log:
+
+1. `arm_init` to `kernel_bootstrap_thread`, corecrypto's POST (the sealed kernel), IOKit, 8 CPUs through PSCI.
+2. The collection's kexts: AppleImage4 (with the software IOAESAccelerator of 0008), AMFI, Seatbelt, the trust caches,
+   APFS; the root mount from xnuhost's verified disks; `bsd_init` complete; the SystemCryptex mount.
+3. The Data volume's first start (0004): `/sbin/newfs_apfs` runs as pid 2. It is the first user process of the boot,
+   so its dyld registers the signature of every shared cache file and `cs_native4k_prepare` reads and hashes all of
+   them (5.8 GiB; 0014 does it on 8 threads: about 3 minutes here). The cache maps and slides (0013: 8 GiB region).
+   Then `OneiOS Data: /dev/disk8s3 on /dev/disk4 (new)`, the mount, `seed verified: 6024 files (1216961847 bytes),
+   14813 folders` (61 s). On a second start of the same store the volume is mounted as it is and launchd is the
+   process that pays for the hashing.
+4. `/sbin/launchd`: `hello, launchd`, every early boot task (fsck, mount-phase-1/2, data-protection, keybag,
+   usermanagerd, MobileAssetEarlyBootTask, the user-space FIPS POST: all tests PASSED, tzinit, launchd_cache_loader,
+   ...), `Early boot complete. Continuing system boot.`, then the daemons: about 125 processes in 5 minutes.
+5. `SpringBoard` is started and exits with signal 5 each time (7 times in that run); `liveactivitiesd` traps (`brk`).
+
+What that run showed is wrong or missing (none of it fixed yet unless a later line says so):
+
+- `hosted: kernel fault inside the fault handler` ended the run during a daemon's copyout of the loaded-kext list.
+  Fixed by 0015 (the count was per CPU; the handler sleeps).
+- No IOMobileFramebuffer and no digitizer in the guest: only the 2D virtio-gpu console. backboardd cannot bring up
+  a display, which is the likely reason SpringBoard does not stay (not proven: no user-space log was read yet).
+- `MKB_INIT: FATAL KEYBAG ERROR: failed to load system bag` and launchd's `failed to find AppleKeyStore service`:
+  UniXNU's AppleKeyStoreState stand-in is not built for this kernel. Fixed by 0022 (section below): the keybag
+  boot task ends with `DONE MKB_INIT`.
+- `Text page corruption detected for pid N` (3 processes), one `dyld` assertion (`!sMemoryManagerInitialized`), one
+  `xpcproxy` fatal exception: user pages that fail their code-signature check or change under a process.
+  **Fixed by 0025 and a change in xnuhost's task layer** (`0025-README.md`): two iOS processes could get one
+  Linux process (task creation raced between vCPUs), xnuhost's waits ended early, and the host's text fixup made a
+  page fail its hash the second time it was validated. With them: 14 minutes past "Early boot complete", 129
+  processes, none of these lines.
+- mount-phase-2: `failed to create overprovisioning volume` (ignored by the task); `DT_get_fstab_entries: failed to
+  get filesystem entry at: /filesystems/fstab`.
+- `OneiOS launch policy: no /private/var/oneios/bin/oneios-init in this seed: no service manager`.
+
+- Later runs: `Debugger synch pending on cpu 0` at the first stackshot (fixed by 0017); once,
+  `hosted: thread_create in task 85 failed (-110)` and a panic in `hosted_user.c:383` (xnuhost's wait counted
+  interrupted futex calls, not time: fixed with 0025's commit).
+- Why SpringBoard exits: `+[FBDisplayManager sharedInstance]` traps in FrontBoardServices (no main display), and
+  chronod aborts in QuartzCore's `query_displays`: backboardd offers no display. The display stand-in is the board's
+  Q4a.
+- With the display (0020 and `display/`, its README): the framebuffer starts about ten seconds into the boot
+  (`oneios-display: late probe: stage 10`), the console reaches `display.sock` through the guest's virtio scanout,
+  and thermalmonitord, backboardd and MobileGestaltHelper open the framebuffer (`status 0`). No swap yet: in the
+  one run that got there backboardd died 4.5 minutes later in `_pthread_wqthread_setup` (a new workqueue thread's
+  first system call returned -1) and the kernel then stopped with `Console I/O from interrupt-disabled context`
+  from a `printf` in `hosted_user_loop` (seen twice; the printf is fixed by 0023). The system call is 372,
+  `thread_selfid`, which cannot fail in the kernel: the -1 is what the host returns for a `svc` it executes
+  itself, so that thread's `svc` was not trapped, or it ran in another process's memory. Both ways are closed by
+  0025 and its xnuhost change; in the first long run with them backboardd was still alive 7 minutes after it
+  opened the framebuffer. Whether it then swaps is not known (no user-space log read).
+
+- Touch and buttons (`hid/`, section below): the guest has a Digitizer / Touch Screen service and a buttons service;
+  backboardd opens both and gets their events queued. No frame yet, so nothing can be seen to react.
+- With series 0001-0025 (the display 0020, the key store 0022, 0023, the task layer's fixes with 0025) and a
+  collection with 214 originals on the stub: a 1000 s run ends at its time limit with no panic; 123 services
+  spawned, about 190 processes, `backboardd` and `SpringBoard` alive to the end, only `chronod` dead (abort in
+  QuartzCore's `query_displays`, 40 s after backboardd opened the framebuffer). `display.sock` shows one flat colour,
+  about two flushes a second; no swap from backboardd, no `session/ready`.
+
+- **The first phone boot (S24 Ultra, 2026-11-11)** got through the kernel, the root mount, the cryptexes, the
+  shared cache's hashing (5791 MiB in 23 s), 8 CPUs, the GPU, the HID devices, and stopped at the first user
+  process: `newfs_apfs failed: wait status 0xb`, `panic: offline scratch Data mount failed: 5`. With
+  `sheng-exc-name=newfs_apfs` in `IMAGE/xnuhost.conf`: a permission fault at `0x81f8d4ed30` in libobjc's
+  `realizeClassWithoutSwift` (from `map_images`), which takes a class's signed isa with a constant mask (`and x0,
+  x8, #0x7fffffffff8`). The phone's Linux has 39-bit user addresses, so the CPU's authentication code starts at
+  bit 39 and four bits of it survive that mask; under qemu-user (48 bits) and on an iPhone (47) none does. **0027**:
+  on a host narrower than 47 bits iOS user space runs without pointer authentication (`arm_user_jop_disabled()`
+  is true: the kernel signs nothing for user space; every task thread runs with its keys off through
+  `PR_PAC_SET_ENABLED_KEYS`). Built and booted on the PC, where it changes nothing (47 bits); **not yet run on the
+  phone**, and the PC cannot run the keys-off mode (qemu-user has no such prctl).
+
+Not reached: a swap from backboardd, a frame from SpringBoard, `session/ready`. Nothing here has run on the phone.
+
+## What the patch does (files, functions)
+
+New, `osfmk/arm64/hosted/`:
+
+| File | What |
+|---|---|
+| `hostcall.h` | xnuhost's ABI header plus the proposed `kernel_map`, `kernel_unmap`, `kva_base/kva_size` |
+| `hosted.h` | the conventions: `x18` = `struct xh_cpu *` of the vCPU, `TPIDR_EL0` = current thread, the interrupt mask as single loads and stores through `x18`, `HOSTED_FN`/`hosted_hc` for calling the vector's unsigned addresses from arm64e code |
+| `hosted_asm.s` | `hosted_start` (entry: x0 boot_args, x1 vector, x2 vCPU), `hosted_cpu_start`, `hosted_hc`, the upcall entries, `hosted_call_on_stack` |
+| `hosted_machine.c` | `hosted_init` (facts, upcalls), console (`hosted_console_putc`), `hosted_panic`, `hosted_irq_upcall` / `hosted_irq_poll` / `hosted_interrupt` (what `fleh_irq` and `return_to_kernel` are), `hosted_exception_upcall` (kernel faults: software-TLB fill, else `sleh_synchronous` on a synthesized `arm_context_t`), `hosted_cpu_idle`, `hosted_io_map`, `hosted_text_fixup` |
+| `hosted_pmap.h` | included at the end of `pmap.c`: the host mapping as the pmap's TLB. `hosted_walk`, `hosted_kernel_fill` / `hosted_kernel_enter` (kernel_map), `hosted_user_fill` (task_map), `hosted_tlb_flush_region` / `hosted_tlb_flush_pmap` (kernel_unmap, task_unmap, nested pmaps), `hosted_pmap_task` / `hosted_pmap_destroy` (task_create, task_destroy), `hosted_copy_user_pages` (copyio through the window), `hosted_mmu_kvtop` |
+
+Changed (all `#if XNU_HOSTED`):
+
+- `start.s` `_start` -> `hosted_start`; `arm_init.c`: `hosted_apply_chained_fixups`, load-command slide, no TCR,
+  scheduling-hygiene timeouts off.
+- `mach/arm/vm_param.h`: `VM_MIN_KERNEL_ADDRESS` `0x2000000000`, `VM_MAX_KERNEL_ADDRESS` `0x3bffffffff` (XNU's
+  -128..-16 GiB layout modulo 2^38, so the T1SZ = 26 table indices are unchanged), pointer strip for low
+  addresses. `arm_vm_init.c`: the window is image and physical aperture at once (`physmap_base = gVirtBase`),
+  `dynamic_memory_begin = xh_info.kva_base`, no low-globals alias. `pmap.c`: kernel pmap bounds, flush entry
+  points, eager kernel mapping in `pmap_enter_options_addr`, no TTBR switch; `pmap.h`: `hosted_task`,
+  `hosted_seq`. `tlb.h`: no `tlbi`. `io_map.c`: `ml_io_map` through the `io_map` host call.
+- Low kernel addresses: `pmap_data.h` (`PVH_POINTER_BITS`), `zalloc.c` (`zone_pva_t` page bit),
+  `mach/vm_param.h` (`vm_unpack_pointer`), `smr_hash.h`.
+- Interrupt mask and current thread: `cpu_data.h`, `asm.h` (`TPIDR_EL1` -> `TPIDR_EL0` in assembly),
+  `machine_routines_common.c` (`ml_set_interrupts_enabled_with_debug`), `machine_routines.c`,
+  `preemption_disable.c`, `pmap_internal.h`, `cpu.c` (idle through `cpu_idle`), `cswitch.s`
+  (`set_thread_registers`, no EL1 PSTATE fields), `machine_routines_asm.s` (`mmu_kvtop`, `set_mmu_ttb`,
+  `set_tcr`, `ml_pac_safe_interrupts_*`, `CHECK_THREAD_STATE_INTERRUPTS`).
+- `pe_serial.c`: the host console; `debug.c`: `panic` -> xnuhost's log and `halt(XH_HALT_PANIC)`.
+- `kalloc.c`: a kernel with no fixed or variable type views (stock clang, no kext) no longer asserts.
+
+## 0034-syscall-failures.patch and 0035-staged-apps-on.patch (lead, 2026-11-11)
+
+Found on the phone: SpringBoard reached the Home Screen with an empty Dock and no icon, the App Library was empty,
+and on unlock SpringBoard died in an assertion of FrontBoardServices, `Invalid condition not satisfying:
+processIdentity` (`+[FBSSceneClientIdentity identityForProcessIdentity:]` with nil, called from SpringBoard's scene
+request for Spotlight while the lock screen's views appeared: named with `scripts/debug/dsc.py` (now `oneios-tool sym`) from the `sheng-exc`
+backtrace).
+
+- **0035.** The removable system apps (Camera, Photos, Safari, Messages, Weather, ...: 52 bundles) are not in the
+  sealed `/Applications`. They ship in the OS volume's `/private/var/staged_system_apps`, and a restore's data
+  migration installs them. The Data seed marks that migration done and carries no copy; UniXNU's kernel shows the
+  folder over `/Applications` as a read-only union (`native_staged_apps_union`, bindfs, before Data covers
+  `/private/var`), but only with `owner-staged-apps=1`, which its boards pass and xnuhost does not. Under
+  `XNU_HOSTED` it is now on unless `owner-staged-apps=0`, and says how far it got:
+  `oneios-apps: /private/var/staged_system_apps shown over /Applications: stage 5 of 5, status 0`.
+  The LaunchServices database is already dropped at every boot (`native_ls_store_drop`, since 0031 made the addon
+  path run), so lsd registers what the view shows.
+  **Not shown by this:** why Settings, Phone and the other apps of the sealed `/Applications` were missing too
+  (UniXNU's note for the same state is "the Home Screen showed Settings alone"), and whether the assertion goes
+  with the apps there. Built; not run.
+- **0034**, a debugging aid, off without its argument: `oneios-sysfail=NAME[,NAME...]` (`*`: every process) prints
+  each file system call of those processes that fails, with the path:
+  `oneios-sysfail: installd[99] mkdir(/private/var/installd/Library) -> errno 13`. `ENOENT` is left out unless
+  `oneios-sysfail-enoent=1`; at most `oneios-sysfail-max` lines (800). The guest's user-space log is not on the
+  console; this is what shows a daemon that cannot make or open what it needs.
+
+## 0036-icon-store-generation.patch and 0037-lsd-first-boot.patch (lead, 2026-11-11)
+
+- **0036.** iconservicesagent keeps the icons it drew in
+  `.../systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache/<UUID>/*.isdata`, keyed by build and
+  language only: an icon drawn while its GPU open was refused (before 0033) or while no app was registered (before
+  0035) stays blank. After iOSPlus10's `userland/metal/plugin/icon_store_rule.h`: a stamp `.oneios-generation-N` in
+  that folder; when it is not `ONEIOS_ICON_GENERATION` (1) or `oneios-icons-generation=N`, every `.isdata` goes
+  before launchd and the stamp is written. Raise the number only when what draws icons changes: redrawing some 500
+  icons costs minutes. A store that does not exist yet is left alone. Console: `oneios-icons: the drawn-icon store
+  had another generation: N icons removed, now generation 1`, then `... has generation 1: kept` on later boots.
+- **0037.** lsd drops the apps of every volume but the system's own the first time it starts after a boot
+  (`_LSServerCleanEphemeralMobileContainersForFirstBoot`), unless the POSIX semaphore `com.apple.lsd.firstboot`
+  exists. The staged-apps view of 0035 is a volume of its own, so from the second boot of a Data store on its apps
+  would be gone. The semaphore is made before launchd (Droid-VM's `DroidVMLaunchPolicy.c`,
+  `mark_lsd_first_boot_done`), only while the view is on: `oneios-apps: lsd's first-boot semaphore made (0)`.
+
+Both built; not run.
+
+## 0040-0043: the CPU path's kernel side (perf, 2026-11-12)
+
+- **0040, the idle cache flush off.** `cpu_idle` calls `platform_cache_idle_enter` (this board is not
+  `APPLE_ARM64_ARCH_FAMILY`), which flushes L1 by set and way (`FlushPoU_Dcache`). Under xnuhost each `dc cisw` and each
+  CLIDR, CSSELR and CCSIDR access is an undefined instruction at EL0 that xnuhost emulates with a signal: 6 traps per
+  idle entry with `setway-skip` (1024 without), about 600 idle entries a second on an idle lock screen
+  (`docs/hardware.md` 7d). A vCPU is a Linux thread; it never powers a core down, and Linux keeps the caches coherent,
+  so the flush had no effect. Now the function is empty under `XNU_HOSTED` (in the built kernel: `bti c; ret`). In the
+  phone log, the stop's `emulated: insn` lines should no longer list `0xd5087e42` (`dc cisw`) or the CLIDR/CSSELR/CCSIDR
+  reads among the most frequent.
+- **0041, `oneios-perf=SECONDS`** (default 30, 0 = off). A kernel thread prints, for each period: user stays, system
+  calls by kind (BSD, Mach, platform) with the vCPU time each took (from the trap to the vCPU's next user entry or
+  idle: the work up to the return or the block, not the wait), faults filled from the page tables (with the fill's
+  time) and faults sent to `vm_fault` (with their time), refills, interrupts of user code, twins made and dropped; the
+  pmap's user and kernel maps and unmaps; the TLB lock (`hosted_pmap.h`): times taken, times it was held by another
+  CPU, the time spent waiting and held (and their share of one vCPU); copyio copies and faults; the 12 BSD system
+  calls and 8 Mach traps with the most calls (`NUMBER CALLS xMEAN_US`; `bsd/kern/syscalls.master` and
+  `osfmk/kern/syscall_sw.c` name them; Mach traps are negative). With xnuhost's `perf:` lines (`docs/booter.md`
+  2.6a) this says which calls the kernel's share goes to, and whether the one TLB lock is a bottleneck.
+- **0042, `oneios-iobusy`** (on unless `oneios-iobusy=0`): at 30, 60, 120, 240 and 480 s after bsd_init (the first
+  phone boot printed all five at once: the guest's counter is the host's, which runs since the phone booted), the services
+  that keep IOKit busy and have no busy child (`oneios-iobusy: 60 s: busy 1: NAME (class CLASS, id 0x...), inactive 0`)
+  and the count. configd's InterfaceNamer waits up to 4 minutes for IOKit to go quiet before it names en0 (261 s
+  after the Wi-Fi driver published it in prelink's session 2); these lines name what it waits for. **Read on the PC
+  (2026-11-13):** the one busy service is the service root, `oneios,xnuhost (class IOPlatformExpertDevice)`, held by
+  `StartIOKitMatching` until driverkitd sends its dexts' personalities (`KextLog: driverkitd is active`). InterfaceNamer
+  waits for that only for an interface it does not know; the Wi-Fi nub now reserves en0's unit
+  (`network-interface-unit-en`, `net/README.md` "en0's name"), so en0 no longer waits for it.
+- **0043, the LaunchServices database is kept when it holds the apps.** The base's `native_ls_store_drop` deleted
+  LaunchServices' database at every boot, on purpose (its comment: the staged apps are registered only by a rebuild,
+  and a database saved before they were registered kept them out). So lsd registered every app again at every boot:
+  6 to 11 minutes on the phone. In the diagnostic boot of 11:53 (kernel.kc 8eff915f) lsd ran from +82 s to +456 s;
+  chronod started its own work at +466 s, and SpringBoard's main thread had waited in `kevent_id` under ChronoServices'
+  `-[CHSWidgetDescriptorProvider initWithConnection:...]` for a queue whose thread was in a synchronous XPC to chronod
+  (`-[CHSChronoServicesConnection _subscribeToExtensions]`), so no touch was handled until then. 0037's semaphore does
+  not change that. Now (`oneios-ls-keep=2`, the default) a container's database is kept when its largest file names
+  every `NAME.app` entry of `/Applications` (the system's and the staged view's) in its strings (a name ends at
+  `.app` and starts after a `/` or a NUL); one that lacks any of them is dropped as before. `oneios-ls-keep=1` keeps
+  every one, `0` drops every one. One line per container: `oneios-ls: CONTAINER/FILE: N bytes, names K of M apps of
+  /Applications: kept` (or `dropped (...)`). If K stays 0 on a database that does hold the apps, the database does
+  not store the names as plain text, and only `oneios-ls-keep=1` keeps it. The scan was tested on the Mac against
+  sample bytes (a name across two 1 MiB chunks, `Notes.apps` against `Notes.app`); not on a real database.
+- **0044, `oneios-enable-jobs`** (default `com.apple.analyticsd`; `-` for none). Before launchd, each listed job's
+  `<true/>` in the Data store's `/private/var/db/com.apple.xpc.launchd/disabled.plist` becomes `<false/>` (enabled),
+  and the file is written again (root's, 0644). The image's daemon policy disabled analyticsd (vphone's base27); then
+  CoreAnalytics' clients retry each synchronous send with a new connection: in the same boot backboardd spun at 217%
+  after a brightness change (`CoreAnalytics::Client::retryXpcMessageHelper_sync` and
+  `__kernelrpc_mach_port_construct_trap`) and the brightness never reached the panel. `userland/config/daemons.toml`
+  now keeps analyticsd, so a new seed has no such entry; 0044 fixes a Data store made from an older seed without a new
+  one. One line per label: `oneios-jobs: com.apple.analyticsd: enabled in disabled.plist (it was disabled)` or `not
+  disabled there`. The edit was tested on the Mac on a plistlib file.
+
+Built on the Mac (`HOSTED_OUT=perf`, series through 0044, DEVELOPMENT and the RELEASE reference).
+
+**First phone run** (combined boot of 2026-11-12 12:30, kernel.kc 1e297354, runtime 0.1.10-dev, 30 s windows):
+- 0040: done (no idle flush). 0043: `names 52 of 52 apps of /Applications: kept`, lsd no longer rebuilds. 0044:
+  `com.apple.analyticsd: enabled in disabled.plist`; analyticsd runs (15-30 % CPU), but backboardd's CoreAnalytics queue
+  still loops in `retryXpcMessageHelper_sync` (the thread is runnable in every sample: each send fails at once and is
+  sent again). Not solved.
+- 0041: 150,000-240,000 system calls and 180,000-520,000 faults per 30 s. The top BSD calls by count: 75 `madvise` (35,000-45,000
+  per 30 s, about 120 us each: the most kernel time of any call), 375 `kevent_id`, 368 `workq_kernreturn`, 478
+  `bsdthread_ctl`, 153 `pread`, 305 `psynch_cvwait`, 220 `getattrlist` (250-350 us), 381 `__mac_syscall`; the top Mach
+  traps: -47 `mach_msg2_trap` (about 90 us), -18 `mach_port_deallocate`, -14 `mach_vm_protect`, -12
+  `mach_vm_deallocate` (100-130 us). malloc's `madvise` frees pages, which the pmap flushes one by one: a likely source
+  of the many unmap orders below. Faults split about evenly between fills from the tables and
+  `vm_fault`. The fills' own time was 77 ms per 30 s in the first window, then 44-572 s (summed over vCPUs and with the
+  time a filling thread was switched out) once the TLB lock got busy: the one global lock was taken 0.3-1.9 million
+  times per 30 s, held 38 % of a vCPU in the first window, and waited for 14 % of a vCPU in the first window and up to
+  41-47 s per 30 s (one and a half vCPUs spinning) later. User unmaps rose to 140,000-500,000 per 30 s (more than the
+  maps): a flush of the shared region (a nested pmap) sends an unmap order to every task, each a round trip of about
+  30 us made with the global lock held. The next step: a lock per pmap, and a flush of a nested range sent only to the
+  tasks that mapped in it.
+- 0042: no result (the timing fault above; fixed).
+
+## 0045-0046: the TLB lock per task, the shared-region fan-out, fault-around (perf, 2026-11-12)
+
+- **0045, a TLB lock per user pmap.** The one global word (`hosted_tlb_lock`) ordered every task's fills, flushes and
+  copies against every other's, and was held across task orders: on the first combined boot it was waited for up to
+  41-47 s per 30 s. What the lock orders is per address space (a fill of P reads P's entry and maps in P's task; a
+  flush of P unmaps in P's task; a copy reads P's entry and touches the page), so each user pmap now has its own word
+  (`pmap->hosted_tlb_word`), taken the same way. The kernel pmap keeps the global word. A kernel fault inside a user
+  copy no longer meets a held lock (a different word).
+- **0045, the shared-region fan-out.** A flush of a nested pmap (the shared region) sent an unmap order to every task
+  that nests it. Each user pmap now records the 32 MiB blocks of its nested region it filled pages in
+  (`pmap->hosted_nested_seen`, 512 bits; the last means "beyond the 16 GiB covered"); the bit is set under the task's
+  word before the map, and the fan-out reads it under the same word after the entry changed, so a task without the bit
+  has no host mapping in that range and is skipped. A full flush of a task clears its bits. The commpage still goes to
+  every task. pmaps_lock is still held across the remaining orders (it keeps the list; a pmap freed under the loop is the
+  alternative).
+- **madvise (item 3 of the plan): not batched.** arm's pmap strips `PMAP_OPTIONS_NOFLUSH` and makes each page
+  operation complete its own flush (`sync_tlb_flush` before it returns; `pmap_flush` is empty), so unmap orders cannot be
+  joined across pages without changing that contract. 0045's report line says where the unmaps come from instead:
+  `oneios-perf:   user TLB words taken T, W waited (U us waiting); unmaps: A for a task's own flushes, F from N
+  shared-region or commpage flushes, which skipped S tasks that never filled there; fault-around maps M`.
+- **0046, `oneios-fault-around=N`** (pages, a power of two up to 16; off by default). After a fill, the other pages of
+  the N-page aligned window whose entries already allow access (valid, reference bit set, in the RAM window) are mapped
+  too, with what each entry allows, under the same lock and rule as the fill. A TLB may hold any entry the tables allow;
+  a later change is flushed and unmapped as before. On the first phone boot half the faults were fills; each costs a
+  trap and a release (about 40 us), a fault-around map one deferred mmap in the task (about 40 us). Worth it only when
+  most neighbours get used: `filled from the tables` against `fault-around maps` in oneios-perf says.
+- Built on the Mac (`HOSTED_OUT=perf`, series through 0046, DEVELOPMENT and the RELEASE reference). Not run: the hosted
+  kernel cannot run in the Mac's container (no pointer authentication), so these are measured on the phone only.
+- **Phone, round 2** (boot 14:12, kernel.kc 29bef797, `oneios-fault-around=8`): the user words were taken 0.7-1.1 million
+  times per 30 s and waited for 1.7-6.7 s (the global word: 41-47 s before); unmaps: 234,435 for tasks' own flushes and
+  4,400 from 49 shared-region flushes, which skipped 2,432 tasks. But a fill from the tables took about 2.1 ms (26,576
+  fills, 56 s per 30 s) against 77 us for a vm_fault: fault-around made 500,000-930,000 maps per 30 s, three per
+  fault, mostly the same windows again (each vm_fault's refill did its window again), and each fill's maps waited for
+  the task's queue while another thread of the task carried out earlier maps (100-130 us a release). Fixed by 0050 and
+  xnuhost's queue lock (below).
+
+## 0050-0051: fault-around once per window, kernel_task's CPU (perf, 2026-11-12)
+
+- **0050.** A window is faulted around once until the task's next flush of it (16 slots per pmap,
+  `pmap->hosted_around`, cleared by `hosted_task_unmap_locked` for the windows a flush covers). A page of a done window
+  that becomes valid later gets its own fault and fill of that page only. The report adds `windows done already W`.
+- **xnuhost (same commit):** the map queue has its own lock (`task.qlock`); a `task_map` adds to it without waiting for a
+  release whose thread is carrying out earlier maps (the task's order lock), which is what made the fills wait with the
+  task's TLB word held. The order is unchanged: an order or a release takes both locks to take the queue.
+- **0051.** oneios-perf adds `kernel_task: N threads, T us of CPU (P% of a vCPU); most: NAME T ... #ID@0xCONT T ... us`:
+  the kernel's own threads (pager, compressor, IOKit work loops, thread calls, idle threads with the interrupts they
+  take), by name or by their continuation (unslid; name it against the kernel). A stall showed kernel_task at 127 %. The
+  kernel's work for a user trap is charged to the user thread, so it is not in this line.
+- Expected per fill without fault-around: a walk and one queue add (a host call of about 1 us), 3-5 us (round 1's first
+  window, before the global lock got busy: 77 ms for 27,605 fills, 2.8 us each); the page's mmap (about 30 us) is paid
+  at the next release, as before. With `oneios-fault-around=8` and 0050: up to 8 queue adds, about 10 us, and at most
+  7 extra maps per window per flush.
+- Built on the Mac (series through 0051, with the other agents' 0047-0049, DEVELOPMENT and the RELEASE
+  reference); not run.
+
+## 0039-gpu-client-list-and-texts.patch (gpu, 2026-11-12)
+
+- **One list for both gates of a Metal device.** A process other than backboardd gets a device only when the
+  accelerator's grant (or its sandbox) lets it open the user client and the plug-in's `NativeAdrenoMetal.clients`
+  (beside its bundle) names it. The grant's list was the kernel's (`droidvm-gpu-clients`, default in the GPU archive),
+  the plug-in's the Data seed's (roottweak), so another list needed a new seed, and a new seed starts the Data store
+  over. Now `native_gpu_addon_prepare` (`bsd/kern/kern_exec.c`, before the addon mount) writes the file into the mount's
+  source folder at every boot from `oneios_gpu_plugin_client_list` (`gpu/OneiOSAdreno.cpp`): `oneios-gpu-plugin-clients`
+  when given, else the grant's list. One line: `oneios-gpu-list: <path> "<list>": written (0)` (or `unchanged (-1)`,
+  or `not written (errno)`). A kernel without the GPU archive's Metal side writes nothing.
+- **The plug-in's text rows, one line a row.** The plug-in streams text as open types (`0x41477fff`/`0x41477ffe` start a
+  row, `0x414770cc` appends a character): a client's reason for having no device, the render server's phase results.
+  0031 logged each as an `oneios-gpu-open` line, one character a line, and the render server's rows used most of the
+  boot's 400 lines. `hosted_gpu_open_note` (`iokit/Kernel/IOUserClient.cpp`) now keeps a row per process (8 at once) and
+  prints it whole: `oneios-gpu-text: iconservicesagent[95] no-device device: Vulkan(VkResultCode(-3))`, at the next
+  row or other marker of that process, at 63 characters, or from the GPU report thread once the row is quiet for a
+  second. Telemetry types `0x41478000` and up are not logged. Rows do not count against the 400 lines (at most 2000).
+- Built on the Mac with the series through 0039 and linked into `kernel.kc`; not yet run.
+
+## 0038-proc-pid-declared.patch (mac-kernel, 2026-11-12)
+
+`hosted_machine.c`'s thread dump (0009, 0012) calls `proc_pid()`, which `osfmk/vm/vm_protos.h` declares only
+`#if DEVELOPMENT || DEBUG`. The DEVELOPMENT kernel compiled; the RELEASE reference of the prelink
+(`XNU_FILESET_REFERENCE=1`) did not on the Mac: Xcode 27.2's clang makes an implicit declaration an error, and on
+Linux `kernel/linux/clang-wrapper`'s `-w` hid it. The patch declares it at file scope, as `osfmk/kern/thread.c` and
+`task.c` do. No code changes. The file is the hosted layer's own (`osfmk/arm64/hosted/`), so there is no
+`#if XNU_HOSTED` around it. Built on the Mac (both kernels); not run.
+
+## 0032-app-cryptex-authenticated.patch (amfi, 2026-11-11)
+
+App cryptex daemons (`webinspectord`, `webbookmarksd`) crash-looped: AMFI's self constraint for their
+trust cache category (1 or 2) needs the program on the root volume or on an authorized authapfs volume, and the App
+volume is neither here (no personalized manifest, so APFS cannot authorize its root hash). The volume is read-only on
+the block device xnuhost verifies chunk by chunk, which `oneios_cryptex_views` has just checked, so `VNOP_IOCTL`
+answers `FSIOC_AUTH_FS` with success for that mount (`oneios_app_cryptex_authenticated` in
+`bsd/kern/oneios_hosted_root.c`; compared by fsid, read-only, only when no vnode is passed to authenticate against).
+User space cannot ask this ioctl. Other volumes go to APFS unchanged; AMFI still evaluates every other fact.
+At the first answer the kernel logs
+`OneiOS: AMFI launch constraints: App cryptex volume answered as authenticated (FSIOC_AUTH_FS)`. Full notes:
+`kernel/prelink/README.md`, "AMFI and launch constraints". Run on the phone (boot of 2026-11-11 23:00, saved as
+`c2`): the line came at +108 s; `webinspectord` and `webbookmarksd` started and the log has no crash line for them.
+
+## 0047-systemos-authenticated.patch and 0048-feature-flags-off.patch (crashes, 2026-11-12)
+
+Two loops of the boots of 2026-11-11/12 (`c2`, `diag`, `combo1` logs).
+
+- **0047.** `SafariConfigurationSubscriber.xpc` (SafariFoundation, on the SystemOS volume) was killed at each launch:
+  `AMFI: Launch Constraint Violation (enforcing), error info: c[4]p[1]m[1]e[0], (Constraint not matched)`. Its code
+  signature carries a self launch constraint of its own (`ipsw macho info --sig`: `on-system-volume` or
+  `on-authorized-authapfs-volume`, and `validation-category` 1; parent `is-init-proc`). The SystemOS volume is the upper
+  layer of the root union, not the root mount (`MNT_ROOTFS` stays with os.img), and APFS cannot authorize it without a
+  personalized manifest. `native_owner_cache_prepare` (kern_exec.c) checks that mount (read-only, APFS, on the device
+  the image set names, which xnuhost verifies chunk by chunk) and now names it to `oneios_systemos_verified`;
+  `oneios_app_cryptex_authenticated` answers `FSIOC_AUTH_FS` for it as for the App volume. First answer:
+  `OneiOS: AMFI launch constraints: SystemOS volume answered as authenticated (FSIOC_AUTH_FS)`. Programs of the root
+  volume are not affected (they meet `on-system-volume`), nor any other volume. Run on the phone: see `c3` below.
+- **0048.** locationd crashed 17 times in one session, every time the same way: `pc=0x0`,
+  `lr=_dispatch_lane_serial_drain+0x118` (`dsc.py --slide 0x124d8000`: `_dispatch_lane_invoke`,
+  `_dispatch_root_queue_drain_deferred_wlh`, `_dispatch_workloop_worker_thread`), a serial queue bound to a workloop.
+  At +0x118 libdispatch calls the item's `dx_invoke` (class word + 0x48). The item (`x25`/`x0`) lay at the same depth
+  of another worker thread's stack in every crash, and its class word (`x28`) was that thread's TSD base (a saved
+  `tpidrro_el0`), whose slot 9 (the semaphore cache) was 0, or once the port name `0x2c03` (`pc=0x2c03`). So the queue
+  drained an item from a stack frame that had already returned: the shape of a `dispatch_sync` waiter that left early
+  (inferred; the waiter was not caught). vphone-cli turns `CoreLocation/CLAutoCohort` off for iOS 27 guests
+  (`patch-locationd-cohorting`, "Disable automatic CoreLocation cohort queues"), droidvm saw locationd's crash on a
+  `Cohort:0` queue once a boot, and vphone's notes have 27.0's locationd failing with `EXC_ARM_PAC_FAIL` (the same item
+  with PAC on). The flag is `FeatureComplete` in the root's `/System/Library/FeatureFlags/Domain/CoreLocation.plist`.
+  The patch writes the override `/private/var/preferences/FeatureFlags/Domain/CoreLocation.plist` =
+  `{CLAutoCohort = {Enabled = false}}` before launchd (that is `/Library/Preferences/FeatureFlags`, the override path
+  libsystem_featureflags reads after the root's); the roottweak writes the same file into new seeds (docs/userland.md).
+  `oneios-feature-off=DOMAIN/FLAG[,...]` (default `CoreLocation/CLAutoCohort`, `-` none). A file that names the flag
+  is kept, another flag's file gets the entry, a binary file is left alone. Console:
+  `oneios-features: CoreLocation/CLAutoCohort: off (written)`, later boots `... named there already: kept`. With the
+  flag off CoreLocation logs `#Cohorting Process intended to sign up for auto cohorting but CoreLocation/CLAutoCohort=off`
+  (user-space log, not on the console). What iOS loses: locationd's silos keep their own queues instead of shared
+  cohort queues (an optimization of iOS 27; no feature depends on it as far as read). Run on the phone: see `c3`
+  below.
+- **0053** and the daemon policy's group `loops`: the speech audio units (`SiriAUSP`, `MacinTalkAUSP`, `MauiAUSP`,
+  `KonaSynthesizer`, ExtensionKit extensions on the root volume, extension point `com.apple.AudioUnit-Speech`). In the
+  14:12 session (`c3`, `sheng-exc-name` with their names) every one of 17 dumps is `exception type=0xa
+  code=0x9000000`: EXC_CRASH for SIGKILL, from outside. They were started four at a time (four `xpcproxy` lines) and
+  killed together 3-4 s later, wherever they were: most still in dyld (`mov x16, #0x126; svc` =
+  `shared_region_check_np`, or dyld's fixups), one in libsystem. `oneios-sysfail` showed no failing file call of
+  theirs. Bursts every 8-10 s for about 50 s. They are not refused by launch constraints (no AMFI violation, no
+  constraint in their signatures, root volume). The four corpses at a time fill the kernel's corpse limit, so a crash
+  in that window gets no report. iOS's own log of the sessions (`ios3-log.csv`) names both ends [F]: runningboardd
+  launched all 84 of them for `osservice<com.apple.accessibility.axassetsd>:33` (axassetsd's TextToSpeech voice list:
+  `Sending prepareUsing to managed extension`), and launchd killed each: `Extension is hanging on launch. Killing.`,
+  `exited with exit reason (namespace: 7 code: 0x3) - XPC_EXIT_REASON_EXTENSION_CHECK_IN_TIMEOUT`: launchd's
+  extension watchdog (`ExtensionWatchdog` in its built-in config) fires before a cold start under the hosted dyld has
+  checked in. axassetsd then logs `Unable to acquire process assertion in beginUsing` and tries again. Settings'
+  `Process[169] crashed: Preferences` is not theirs: the owner closed it from the app switcher, it did not exit within
+  5 s, and SpringBoard ended it with `Watchdog Violation (0x8BADF00D)`; the corpse limit only took its report.
+  The policy disables `com.apple.accessibility.axassetsd` (`daemons.toml`
+  group `loops`); 0053 writes the same into a Data store made from an older seed: `oneios-disable-jobs=LABEL[,...]`
+  (default `com.apple.accessibility.axassetsd`, `-` none), `<false/>` becomes `<true/>`, a missing entry is added,
+  a missing file is written. Console: `oneios-jobs: com.apple.accessibility.axassetsd: disabled in disabled.plist
+  (it was not)`, later boots `... disabled there already`. Cost: Accessibility's downloadable assets (more voices,
+  Sound Recognition, Magnifier, Back Tap and image-caption models); the built-in voices stay. Settings' Spoken
+  Content may still start the units when it lists voices. Built (HOSTED_OUT=crashes); the plist logic run on the Mac.
+- Checked in `c3` (kernel.kc 29bef797, with 0047 and 0048): `oneios-features: CoreLocation/CLAutoCohort: off
+  (written)`; locationd ran as pid 59 for the whole session (570 s) with no exception; `SystemOS volume answered as
+  authenticated` and SafariConfigurationSubscriber started.
+
+## Written and never run
+
+`hosted_user_fill`, `hosted_pmap_task`, the user and nested-pmap flushes, `hosted_copy_user_pages`: compiled,
+no caller yet. `hosted_irq_upcall`: no interrupt arrived before the stop. Secondary CPUs: `hosted_cpu_start`
+parks them.
+
+## Not written (what remains before launchd)
+
+1. The corecrypto POST stop above, then whatever `kernel_bootstrap_thread` hits next (IOKit start, ArmCpu's
+   GIC and timer through xnuhost's emulation, `bsd_init`).
+2. Return to user: `hosted_thread_exception_return` is a panic. To write: the `thread_run` loop
+   (`arm64_thread_exception_return`, `thread_bootstrap_return`, AST handling as `return_to_user`), the
+   `xh_user_state` <-> `arm_saved_state64` conversion, trap -> `sleh_synchronous` / `sleh_irq`, the thread's
+   Linux twin (`thread_create`/`thread_destroy`, keyed by `pmap->hosted_seq`), a fill after each resolved
+   user fault.
+3. copyio (`osfmk/arm64/copyio.c`, the `_bcopyin` family) on `hosted_copy_user_pages` + `arm_fast_fault` /
+   `vm_fault`.
+4. Device memory mapped by IOKit at kernel addresses (not through `ml_io_map`): a kernel fault whose page
+   table entry points into the I/O aperture has to be emulated by the host (open request 1 below).
+5. Secondary CPUs (`cpu_start` / PSCI entry -> `arm_init_cpu`), the `timer_set` host call instead of trapped
+   `CNTV_*`, user-address caps from `xh_info.user_va_limit`, `text_fixup` in `cs_text_fixup_page`
+   (`bsd/kern/ubc_subr.c`: `hosted_text_fixup` exists, the call is not wired).
+6. A standalone kernel leaves its one weak bind (`native_source_storage_start`) NULL; inside `kernel.kc`
+   XnuPrelink resolves it. `kernel.kc` itself (the prelink) is still absent.
+
+## Requests to the booter (also on the board)
+
+Landed (commit `bbe3bcc`): `kernel_map` / `kernel_unmap` with `xh_info.kva_base/kva_size` and a raised
+`vm.max_map_count`; PSCI `CPU_ON` entry with x1 = vector, x2 = the vCPU's `struct xh_cpu *`; the rule that an upcall
+which migrated its thread ends with `frame_resume` on the current vCPU, and that host calls are made masked.
+
+Open (all four answered by xnuhost `9bb0dca` and `242ee8f`; see the 0003 section below):
+
+1. `mmio_emulate(cpu, frame, phys)`: emulate the load or store at `frame->pc` against a device address, for
+   device pages IOKit maps at kernel addresses (not through `ml_io_map`).
+2. `TPIDR_EL0` in user mode: iOS reads the CPU number from its low 12 bits (`MACHDEP_TPIDR_CPUNUM_MASK`,
+   `_os_cpu_number()`); with the TSD base there, per-CPU indexing in libmalloc and libdispatch goes out of
+   range. Suggest `text_fixup` also rewrites user `mrs xN, TPIDR_EL0` to `mov xN, #0`.
+3. `xh_frame` has no signal number: a `brk` and an undefined instruction both arrive with `esr` 0 (the kernel
+   reads the instruction to tell them apart).
+4. `frame_resume` of an unmasked frame while the interrupt line is up: re-raise it, or the interrupt waits for
+   the next unmask.
+
+## 0003-smp-timer-irq.patch (fable-smp, 2026-11-10)
+
+On top of 0001, all under `#if XNU_HOSTED`. Work tree `HOSTED_OUT=smp`.
+
+| Where | What |
+|---|---|
+| `hosted_pmap.h` `hosted_kernel_device`, `hosted_machine.c` `hosted_exception_upcall` | A kernel data abort whose page-table entry names an address inside `xh_info.io_phys/io_size` (IOKit's IOMemoryMap of a board device, as `ArmCpu::mapGic`) is handed to the `mmio_emulate` host call with the fault's frame; the frame is resumed past the instruction. Such a page is never given to `kernel_map`. An instruction the host cannot emulate stops the kernel with the registers, instead of faulting forever. |
+| `start.s` `LowResetVectorBase`, `hosted_smp.c` `hosted_secondary_entry` | The reset vector page ArmCpu passes to PSCI `CPU_ON` branches to `hosted_cpu_start`. The new vCPU finds its CPU data by `xh_cpu.index` (the node's `reg`) and runs `arm_init_cpu` on that CPU's interrupt stack. |
+| `oneios-tool kernel hosted-fixup` (was `kernel/hosted-fixup.py`; run by `build-hosted.sh`, then the seal again) | `mrs xN, MPIDR_EL1` -> `ldr wN, [x18]` (the vCPU index) in the linked kernel: 7 sites, XNU's and ArmCpu's. At EL0 Linux answers MPIDR_EL1 itself with one value for every core, and ArmCpu parks a secondary whose MPIDR is not its affinity. Done after the link because the text is under corecrypto's HMAC (a rewrite at boot fails the POST with -2074). **fable-prelink:** kexts of the collection that read MPIDR_EL1 need the same rewrite. |
+| `machine_routines.c` `ml_set_decrementer`, `ml_get_decrementer`, `ml_get_timer_pending`, `_enable_virtual_timer`; `hosted_smp.c` `hosted_timer_*` | The decrementer is the `timer_set` host call (one call instead of a trapped `CNTV_TVAL_EL0`). It still arrives as INTID 27 through ArmCpu's handler, which calls `rtclock_intr`. |
+| `hosted_machine.c` `hosted_kernel_esr` | Uses `xh_frame.signo` (SIGTRAP = `brk`) when the host gives it. |
+| `hostcall.h` | xnuhost's header as of `242ee8f`. |
+
+Boot arguments for more than one CPU: add `sheng-smp=1` (ArmCpu starts no secondary core without it). `armcpu-spi-ipi=1`
+and plain SGIs both work in xnuhost's GIC. Bench runs without a host topology: `--set clusters=EEPPPPPP`.
+
+**What ran, what did not.** The patched kernel builds (`HOSTED_OUT=smp kernel/build-hosted.sh`), passes corecrypto's
+POST with the fixup and the second seal, and boots with `--cpus 4` to the same stop as 0001 alone: `image4 interface
+not available` in `trust_cache_runtime_init`, which is before ArmCpu starts. So **`hosted_kernel_device`, the secondary
+entry and the timer interrupt path have not run inside XNU**: they need `kernel.kc` (or the lead's local image4 skip).
+The host side of each (`mmio_emulate`, PSCI `CPU_ON` entry, timer, SGIs, the re-raise) runs in xnuhost's test kernel.
+
+## 0022-keystore.patch and keystore/ (q5-keystore, 2026-11-11)
+
+The AppleKeyStore service in software: UniXNU's AppleKeyStoreState with OneiOS's class keys and key wrap. What it
+is, what it answers and why it is **not a security boundary**: [keystore/README.md](keystore/README.md).
+
+| Where | What |
+|---|---|
+| `keystore/OneiOSKeyStore.cpp`, `oneios-tool kernel gen keystore` | the archive `liboneioskeystore.a` (the component's service and user client, the start, the class keys, wrap and unwrap), added to the link by `kernel/build-hosted.sh` |
+| `osfmk/arm64/oneios_host.c` | `oneios_keystore_start()` (weak default) called from `oneios_board_late_start`, after the GPU, before the first user process |
+| `bsd/vfs/kpi_vfs.c` `native_dataprotect_emulated` | UniXNU's `owner-dataprotect` (a file's protection class kept in the extended attribute `com.unixnu.dataprotect-class` on a volume without content protection) is on unless `owner-dataprotect=0` |
+
+Work tree `HOSTED_OUT=keystore`. `com.apple.driver.AppleSEPKeyStore` stays out of the collection's roots.
+
+**What ran** (PC, `qemu-aarch64 -cpu cortex-a710`, 8 vCPUs, 4 GiB, the real image set, a collection made from this
+kernel with the committed prelink records of `a6c13fe` for boots 1 to 4, of the committed tree for boot 5; the first on a new Data store):
+
+- At the board start: `oneios-keystore: AppleKeyStore started in software: system keybag loaded, no passcode, 31
+  class keys, wrap and unwrap by AES key wrap. Not a security boundary.` The start's own test of the key wrap
+  (wrap, unwrap, wrong class, changed byte; 32, 5 and 40 bytes) passes in the kernel; a failure would stop the start.
+- launchd no longer logs `failed to find AppleKeyStore service` (0 times; once per boot before).
+- launchd's keybag boot task, before: `MKB_INIT: FATAL KEYBAG ERROR: failed to load system bag`, `Could not save
+  value:e00002e2`, `Rebooting...`, `REBOOTING INTO RECOVERY MODE.` Now: `oneios-keystore: first client: keybagd`,
+  `selector 0 from keybagd: 0x0`, `selector 14 from keybagd: 0x0`, then `MKB_INIT: mount is with NO CPROTECT ...
+  (/private/var/)`, `mount point (/private/var/) does not support Data Protection`, `****** DONE MKB_INIT ****`.
+  The lines about `systembag.kb` not being there stay: `keybags/` is empty by design and the bag is the kernel's.
+- `Early boot complete. Continuing system boot.` and the daemons, as before.
+
+- **Boot 5** (the committed tree: series through 0017 plus 0022, a new collection; 8 minutes after "Early boot
+  complete" and still running when stopped). Each selector's first call, as the service logs it:
+
+  | Selector | From | Result |
+  |---|---|---|
+  | 0, 14 (`aks_get_system`) | keybagd | 0 |
+  | 7 (lock state) | powerd | 0 |
+  | 17 (device state) | backboardd | 0 |
+  | 35 (extended device state) | powerd | 0 |
+  | 10 (`aks_wrap_key`), 11 (`aks_unwrap_key`) | securityd | 0: the keychain's keys are wrapped and unwrapped |
+  | 107 | keybagd | `0xe00002c7`, **not answered** (what it asks is not known; keybagd keeps running) |
+
+  No selector failed other than 107. Not seen: a keychain item read back after a restart, and the
+  protection-class attribute in use (PosterBoard's store): nothing was checked on the Data volume.
+
+**What comes next.**
+
+- `SpringBoard` still exits with status 5 each time it is started (12 times in boot 5): the display, not the key
+  store (the lead's note: it dies in FBDisplayManager; `0020` and `display/` are that work).
+- Selector 107 from keybagd, if something turns out to wait for it.
+- Boots 1 to 3 (before the lead's 0016 and 0017, PC at load average 27 to 33) ended 50 to 100 s after "Early boot
+  complete" in the task layer: twice `hosted: thread_create in task N failed (-110)` then `panic: hosted: no task
+  process or thread for thread ... @hosted_user.c:383`, once seven "Text page corruption detected" lines, "Too many
+  corpses being created", then `panic: Console I/O from interrupt-disabled context @serial_console.c:175`. A boot
+  of the same collection with `oneios-keystore=0 owner-dataprotect=0` (boot 4) showed the old failure lines again
+  and ran 7 minutes without a panic; boot 5, with the key store on, ran 8. Whether a working keybag task makes
+  those stops likelier (more daemons get further at once) is not known: one boot each way.
+
+## 0024-gpu-pool.patch and Metal's kernel side in gpu/ (native-adreno, 2026-11-11)
+
+`0024` (`hosted_pmap.h`, `hosted_pa_in_gpu_pool`): the host RAM object's pages between the kernel's window and the
+boot framebuffer (xnuhost's GPU pool, `/arm-io/virtio-gpu` `drm-host-pool`; at most 64 MiB) may be handed to the
+host's `kernel_map` and `task_map`, as `0020` allows the boot framebuffer for kernel mappings. The virtio-gpu 3D
+driver maps each context's response buffer from the pool into the client's task. Not run: xnuhost names a pool only
+with a renderer, and the PC has none.
+
+NativeAdreno (the `AGXAccelerator` under the collection's `IOAcceleratorES`, `AGXDeviceUserClient`) needs no patch:
+it is in the GPU archive of `0005` and starts from `oneios_gpu3d_start` (`docs/gpu.md` 5.1, with the PC boot's
+lines and what is not tested).
+
+## hid/: touch, buttons and the light sensor's HID device (fable-hid, 2026-11-11)
+
+No numbered patch: an archive (`oneios-tool kernel gen hid`, hooked into `kernel/build-hosted.sh`) whose start,
+`oneios_hid_input_start`, is the last call of `oneios_drivers_start` (`drivers/bridge/OneiOSBridge.c`).
+`hid/README.md` has the files, the evidence for the layout header, the buttons table and the log lines.
+
+- `hid/OriginalHidDeviceABI.h`: the layout of the collection's original `IOHIDDevice` (24A446 iPhone18,2), checked
+  at every build against what the kernelcache says (`hid/IOHIDDevice-24A446-v54.json`): 207 vtable slots with their
+  pointer-authentication discriminators, 0xd0 bytes. Any driver that subclasses `IOHIDDevice` includes it.
+- UniXNU's NativeHidInput as two devices (touch screen, buttons) fed by UniXNU-droidvm's virtio-input transport
+  from xnuhost's `/arm-io/input-0`; `drivers/brightness/OneiOSALSDevice.cpp` built against the same header.
+- It needs three pairs in the collection that were wrong or missing until 2026-11-11 (fable-prelink has them):
+  `IOReportLegend::addReporterLegend(IOReporter *, ...)` (a PAC failure in `IOHIDDevice::start` without it) and
+  `IOSharedDataQueue::getQueueSize` / `setQueueSize` (the panic stub when backboardd opens a service).
+
+Seen under qemu-aarch64 (main at `3202197` plus this, 8 vCPUs, `--input-script runtime/xnuhost/tools/input-demo.script`):
+
+1. 10 s into the boot: `droidvm input /arm-io/input-0: OneiOS touchscreen, touch`, both HID devices started under
+   `IOHIDResource`, `ONEIOS ALS: on`, and `oneios-hid: light sensor: OneiOSALSDevice(IOHIDInterface(AppleUSBALSService))`:
+   Apple's light sensor service attaches to our device.
+2. The touch screen's and the buttons' interfaces wait (`matching deferred by IOHIDEventDriver`) until driverkitd
+   is active, three to five minutes after launchd's early boot here. The collection then tries the DriverKit event
+   driver first (`AppleUserHIDEventService`; `DK: ... waiting for server com.apple.driverkit.AppleUserHIDDrivers`),
+   gives up after 120 s (`failed to launch server`: the driver extension's process does not start in this guest
+   yet) and the kernel's `IOHIDEventDriver` takes both devices. Not a fault of this archive, but two minutes
+   without touch; open.
+3. `oneios-hid: touch screen: 1 user client(s) on the event service: IOHIDEventServiceUserClient (pid 84, backboardd)`
+   and the same for the buttons: backboardd found the digitizer and opened it.
+4. The script's events arrive as HID reports the family accepts (`last result 0x0`) and Apple's event driver
+   queues its events for backboardd: `touch screen: 444 HID events queued for the service's client(s), 0 dropped`,
+   `21 contacts begun (10 at an edge)`; `buttons: 66 HID events queued`.
+
+Not seen: backboardd or SpringBoard acting on an event (no user-space log was read, and no frame is drawn yet).
+Nothing ran on the phone.
+
+
+## audio/: the speaker and the microphone (audio, 2026-11-12)
+
+No numbered patch: an archive (`oneios-tool kernel gen audio`, hooked into `kernel/build-hosted.sh` like `hid/`)
+whose start, `oneios_audio_start` (`audio/OneiOSAudio.c`), is the last call of `oneios_drivers_start` (weak in
+`drivers/bridge/OneiOSBridge.c`). It holds UniXNU-droidvm's virtio-snd transport (`DroidVMVirtioSnd.c`, unchanged,
+`-DDROIDVM_DEVICE_DYNAMIC=1`) and its two IOAudio2Devices (`DroidVMAudio.cpp`, staged with the boot arguments
+`oneios-audio-out-uid`, `oneios-audio-in-uid`, `oneios-audio-latency`; its static initializer out of
+`__mod_init_func`, as the HID archive's: `droidvm_audio_attach` runs it in its own module load). Before it the
+hosted kernel had no audio device. Log lines, boot arguments and what was measured: `docs/hardware.md` section 6.
+On the phone since `kernel.kc` `66faa3e8` (main 924a0d9, agent prelink's sessions of 2026-11-12): `ONEIOS AUDIO: on`,
+both devices published, audiomxd opens them and plays (`docs/hardware.md` section 6, "In a session").
+
+Since 2026-11-15 (fix-audio-latency) the staged source also gives the speaker a smaller ring (`oneios-audio-ring`,
+default 1920 frames: iOS's I/O buffer is at most 0.375 of it, 720 frames, instead of 3072 of the 8192 ring), hands
+its periods on as they start (output safety offset 240), publishes `oneios-audio-latency` (xnuhost passes the
+helper's measured latency; default 720 frames, was 6480), fixes the ring's wrap for every device (8192 is not a
+whole number of 240-frame periods: a period read, zeroed or written up to 208 frames past the ring's buffer; the
+zero time stamp only every 245760 frames) and reports the speaker engine's timing (`ONEIOS AUDIO: speaker engine:`).
+`drivers/audio/README.md`, `docs/hardware.md` section 6 "Latency end to end".
+
+### The Actuator device (media, 2026-11-12)
+
+The archive also stages a third IOAudio2Device into `DroidVMAudio.cpp`: UID `Actuator` (VirtualAudio's
+`VirtualAudioDevice_Actuator`: Core Haptics, UI and keyboard taps), mono S16 at 48 kHz, the speaker's engine, whose
+periods go to `drivers/haptics` (`oneios_haptic_actuator_play`, the host's actuator) instead of virtio-snd. Published
+only when `drivers/haptics` has the host's actuator (`oneios-actuator=0`: never; `oneios-actuator-channels=2`:
+stereo). `drivers/haptics` publishes `/product/haptics closed-loop` only when the device exists. Built
+(`HOSTED_OUT=media`); not run. `docs/hardware.md` section 5 has the design, the log lines and the way back.
+
+## 0052-rt-computation-held.patch (media, 2026-11-12)
+
+`thread_policy_set(THREAD_TIME_CONSTRAINT_POLICY)` (osfmk/kern/thread_policy.c) refuses a computation above
+`max_rt_quantum`, 50 ms in the guest's ticks. The guest's counter is the phone's (19.2 MHz): 50 ms is 960000 ticks.
+iOS's audio server asks 1200000 ticks (50 ms at Apple's 24 MHz) for the HAL's I/O thread when its buffer is about
+60 ms or more (`configure_thread_for_realtime - thread_policy_set failed. Cycle Size: 1536000 Thread Parameters:
+1536000 1200000 1536000 1` in every boot's iOS log); the I/O thread then stopped after 0 frames, and each system
+sound waited out the mixer's 3 s timeout. With the patch a computation above the maximum is held to it when the
+constraint is at least the maximum, as the code below already raises a computation under half the constraint. After
+macOS-DroidVM's xnu-12377 patch 0039 (the same board clock). The guest's scheduler only: xnuhost's vCPUs are normal
+Linux threads, and no host thread changes its policy. Built (`HOSTED_OUT=media`); not run. `docs/hardware.md`
+section 6 ("Very slow" playback).
+
+## 0056-camera-plugin-mount.patch (camera, 2026-11-12)
+
+- **Why.** CMCapture 27 loads the camera's FigCaptureDevice maker itself: when its probe (`fcc_probeCameraDriverService`)
+  finds a service of class `AppleH9CamIn` it `dlopen()`s `/System/Library/MediaCapture/H9ISP.mediacapture` and calls
+  `H9ISPCaptureDeviceCreate` (read in the 24A446 cache; `userland/camera/README.md`). The drivers archive publishes
+  `AppleH9CamIn` (`drivers/camera/OneiOSCameraService.cpp`). The folder is empty on the sealed OS volume, so this
+  patch shows the Data seed's `/private/var/oneios/addons/MediaCapture` over it: a read-only bindfs union made with
+  UniXNU's `native_gpu_addon_mount` (scratch offset 0xa00), called in `native_gpu_addon_prepare` before 0036's call.
+- **Log.** `oneios-camera-addon: /private/var/oneios/addons/MediaCapture over /System/Library/MediaCapture: stage N,
+  status E`. Stage 5 status 0: mounted, `H9ISP.mediacapture` visible. Stage 1 status 2: this Data store has no
+  plug-in (an older seed): nothing is mounted, and CMCapture logs that it could not load the dylib.
+- **Off.** `oneios-camera-plugin=0`: no mount (and no AppleH9CamIn). `sheng-gpu-addon=0` skips it too (that function
+  returns early).
+- **State.** Built on the Mac (`HOSTED_OUT=cam`, on the series through 0051: before 0052 landed); not run.
+
+## 0057-swap-folder.patch (mem, 2026-11-12)
+
+- **Why.** XNU's compressor swaps to `/private/var/vm/swapfileN` (`SWAP_FILE_NAME` in
+  `osfmk/vm/vm_compressor_backing_store_internal.h`, opened `O_CREAT | O_TRUNC | O_NOFOLLOW_ANY` by
+  `vm_swapfile_open`, `bsd/vm/vm_compressor_backing_file.c`). Nothing in the kernel makes the folder: iOS's own Data
+  volume has it, the image set's seeds did not. In the 15:35 session (phone, 2026-11-12) every swap file failed
+  ("Failed to open swap file", errno 2 and 30) while `VM_pageout_scan` took about 95% of a vCPU. Those two are early
+  tries before the Data mount (below, "errno 2 and 30"); after a failure the creation thread tries again, 15 s or more
+  later, when a swap-out asks for room (`vm_swapfile_creation_delay_ns`), so swap can start once the folder is there.
+- **What.** (1) `oneios_swap_folder` in `kern_exec.c`, called last in the pre-launchd list (after 0053): makes
+  `/private/var/vm` root:wheel 0755 with 0004's `oneios_kern_mkdir`, or gives a folder there that owner and mode;
+  anything else there (a file, a link) is left alone and said. `oneios-swap-folder=0`: nothing done. The roottweak's
+  `data_layout` puts the folder in new seeds too. (2) `oneios_swapfile_failed` in `vm_compressor_backing_file.c`,
+  after XNU's own line: for each errno the first time, then every 64th failure, the path, the seconds since boot (by
+  the calendar), and
+  the deepest folder of the path that is there with its volume and whether that is read-only.
+- **Log.** `oneios-swap: /private/var/vm: made, root:wheel 0755 (0), on /private/var (apfs, read-write)` (later boots:
+  `there already`). If a swap file still fails: `oneios-swap: /private/var/vm/swapfile0: errno N at S s (failure K);
+  DIR is there, on MOUNT (TYPE, read-only|read-write)`. Then XNU's `VM Swap Subsystem is ON` stays as before, and swap
+  in use shows as files in `/private/var/vm` and as `vm.swapusage` (`sysctl vm.swapusage` in iOS).
+- **errno 2 and 30, settled on the PC (2026-11-12, pc-kernel).** Two boots of the Linux-built kernel under qemu
+  (`--ram auto` = 14,080 MiB, and `--ram 2G`; logs in `out/run-pc-auto/`, git-ignored) show both errors before the Data
+  volume is mounted, and neither is a swap file on the Data volume:
+  - errno 2, 4 s in, on `/private/var/vm/swapfile` (no number): the freezer's budget probe (`vm_swap_max_budget`,
+    `CONFIG_FREEZE`, before any swap file exists), before the root is mounted (`rootvnode is not set`; the line says
+    `nothing is there, on ?`). Its failure only keeps the freezer's default daily budget.
+  - errno 30, 7 s in, on `/private/var/vm/swapfile0`, right after `VM Swap Subsystem is ON` and followed by XNU's
+    `low swap: failed to create swapfile`: the creation thread's first swap file, made as soon as swap starts. The line
+    says `/private/var/vm is there, on / (apfs, read-only)`: the sealed root's own `/private/var/vm`, under the Data
+    mount. The thread then sleeps until a swap-out wakes it (`vm_swapfile_create_needed`, from the swap-out paths of
+    `vm_compressor_backing_store.c`) and tries again 15 s or more after the failure.
+  - Then 0057's line, 11 s in (365 s on a first boot under qemu, which waits for the Data store):
+    `oneios-swap: /private/var/vm: there already (0), on /private/var (apfs, read-write)` (the roottweak's seed has the
+    folder, root:wheel 0755, read back from the Data volume after the run).
+  - Not seen on the PC: a swap file. In 20 minutes at 2 GiB (to SpringBoard and the daemons, no panic) nothing asked for
+    a swap-out, so the thread never tried again and `/private/var/vm` stayed empty. Whether swap starts under the phone's
+    pressure is for the phone's log: a `Failed to open swap file` after the Data mount (and its `oneios-swap:` line), or
+    `swapfile0` in `/private/var/vm`. **Swap serves only the freezer on iOS** (read in xnu-12377, 2026-11-12): with
+    `CONFIG_FREEZE` the default `vm_compressor_mode` is `VM_PAGER_FREEZER_WITH_SWAP` (0x20; the PC's log: `"vm_compressor_mode"
+    is 32`), which sets `freezer_swap_is_active` and not `swap_is_active` (`vm_config_init`, `vm_pageout.c`); a
+    general compressed segment goes on the swap-out queue only with `VM_CONFIG_SWAP_IS_ACTIVE` (`C_SWAPOUT_REG`,
+    `vm_compressor.c`), so only frozen apps' segments (`C_SWAPOUT_FREEZER`), donated early ones (`C_SWAPOUT_DONATE`) and,
+    with `vm_compressor_scavenger_enabled=1` (off by default), old ones (`C_SWAPOUT_RIPE`) are swapped. Swap does not
+    relieve the pageout scan of the 15:35 session; [I] it helps only when iOS's freezer freezes apps, which user space
+    asks for. `/defaults kern.vm_compressor` in the device tree would set another mode (the phone's log line says).
+- **The time in the failure line** is seconds since boot from the calendar (`clock_get_calendar_microtime` less
+  `clock_get_boottime_microtime`): the hosted `mach_absolute_time` is the host's counter (wall time under qemu, the
+  phone's own uptime on the phone); the first build printed `at 1794488403 s`.
+- **State.** Written on the Linux PC (2026-11-12): every one of the 23 patches of the build's series that touch
+  `kern_exec.c` (arch, OS, device, hosted through 0056) and then this one apply with `git apply` to xnu-12377.121.6's
+  file, and the swap file hunk to its `vm_compressor_backing_file.c`. Compiled on the Linux PC once libdispatch was
+  installed (`HOSTED_OUT=pc` at `7652df1`; with the time fix `HOSTED_OUT=pc2`, `kernel.kc` `cdd98e7e`; no warnings from
+  it) and run on the PC as above. Not run on the phone.
+
+## 0058-free-page-report.patch (mem, 2026-11-12)
+
+**The goal: iOS keeps all of its ram=auto memory; the host gets back only pages iOS has freed.** (The owner's
+decision, 2026-11-12: no pressure feedback, no cache cap, no change to XNU's free targets, memorystatus or jetsam.)
+
+- **Why.** xnuhost's RAM is a memfd: the host holds a page from its first touch until the guest gives it back
+  (`ram_discard`, a hole punched in the memfd), and before this patch the kernel never gave anything back. Stock arm64
+  XNU enters a freed page at the tail of its free queue and allocates from the head (FIFO), so even a small working set
+  walks through every never-touched page: at `ram=auto` on the PC (14,080 MiB) the host held 8,567 MiB after 7 min
+  while XNU itself had 11,310 MiB free, and 12,266 MiB after 16.5 min (9,048 MiB free in XNU), when the PC's
+  MemAvailable fell to 903 MiB (the run below). What fills the memfd is not the file cache: it is free pages that the
+  boot's reads and allocations went through. On the phone (9.5 GiB guest of about 11.2 GiB) that memory would never
+  go back to One UI.
+- **What.** (`osfmk/vm/vm_resident.c`, `vm_page.h`, `vm_pageout.c`, `arm64/hosted/hosted_pmap.h`,
+  `arm64/hosted/free_report.h`; all `#if XNU_HOSTED`.)
+  - Only pages on XNU's own free queue are given back: memory iOS is not using at all. Cached, compressed and wired
+    pages are never touched, and nothing changes `vm_page_free_count` (but for the moment a batch is out, below), the
+    free target or what memorystatus counts.
+  - The free queues keep two kinds of page in order: `[pages iOS freed: the host holds them][pages given back]`. A
+    freed page enters at the head (taken first: memory the host still holds), a given-back one at the tail (taken
+    last). Pages released at startup were never touched and enter as given back. `vm_page`'s spare bit
+    (`__vmp_reserved3`) is `vmp_hosted_reported`; per colour queue, a count of held pages and the first given-back
+    page, all under the free queue lock (`vm_page_free_queue_enter/remove/grab`).
+  - A thread (`oneios_free_report`, utility priority) wakes every second. When the held free pages pass keep +
+    hysteresis it gives back down to keep, coldest first, in batches: up to 64 pages taken off the queue with its lock,
+    given back as runs of consecutive pages with the lock dropped and interrupts masked for each host call, put back
+    at the tail with the lock (waiters woken, memorystatus updated). keep = `vm_page_free_target` +
+    `oneios-free-report-keep` MiB (32): the pages the next allocations take; under pressure XNU keeps its free count
+    between its free minimum and target, so pages that cycle through the free queue are never given back. While a
+    batch is out (at most 256 KiB with 4 KiB pages, for the host calls' time, only far above the free target) the free
+    count is that much lower. Nothing can allocate a page whose hole is being punched; the contiguous allocator does not
+    take a page that is on no queue (`vm_page_is_relocatable`: `VM_PAGE_NOT_ON_Q`).
+  - The decisions (`xh_fr_batch`: the hysteresis and the batch; `xh_fr_runs`: sorted runs; `xh_fr_keep_per_queue`)
+    are `osfmk/arm64/hosted/free_report.h`, the same file as `runtime/xnuhost/include/xnuhost/free_report.h`; the host
+    tests check that the two are one and test the functions.
+  - Deferred unmaps (`docs/booter.md` 2.6): XNU's pmap removes every mapping of a page before it reaches the free
+    queue; xnuhost may still have a stopped task's unmap queued. The punch drops the page from that task's process too,
+    and the task cannot run before the stub has carried the queue out (test kernel: "ram_discard of a page whose unmap
+    is queued"). With `hosted_mapcheck=1` each page given back is checked: no task mapping recorded for any 4 KiB part
+    and `pmap_verify_free`; a failure prints `hosted check: page 0x... is given back to the host (0058) while N task
+    mapping(s) of it remain`.
+- **Boot arguments.** `oneios-free-report=0` (off: stock FIFO order, nothing given back; the `oneios-mem:` lines stay),
+  `oneios-free-report-keep=MiB` (32), `oneios-free-report-hysteresis=MiB` (16), `oneios-free-report-batch=PAGES` (64,
+  the most), `oneios-free-report-ms=MS` (1000), `oneios-free-report-log=SECONDS` (30; 0: no lines). A check, not a setting:
+  `oneios-free-report-stress=1` makes keep 0, so every held free page above the hysteresis goes back and pages come
+  back used at once (with `hosted_mapcheck=1`: the races of the paths above).
+- **Log.** At the pageout daemon's start: `oneios-mem: free-page reporting on (oneios-free-report=1): keep 16192 pages
+  (free target 8000 + 32 MiB), hysteresis 16 MiB, batch 64 pages, every 1000 ms; 3506783 of 3506783 free pages never
+  touched`. Every 30 s, three lines (the console cuts a line past about 256 characters):
+  `oneios-mem: free F MiB (G given back, H held), active, inactive, speculative, throttled, wired, compressor C MiB
+  holding P MiB`, `oneios-mem: purgeable, file-backed, anonymous, secluded MiB; memorystatus available M MiB; RAM T
+  MiB`, `oneios-mem: given back X MiB since boot in B batches, R runs, N rounds (0 failed, 0 out of order), D ms`.
+  xnuhost's `memory:` line adds what it was given (`given back N MiB of free pages in C calls (F failed, T ms)`).
+- **Measured on the PC (2026-11-12, qemu-aarch64, 8 vCPUs, `--ram auto` = 14,080 MiB, the first boot of a fresh Data
+  store, `HOSTED_OUT=fpr`, `out/kernel/fpr-24A446/kernel.kc`: `216b73ba` for the control, `c8d36270` with it on; they
+  differ from the committed patch only in how the `oneios-mem:` lines are cut and in the stress check).** The same kernel with `oneios-free-report=0` (control)
+  and with the default (on), 18 min each; the control was stopped at 1,003 s by the run's watchdog (the PC's
+  MemAvailable under 1,000 MiB). XNU's view is its `oneios-mem:` lines (MiB):
+
+  | | control, 420 s | on, 420 s | control, 990 s | on, 990 s |
+  |---|---|---|---|---|
+  | memfd held by the host | 8,567 | 3,160 | 12,266 | 4,973 |
+  | host MemAvailable | 4,588 | 8,903 | 1,084 | 3,769 |
+  | XNU free | 11,310 | 11,032 | 9,048 | 9,084 |
+  | XNU active / inactive / speculative / wired | 78 / 78 / 2,099 / 481 | 137 / 85 / 2,306 / 485 | 942 / 165 / 3,259 / 629 | 929 / 157 / 3,258 / 616 |
+  | XNU RAM, compressor | 13,761, 0 | 13,761, 0 | 13,761, 0 | 13,761, 0 |
+
+  iOS's usable memory is the same (its RAM 13,761 MiB, free plus cache plus in use within the run-to-run spread;
+  memorystatus available 13,088 MiB at 990 s with it on), and the host holds about what XNU uses (active + inactive +
+  speculative + wired = 4,960 MiB at 990 s). Stages: launchd 306 s / 292 s, SpringBoard 361 s / 333 s (control / on),
+  no panic in either. With it on nothing reached keep + hysteresis, so 0 MiB was given back: the head-first order
+  alone keeps the memfd at the working set; giving back is for bulk frees (an app's exit, a purge). A third boot
+  (4 GiB, `hosted_mapcheck=1 oneios-free-report-stress=1 oneios-free-report-hysteresis=1`, the final patch,
+  `out/kernel/fpr2-24A446/kernel.kc` `ff87a7ee`) gives back pages all the time: launchd 267 s, SpringBoard 310 s and the daemons (analyticsd 716 s) in 840 s, no panic, no `hosted check:` line, and
+  893 MiB given back in 3,650 batches (215,240 runs; 0 failed, 0 out of order), also under pressure (free 28 MiB at
+  810 s: by design this check gives back pages that cycle, 35 s of the thread's time in 840 s; the default keep
+  never does). A first `hosted_mapcheck=1` boot with the default keep (4 GiB): launchd 299 s, SpringBoard 366 s, no
+  panic, no `hosted check:` line, nothing given back.
+- **The cost to iOS** (test kernel, `make -C runtime/xnuhost bench-arm64`, under qemu on the PC; times about 10x the
+  phone's): `ram_discard` of one 16 KiB page 5.2 us, of 1 MiB in one run 90 us (1.4 us a page); zero-filling a 16 KiB
+  page that was given back 11.7 us against 6.0 us resident (the host's first touch of each 4 KiB part): +5.7 us per
+  16 KiB, about 0.36 ms per MiB used again, paid only for pages given back and reused (never for pages cycling
+  through keep). With the order change the boots were faster, not slower (above). So the default is on.
+- **Not run on the phone.** Risks: a host with shmem huge pages for the memfd (`shmem_enabled` `always`/`within_size`,
+  or a per-size mTHP setting) may split or merely zero a punched range instead of freeing it (this PC: `advise`; the
+  phone's: unknown, read `/sys/kernel/mm/transparent_hugepage/shmem_enabled`); a page XNU frees while the GPU's
+  renderer still holds its udmabuf stays held by Linux (the import pins it) and the guest's reuse gets a new page (a
+  guest bug either way).
+
+## 0060-ls-boot-state.patch (fix-boot-slow, 2026-11-13)
+
+The phone's boot of 2026-11-12 23:45 (kernel.kc through 0058, a Data store kept from earlier boots) built the lock
+screen and the Home Screen piece by piece: the clock, the wallpaper, the icons, then the labels one by one. In the
+first two minutes `oneios-cpu` had lsd at 90-92 % (+40 s, +58 s) and iconservicesagent at 115 % (+108 s).
+
+**The two stores, read in 24A446** (CoreServices in the dyld cache; `/System/Library/CoreServices/iconservicesagent`):
+
+- lsd keeps its database in its data container's `Library/Caches/com.apple.LaunchServices-33554481-v2.csstore`
+  (beside it `SystemDataOnly-...csstore`, the system content's copy). `_LSDatabaseCreateFromPersistentStore` first
+  looks for the recovery file `com.apple.LaunchServices.error`: when it is there lsd logs `_LSCreateStoreWithFileContents
+  found a recovery file, so creating a new empty store` and registers everything again. When it is not, lsd makes it,
+  loads the database, runs `_LSDatabaseClean` on it ("Cleaning new database object": it registers the CoreTypes bundle,
+  the extension points, the canonical names and the frameworks' localized strings again, at every start, on a loaded
+  database as on a new one) and only then removes the file. A database is also rebuilt when its header says the
+  seeding did not complete (`Database seeding is incomplete, need to rebuild`; set when MobileInstallation answers with
+  partial results) or names another build (`Local database thinks system build version is ...`). LaunchServices removes
+  the recovery file itself when its sync marker `com.apple.LaunchServices.syncInterrupted` says a reboot cut the last
+  save (`Previous sync was interrupted, presumably by a reboot. Removing any extant recovery file.`);
+  `com.apple.LaunchServices.dirty` marks unsaved changes and goes at each save.
+- iconservicesagent keeps the icons it drew in `systemgroup.com.apple.lsd.iconscache/Library/Caches/
+  com.apple.IconsCache/<UUID>/` (`*.isdata`, `store.index`, `store-source-registry.map`, `__cache_info__`). At start
+  (`-[ISMutableIconCache initWithURL:]`) it empties the folder unless `__cache_info__` holds this build's
+  `ProductBuildVersion`, the folder is owned by `_iconservices` (uid 276) and has no ACL. Each icon carries a validation
+  token, LaunchServices' database UUID and sequence number (`Generated image for icon %@ -- Validation token DB UUID %@
+  seq No %llu`); one whose token no longer matches is drawn again (`Rejected cached image ... validation state`).
+
+**What the PC showed** (qemu-aarch64, 8 vCPUs, 4 GiB, the PC image set; one Data store booted again and again, its
+copies for the comparisons; boots 1-6 shared the box with two other agents' boots and kernel builds, load 13-24 on 4
+CPUs; boot 7 had it alone; boots 8 and 9 (not in the table) were stopped before lsd started, 8 by its time limit at
+load 16, 9 to keep to one boot at a time; 10 and 11 ran one at a time through the box's qemu queue, `flock
+/tmp/oneios-qemu.lock`):
+
+| Boot | Data store | Kernel | launchd | lsd | first frame | lsd / iconservicesagent CPU-s, 30 min from launchd |
+|---|---|---|---|---|---|---|
+| 1 | new | fpr2 (through 0058) | +874 s | +2050 s | +2096 s | 168 / 2 |
+| 3 | after 1 (no database saved) | fpr2 | +531 s | +1392 s | none in 4067 s | lsd 137 to the end |
+| 4 | after 3, its recovery file left | 0060 (first build) | +1088 s | +1272 s | +1613 s | 1298 / 1666 (60 min): lsd built and seeded the database |
+| 5, 6 | after 4: database saved, 52 of 52 apps | 0060 / fpr2 | +515 s | +1508 / +1450 s | none in 3600 s | 27 / 0, 47 / 0 (60 min) |
+| 7 | the same, alone on the box | 0060 | +229 s | +308 s | +679 s | 75 / 160 |
+| 10 | a copy of the store after 6: the database (52 of 52 apps) and boot 6's recovery file | fpr2 | +310 s | +381 s | +1306 s | 57 / 0; containermanagerd 160 |
+| 11 | another copy of the same | 0060 (merged tree, `kernel.kc` `22f8c09d`) | +413 s | +966 s | +1449 s | 71 / 277 |
+
+**Before and after, the same store** (boots 10 and 11, one at a time; the box's load differed, so their times do not
+compare). Both kernels' 0043 said `names 52 of 52 apps of /Applications: kept`. Boot 10 (no 0060), iOS's own log: lsd
+`_LSCreateStoreWithFileContents found a recovery file, so creating a new empty store`, `result: (null)`, then `Seeding
+database with UID: 501`: everything registered again, containermanagerd busy, and 45 minutes later the session was
+killed with the new database not yet saved (on disk still the old one, with lsd's new recovery file beside it: the next
+boot does it all again). Boot 11 (0060): `oneios-ls-state: ... com.apple.LaunchServices.error 0 bytes, modified 11065 s
+ago: removed (0), lsd loads the database`; lsd made its own recovery file, `result: <private> options: 7` (the database
+loaded), no seeding, removed the file, saved the database again; iconservicesagent served the 72 stored icons (2
+`.isdata` rewritten, 70 untouched).
+
+- **The database is kept and loaded** (boot 7's own log): `oneios-ls: ... names 52 of 52 apps of /Applications: kept`;
+  lsd found no recovery file, loaded it (`result: <private> options: 7`), no `Seeding`, no rebuild. Before it removed
+  its recovery file it ran `_LSDatabaseClean`: `Registering CoreTypes bundle` (`Error -50 registering path
+  /System/Library/CoreServices/MobileCoreTypes.bundle`), 42 `Unable to create bundleRef`, `Registering extension
+  points` (`Failed to create node for framework (null)`), canonical names, localized strings: 26.8 s of iOS's clock,
+  about 5 min of real time on this PC (the guest's clock ran about 12 times slow here, below). On the phone, 10 or more
+  times faster, that is about the first minute of lsd at 90 %: **the phone's lsd minute is most likely this per-start
+  work, not a rebuild** (a guess for the phone: the next boot's log says).
+- **A kill during that window throws the database away.** Under load (boots 5 and 6) lsd was still in it 35 minutes
+  later, its recovery file in place, when the session was killed; boot 3 ended the same way. Every session here ends
+  with the kernel killed (a return, a panic, xnuhost's exit), never with lsd's own shutdown, so the next lsd finds the
+  file and starts empty: a full registration (boot 4's `Noting rebuild statistics`: 346 apps, 928 plug-ins,
+  `systemContentScanTime` 1439 s, `totalRebuildTime` 1454.5 s) and a new database, whose new UUID makes every drawn
+  icon's token stale. On the phone that is a return or a panic within lsd's first minute.
+- **The icon store is kept and valid across boots** on the PC: `__cache_info__` is `{ProductBuildVersion: 24A446,
+  language: en}`, the `<UUID>` folder is `_iconservices`' with no ACL (its parents carry the container ACL, which is not
+  looked at). Boot 4 drew 72 icons on the CPU (no 3D GPU on the PC); boot 7 found them (`72 icons (.isdata)`) and wrote
+  no new `.isdata`; its iconservicesagent (160 CPU-s) served them. So the phone's 115 % at +108 s is not the store being
+  thrown away when the database was kept; a guess: the Metal path's own cost at each boot (metal2vulkan's pipeline
+  cache, which the plug-in's client path puts in `_CS_DARWIN_USER_CACHE_DIR` or, failing that, the user temp folder that
+  launchd's `dirs_cleaner` empties at every boot: `external/NativeMetal/NativeAdrenoMetalPlugin.mm` `clientDevice`).
+  Not looked at on the phone.
+- 0036's stamp and 0037's semaphore did what they say (`generation 1: kept`; no `Reboot detected, performing first
+  boot work`).
+
+**The change.** Before launchd, after 0043's keep or drop and 0036/0037:
+
+- `oneios-ls-state:` one line per `com.apple.LaunchServices*` and `SystemDataOnly-*` entry of every lsd data container
+  (the databases, the recovery file, `.syncInterrupted`, `.dirty`, `.InstallJournal`, the app protection store): size
+  and age.
+- A recovery file there is removed (`oneios-ls-recovery=0` keeps it). For lsd the kill of the whole kernel is a reboot,
+  not its own crash, which is the case LaunchServices handles itself by removing the file; lsd makes the file again
+  before it loads, so a database that crashes lsd is still thrown away at lsd's next start in the same session. 0043 has
+  already checked that the database names every app.
+- `oneios-icons-state:` one line per `com.apple.IconsCache` folder: the drawn icons (`.isdata`), `store.index`'s size
+  and age, `__cache_info__`'s size (-1: missing, and iconservicesagent then starts the folder over).
+- `oneios-store-report=0` turns the step off.
+
+The lines on the PC (this patch before the merge of main, `kernel.kc` `06b06e68`, boot 7; the merged tree's
+`22f8c09d` gave the same lines in boot 11):
+
+```
+oneios-ls: D1F3ECC9-8A4D-42E8-8A88-F6F96F1A8E6E/com.apple.LaunchServices-33554481-v2.csstore: 11448320 bytes, names 52 of 52 apps of /Applications: kept
+oneios-ls-state: lsd D1F3ECC9-...: com.apple.LaunchServices.unregisteredtypes-501.db 12288 bytes, modified 6197 s ago
+oneios-ls-state: lsd D1F3ECC9-...: com.apple.LaunchServicesAppProtectionStore.plist 264 bytes, modified 7289 s ago
+oneios-ls-state: lsd D1F3ECC9-...: com.apple.LaunchServices-33554481-v2.csstore 11448320 bytes, modified 4614 s ago (the database)
+oneios-ls-state: lsd D1F3ECC9-...: SystemDataOnly-com.apple.LaunchServices-33554481-v2.csstore 11200440 bytes, modified 6283 s ago (the system content's database)
+oneios-icons-state: 15E09D24-AF82-354E-BECD-43DCC0B36EFC: 72 icons (.isdata) of 75 entries, store.index 720896 bytes (modified 6189 s ago), __cache_info__ 91 bytes
+```
+
+and with a recovery file left (boot 4's store; the first build said "lsd loads the database" there):
+`oneios-ls-state: lsd D1F3ECC9-...: com.apple.LaunchServices.error 0 bytes, modified 4975 s ago: removed (0) (no
+database here: lsd builds one)`.
+
+**Not changed: what it costs** (the hosting's share; PC boot 1, lsd's busiest 30 s, lsd 78-92 %): 154,027 task traps
+(5,125/s: 60,108 system calls, 88,431 faults, 5,488 interrupts); the hand-offs (trap to vCPU and back) 56.6 and 65.4 us
+at the mean (10 us at p50), about 19 s of the 30 s summed over the vCPUs; on cpu0 and cpu1 45 % of the wall time was
+kernel, 55 % an iOS thread's turn. lsd's calls are file system work, by kernel time: `madvise` 14,156 x 145 us,
+`open_nocancel` 3,661 x 636 us, `open` 1,697 x 1,264 us, `workq_kernreturn` 3,151 x 586 us, `getdirentries64` 2,912 x
+580 us, `getattrlist` 1,619 x 946 us, `mach_msg2` 6,123 x 333 us. These are qemu's times (about ten times the phone's);
+the phone's earlier boot had syscall p99 1.3 ms, fault p99 0.4 ms and 40-45 % kernel on cpu0 and cpu1. So the work is
+iOS's own (walking bundles, reading Info.plists and localizations, container queries), each step a trap the hosting
+makes dearer; doing less of it at each start is worth more than a cheaper trap, and the part that could be cut is
+Apple's `_LSDatabaseClean`, which this patch does not touch.
+
+Also seen on the PC, not changed: the guest's wall clock (iOS's log times) ran about 12 times slower than real time
+(boot 7: 109 `oneios-cpu` lines, 10 s apart on the console, span 91 s of iOS's log) and jumped between boots (launchd at
+20:38 UTC in boot 1, 14:18 in boot 3); rapportd logged 221,791 lines in boot 3's first minutes
+(`ServiceDiscovery:DiscoveryCache After pruning N records`), logd at 30-80 %; `oneios-tool`'s own APFS reader refuses
+these Data stores (`short read at 1152903912689233920`: it reads block 0's container superblock, an old checkpoint
+whose object map is gone) and falls back to apfs-fuse.
+
+## 0061-ubt-count.patch (fix-wifi-late-2, 2026-11-13)
+
+0026's user backtraces (`oneios-ubt=NAME,...`, `oneios-ubt-at=`, `oneios-ubt-every=`) as a sampler of a boot's first
+minutes: `oneios-ubt-count=N` stops after N reports (default 0: no end, as before), and each report now starts with
+`oneios-ubt: report K at +S s` (seconds after bsd_init's late start, where 0026's thread starts). Why: on the phone
+(2026-11-13, main c1223f8) configd named en0 89 s after launchd with IOKit already quiet, and what its threads did in
+those 89 s is not in xnuhost's log. For the next boot, in the image's `xnuhost.conf`: `oneios-ubt=configd,wifid,logd
+oneios-ubt-at=20 oneios-ubt-every=10 oneios-ubt-count=18` (+20 s to +190 s); give each line's addresses to `oneios-tool
+sym` (`docs/hardware.md` 3, "en0 late"). Compiled in the Linux PC's kernel (`HOSTED_OUT=fixwifi`) and prelinked (`kernel.kc` `84d3304c`: audit 0 failures, `stubs-check.py` 666 good). On the PC (2026-11-13, `oneios-ubt=configd oneios-ubt-at=850 oneios-ubt-every=45 oneios-ubt-count=6`): reports 1 to 6 at +850 to +1075 s, then `oneios-ubt: 6 reports, the last (oneios-ubt-count)`; what they showed is in `docs/hardware.md` 3. Not on the phone.
+
+## 0062-iokit-hardware-probe-trace.patch (fixbt, 2026-11-13)
+
+A debugging aid for a daemon that runs and never opens its hardware (bluetoothd on the phone, 2026-11-12 23:45: on,
+no transport opened). For the processes of the boot argument `oneios-iokit=NAME[,NAME...]` (default
+`bluetoothd,BlueTool`; `oneios-iokit=-` for none) the kernel logs one `oneios-iokit:` line per distinct request:
+
+- IOKit matching (`io_service_get_matching_service(s)`): the matching dictionary on one line and what was found
+  (`match {IONameMatch=bluetooth} -> IOPlatformDevice "bluetooth"`, `-> none (0x2c0)`), `match all` for an iterator;
+- matching notifications (`io_service_add_notification*`: `notify IOServiceFirstMatch {...}`): a daemon that waits
+  for a service shows what it waits for;
+- registry paths (`io_registry_entry_from_path`, `_ool`);
+- property reads (`io_registry_entry_get_property`, `_bytes`, `_recursively`, `_bin`/`_bin_buf`: what
+  `IORegistryEntrySearchCFProperty` uses): name, plane, recursive or not, the entry, found or not;
+- user client opens (`io_service_open_extended`): class, type, result;
+- kernel controls looked up by name (`CTLIOCGINFO`, `bsd/kern/kern_control.c`): `kernel control
+  "com.apple.uart.sk.bluetooth" -> id N` or `-> not registered (errno 2)`;
+- `kern.hv_vmm_present` reads (`bsd/kern/hvg_sysctl.c`, after Droid-VM-UniXNU's `owner-hide-vmm`; added 2026-11-14):
+  `sysctl kern.hv_vmm_present -> 1 (a virtual machine)` for a traced process, and for any process the boot argument
+  `owner-hide-vmm=NAME,...` applied to (matched on `proc_best_name`, the long name), once per process:
+  `-> 0 (the virtual machine hidden by owner-hide-vmm)`. A daemon that decides "virtual" with no such line asked
+  something else (MobileGestalt's cached `IsVirtualDevice`, the device tree's `/defaults vmm-present`: the latter shows
+  as a `property "vmm-present"` line).
+
+A request is logged when first made, when its answer changes, and at its 16th, 64th, 256th, ... asking (a polling loop
+shows with its count), at most 800 lines a boot. The property wrappers rename the original routines
+(`hosted_impl_...`) and call them; nothing else changes. Built in `HOSTED_OUT=fixbt` on 2026-11-13 (see
+`docs/hardware.md` 4 for what it showed on the PC); not run on the phone.
+
+## 0066-free-page-runs.patch (hang, 2026-11-13)
+
+**0058's give-back in long runs, and where its time goes.** On the phone (2026-11-12 23:45 boot) 0058 gave back 205
+MiB as 52,602 runs in 822 batches: every run one 4 KiB page (this kernel's page) and one `ram_discard`. xnuhost spent
+570 ms in those calls (11 us each); the guest's counter said 131,425 ms.
+
+- **What the old counter was.** `hosted_fr_stats.ticks` ran from before the free queue's lock was taken to after the
+  batch was back on the queue: the 1 s sleep between looks was never in it, but the lock wait, any time the utility
+  thread was preempted (after every host call, when interrupts come back on) and interrupts handled on it were. Boot A
+  below (0058's way, on the PC under load) shows what that time is: 49,144 ms by the clock, 1,567 ms on a CPU; 41,622
+  ms of it was the host calls' stretch, and one hold of the free queue's lock lasted 772 ms (the mutex's holder was
+  preempted). So the phone's 131 s was almost all the thread waiting for a CPU between its 52,602 calls [inference:
+  the phone's line had no split; the PC's does], not work, and not the host.
+- **What.** (`osfmk/vm/vm_resident.c`, `osfmk/arm64/hosted/free_report_runs.h`; all `#if XNU_HOSTED`, on 0058's code.)
+  - Each cold page brings the free pages next to it in physical memory: up to `oneios-free-report-run` pages in one run
+    (256 = 1 MiB; 1: none, 0058's way), ahead first, then behind, found through `vm_page_find_canonical` (O(1) in
+    `vm_pages[]`) and taken only if on the regular free queue, held by the host (not given back) and from a colour
+    queue still above its share of keep. Not with `HAS_MTE` (the free state is shared with the tagged classes there).
+  - A batch is up to `oneios-free-report-batch` pages (1024 = 4 MiB, the most; 0058: 64), only as far as the free
+    queues hold that much above keep, in whole slices; a small excess goes as before.
+  - The free queue's lock is held for at most 128 pages at a time, taking or putting back, and taken in spin mode for
+    the taking (preemption off: the hold is never the thread's wait for a CPU).
+  - A batch is given back as its runs, heap-sorted by page and joined (`xh_fr_sorted_runs`), one host call each.
+  - A fourth `oneios-mem:` line splits the time: `give-back time T ms: lock waits W, taking K (longest hold H us), host
+    calls C, putting back P; on a CPU U ms; per MiB T/M us (U/M on a CPU); runs longest L pages, N neighbours`. "On a
+    CPU" is the thread's own run time (`recount`); the guest cannot see a vCPU the host has descheduled, so that time
+    is in it too. The start line adds `runs N pages`.
+- **The decisions** (`xh_fr_sort`, `xh_fr_sorted_runs`, `xh_fr_batch_pages`, `xh_fr_neighbours`) are
+  `free_report_runs.h`, the same file as `runtime/xnuhost/include/xnuhost/free_report_runs.h`; the host tests check
+  they are one and test them (`tests/test_xnuhost.c`, "free report": the heap sort against 0058's insertion sort on 200
+  orders up to 1024 pages, duplicates, the batch and neighbour rules).
+- **Measured on the PC** (2026-11-13, qemu-aarch64, 8 vCPUs, `--ram 4G`, a fresh Data store each, `HOSTED_OUT=hang`,
+  `kernel.kc` `5b823f11` for A, `62245ded` for B; boot arguments of `docs/building.md` 5 plus
+  `oneios-free-report-stress=1 oneios-free-report-hysteresis=1`, which give back pages all the time; 960 s each, one
+  after the other, the PC shared with other agents and swapping guest RAM: xnuhost's new line said 1,058 MiB of the
+  guest's RAM swapped out by the PC at the end of A, 2,181 MiB at the end of B). A is `oneios-free-report-run=1
+  oneios-free-report-batch=64` (0058's way; A's kernel also still took the lock as 0058 did, not in spin mode); B is
+  the defaults. Both reached SpringBoard (A at 317 s, B at 305 s of the run), no panic. The last lines (MiB, ms, us):
+
+  | | A (0058's way) | B (0066) |
+  |---|---|---|
+  | given back | 950 MiB in 3,894 batches | 1,093 MiB in 423 batches |
+  | runs (host calls) | 233,969 (1.04 pages a run, longest 8) | 134,392 (2.08 pages a run, longest 615; 144,640 pages came as neighbours) |
+  | xnuhost's time in the calls | 976 ms (1.03 ms per MiB) | 669 ms (0.61 ms per MiB) |
+  | the guest's time by the clock | 49,144 ms (51.7 ms per MiB) | 45,497 ms (41.6 ms per MiB) |
+  | of it: host calls / taking / putting back / lock waits | 41,622 / 2,982 / 4,528 / 2 | 35,348 / 3,013 / 7,131 / 1 |
+  | the thread on a CPU | 1,567 ms (1,649 us per MiB) | 1,234 ms (1,129 us per MiB) |
+  | longest hold of the free queue's lock | 772 ms | 711 ms |
+
+  So per MiB 0066 costs the guest 32 % less of a CPU and xnuhost 41 % less, in a ninth of the batches; by the clock
+  the thread waits for a CPU all the same (97 % of its clock time is not on a CPU, in both). On this PC the freed pages
+  were mostly scattered (a run of two pages on average), so the runs were short; a bulk free (an app's exit) gives
+  longer ones. The longest hold stayed at 0.7 s even in spin mode: the vCPU itself was off the PC's CPUs, or the
+  `vm_page` entries it walked were in the PC's swap (2 GiB of the guest's RAM was) [inference]; the guest cannot
+  prevent either. The clock time is not a cost to iOS (the pages of a batch are off the free queue meanwhile, 4 MiB at
+  most, only far above the free target), but it is what the phone's 131 s were.
+- **Not run on the phone.** What to read there: the fourth `oneios-mem:` line's per MiB on a CPU and by the clock, and
+  `runs` against `batches` (0058's were 64 runs a batch).
+
+## 0070-log-persist.patch (fix-wifi-join-2, 2026-11-14)
+
+`oneios-log-persist=SUBSYSTEM[,SUBSYSTEM...]` (default: none, nothing written) keeps the info-level messages of those
+log subsystems in the unified log: before launchd it writes `/private/var/preferences/Logging/Subsystems/SUBSYSTEM.plist`
+on the Data volume (`/Library/Preferences` is a link to `../private/var/preferences` in 24A446's OS image), with
+`DEFAULT-OPTIONS` `Level` `Enable` and `Persist` both `Info`, root 0644, and makes `Logging` and `Logging/Subsystems`
+when missing. A file already there is left alone. The file stays in the Data store; delete it to go back. Why: CoreWiFi
+says why `_CWFFilteredScanResults` drops a scan result (`[corewifi] Filtering based on maxAge (...)` and 15 other
+reasons, subsystem `com.apple.WiFiManager`) only at the info level, and auto-join saw no result in the phone's boots of
+2026-11-13 (`docs/hardware.md` 3, "Wi-Fi does not join"). For the next boot: `oneios-log-persist=com.apple.WiFiManager`
+in the image's `xnuhost.conf`. Line: `oneios-logpersist: com.apple.WiFiManager: info kept (... written, 0)`, or `... is
+there already: left alone`. [I] That logd honours the Data volume's file: `/Library/Preferences/Logging/Subsystems` is
+the path iOS frameworks write their own overrides to (SafariShared, VoiceControl in 24A446's cache); not seen working
+yet on the phone. **On the PC** (2026-11-14, `wifi=sim`, `kernel.kc` `552d08f1` from this branch, a fresh Data store): `oneios-logpersist: com.apple.WiFiManager: info kept (...)` before launchd, and iOS's log then held 14 info-level `com.apple.WiFiManager` entries of wifid (`[corewifi] ADDED LOCAL/DAEMON XPC CONNECTION ...`, `Mega WiFi profile is NOT installed`, ...); the system has no logging preference of its own for that subsystem (HomeKit and containermanager, whose info lines were kept too, have theirs), so logd honours the Data volume's file. Final build `kernel.kc` `bf31eb0d` (audit 0 failures, `prelink stubs-check` 666 good).
+
+## 0067-ram-fixed.patch (fix-fixed-memory, 2026-11-13; in the series since fix-ram-fit, 2026-11-14)
+
+**0058's give-back becomes the host's choice.** With xnuhost's `ram-giveback=0` the RAM is held fixed for the session
+(`docs/booter.md` 2.2, "Fixed RAM"), and the host says so with `XH_FEATURE_RAM_FIXED` (bit 3 of `xh_info.features`, added
+to the kernel's copy of `hostcall.h`). The patch: `hosted_fr_giveback`, set once in `hosted_free_report_start` from that bit
+(`oneios-free-report-giveback=1` gives back anyway, `=0` never); the reporting loop runs only with it. The free queues keep
+0058's order (freed pages first) and the `oneios-mem:` lines stay; with give-back off, their "given back" count is the
+free pages never touched since boot (released at startup). A new start line: `oneios-mem: free pages given back to the
+host: no (the host holds the RAM fixed); the free queues take the pages iOS freed first (0058)`.
+
+- **State.** Written against `vm_resident.c` after 0066 and `hostcall.h` after 0003. Compiled on the Linux PC
+  (2026-11-14, `HOSTED_OUT=fixram`, the series of main `f7bb1c3` plus 0067: `xnu.macho` `f9a4b99e`, 1541 s; no warning
+  from it), prelinked (`kernel.kc` `e128c27b`: audit 0 failures, 2711 paired; `oneios-tool prelink stubs-check` 666 good,
+  0 bad). Booted on the PC twice (`docs/booter.md` 2.2, "Fixed RAM", the A/B table): with `ram-giveback=1` the start
+  line says `free pages given back to the host: yes (the host does not hold the RAM fixed)`, with `ram-giveback=0` `no
+  (the host holds the RAM fixed)` and xnuhost counted no `ram_discard` call; no panic in 960 s each. Not run on the phone.
+- **Without it** xnuhost's `ram-giveback=0` still works: the first `ram_discard` of 0058/0066 gets -EPERM and the kernel
+  stops for the boot (`oneios-mem: ram_discard(...) failed: -1; free pages are no longer given back`); one batch's pages
+  go back to the head of the free queue.
+- **0058/0066 now (fix-ram-locked, 2026-11-15):** give-back is opt-in. xnuhost's default is `ram-giveback=0`, the RAM
+  prefaulted and locked (`docs/booter.md` 2.2, "Fixed RAM"), so with this patch the kernel starts with `oneios-mem: free
+  pages given back to the host: no (the host holds the RAM fixed)` and its reporting loop never runs (no CPU spent on
+  give-back rounds; the `oneios-mem:` lines stay). Why: the phone's session of main `3233fed` (`ram-giveback=1`,
+  `ram=auto` at a fitted 6,656 MiB) still had Linux swap iOS's RAM, 138 -> 604 MiB at up to 37.9 MB/s of swap-outs,
+  with about 1.9 GB of other page cache there: a size that fits is not enough under Samsung's swappiness, only the
+  lock is. `ram-giveback=1` gives 0058/0066's way back with one setting. No kernel change: 0067 already does what the
+  new default needs.
+
+## 0071-cache-maintenance-fault-read.patch (fix-webkit-icache, 2026-11-14)
+
+**A cache maintenance fault is a read.** The phone's WebContent crash report (2026-11-14 06:03, main `9f6dc38`):
+`KERN_PROTECTION_FAILURE`, "(Data Abort) byte write Permission fault", in `sys_icache_invalidate` of JSC's first JIT
+thunk (`JSC::LLInt::createJSGateThunk`), on the read-execute alias of the JIT region. A `dc cvau` / `ic ivau` that
+faults reports ESR ISS.WnR = 1 **and** ISS.CM = 1 (Linux passes the ESR of a user address on whole); 0002's trap path
+read WnR alone: `hosted_trap_access` said `XH_PROT_WRITE`, `hosted_user_fill` refused it on the read-execute page, and
+`hosted_trap_fault_esr` rebuilt the syndrome as a permission fault with WnR and no CM, which `inspect_data_abort`
+(sleh.c: a write when WnR is set and either CM is clear or the fault is a permission fault) turned into a write
+`vm_fault` on a read-execute entry. The patch, `osfmk/arm64/hosted/`:
+
+- `hosted_user.c`: `hosted_esr_is_cache_maintenance` (EC 0x24 with CM); `hosted_trap_access` returns `XH_PROT_READ` for
+  it before it looks at the stub's `access` (so a runtime older than the stub's own fix is covered too);
+  `hosted_trap_fault_esr` gives it to XNU as the hardware reported it, CM and WnR kept, with the fault status an
+  access flag fault (level 3) instead of a permission fault: XNU's CM rule makes it a read, and `arm_fast_fault` is
+  still tried before `vm_fault` (it is for every fault that is not a translation fault; its `was_af_fault` argument is
+  unused). Stores and loads are unchanged (a permission fault, WnR for a write).
+- `hosted_machine.c`: the kernel's own faults (`hosted_exception_upcall`'s fill) take CM as a read too. (The kernel
+  runs at EL0 on the host, so it can only run the cache maintenance EL0 may, all of which need read access only.)
+- `hosted_selftest=1`: a new check, "a cache maintenance fault (CM, WnR) reaches XNU as a read with CM kept; a store as
+  a write", on synthetic traps (the stub's old `XH_PROT_WRITE` included).
+
+The runtime half is in the stub (`runtime/xnuhost/stub/stub_abi.h` `xs_fault_access`, host test `test_fault_access`):
+either half alone fixes the crash. Tests: `docs/booter.md` 2.6 and 6 (`test_jit_icache`; qemu-user never faults on
+cache maintenance, so only arm64 hardware runs the fault itself).
+
+- **Built and booted on the PC (2026-11-14).** Written and built as 0070 and renamed to 0071 before the merge (0070 is
+  fix-wifi-join-2's): the rename changed only the number in comments. `HOSTED_OUT=fixic` built in 844 s; the prelink's
+  audit 0 failures, `stubs-check` 666 good. A PC boot (qemu-aarch64, 8 vCPUs, `--ram 4G`, a new data store,
+  `hosted_selftest=1`, 1500 s): `hosted selftest: 29 passed, 0 failed` with the new check `ok`; SpringBoard and
+  backboardd up (backboardd opened the framebuffer), no panic; the only exception was chronod's
+  (`type=0xa`), which an earlier PC boot on main had too. No WebContent process ran (Safari is not opened on the PC),
+  and qemu does not fault on cache maintenance, so the fix itself is proven on the phone only.
+
+## gpu/: the blobs' kinds and ages, `oneios-cpu`'s span (hang, 2026-11-13; the archive, not a numbered patch)
+
+No XNU source changes, so no patch in the series: `oneios-tool kernel gen gpu` compiles a staged
+`DroidVMVirtioGpu3D.cpp` (`staged/gpu.rs` `GPU3D`: weak hooks at a blob's creation, deferred close and release), and
+`gpu/OneiOSAdreno.cpp` keeps a table of the live blobs (24,576 at most) and prints `oneios-gpu-kinds:` and
+`oneios-gpu-ages:` per client with the GPU report (`docs/gpu.md` 5.1: own blobs in the task or the kernel, mappable;
+wired by the VM tag of the caller's mapping; sizes under 1 MiB; ages; closed blobs still held). `oneios-cpu:` now divides
+by the time measured since its last walk and prints those seconds (it divided by the nominal 10 s: a late report in a
+stall inflated every share). Built into the kernel of 0066's boot B and booted on the PC (no 3D there: the hooks are
+never called, the table is never made; the `oneios-cpu` lines are). Not run on the phone.
+Since 2026-11-14 (fix-thermal-log) an `oneios-cpu-sys:` line follows each `oneios-cpu:` line with the same processes'
+kernel time (`docs/gpu.md` 5.1); compiled alone with the kernel build's own flags, not yet in a built kernel.
+Since 2026-11-15 (fix-host-overhead) `oneios-cpu:`'s "all" is the processors' busy time (the span times the CPUs, less
+the time they idled: hosted 0075's `hosted_processors_idle_mach`), and each process's share is capped at it
+(`gpu/cpu_window.h`, the same file runtime/xnuhost's host tests check). The cause of a window over 800 % on 8 vCPUs,
+besides the old nominal divisor: recount adds a thread's time to its task only when the thread changes state, so time
+from earlier windows lands whole in the window where a long-running thread finally switched, and "all" was the sum of
+those deltas with no bound. A process's lump can still land in one window, but never past what the CPUs did in it.
+
+## 0075-host-overhead-per-cpu-stats-perf-hint.patch (fix-host-overhead, 2026-11-15)
+
+From the phone session of main 3233fed (30 s): `1021984 user stays; 684514 syscalls (bsd 473429, 26066040 us; mach
+211370, 8850591 us ...); 330746 faults, 49701 filled from the tables (11417628 us), 281312 to vm_fault (6309604 us),
+281229 refilled; ... pmap: user maps 331008, unmaps 414758 ... TLB lock taken 232732, 2775 waited (125098 us waiting
+...)`. What the patch changes:
+
+- **The counters are per vCPU.** `hosted_user_stats` (runs, syscalls, faults, ...), the audit tick (an atomic add on every
+  return to user mode) and 0041's per-call counters (`hosted_perf`, atomics on shared lines) were written by every vCPU on
+  every stay: about 34,000 stays a second on the phone, each taking the line from the vCPU that wrote it last. Now an array
+  of one 128-byte-aligned set per vCPU; the report adds them up.
+- **The fill's time is its own.** The fill runs with interrupts on, and the interrupt that ended the stay is often taken
+  there, with its preemption: the thread then waited while other threads ran, and that was counted as the fill's. 49,701
+  fills "took" 11.4 s per 30 s (fill_t also counts the 281,312 attempts that went on to vm_fault: 34 us each on average),
+  against 22 us per vm_fault. A fill during which the thread was switched out (`thread->c_switch` moved) is now counted
+  apart (`fills switched out N`) and not timed. Nothing in the fill's own work changed: the number is now honest.
+- **A kernel entry made again unchanged maps nothing in the host.** `pmap_enter_options_addr` reads the kernel's leaf
+  entry before and after the enter (`hosted_kernel_pte`); when it is the same valid entry, its host mapping exists (made by
+  `hosted_kernel_enter` when the entry was made, and a flush maps a still valid entry again at once), so no `kernel_map`:
+  each one is an mmap in xnuhost with its mmap_lock taken for writing, which holds every vCPU's page faults meanwhile. The
+  PC's idle boot made 220,270 kernel maps per 30 s with 1,468 kernel unmaps. The count: `kernel entries made again
+  unchanged N (no host map)`. Measured on the PC boot (2,900,519 kernel maps in 2,400 s): 0, so there the kernel maps are
+  new entries and the guess was wrong; the check stays (one walk per kernel enter) for the phone's count.
+- **The hosted CLPC's hint** (`hostcall.h` `perf_hint`, ABI unchanged: a reserved word of `struct xh_cpu`): before each
+  user stay the kernel writes the class of the thread (`thread_get_perfcontrol_class`, darwin background from the task's
+  policy): realtime, UI and above-UI floor 1024, user-initiated 768, utility and background (and darwin-background) no
+  floor and, since 2026-11-16, no ceiling of ours (fix-host-overhead's 512 ceiling slowed chronod's widget extensions;
+  the owner's no-caps rule ended it). xnuhost's `thread_run` turns it into the uclamp of the Linux thread that runs the user code
+  (`docs/booter.md` 2.6a, 2.6b). RunningBoard's background and suspended roles reach it through the task's QoS clamp. The
+  same word is the role of the submitting thread for host code on the vCPU (the GPU path, fix-gpu-perf). `perf hints N`
+  counts the changes.
+- **`hosted_processors_idle_mach`** for the oneios-cpu window (above).
+- **The GPU path's CLPC signal** (fix-gpu-perf #42 declares both weak in `gpu/OneiOSAdreno.cpp`, this defines them):
+  `oneios_clpc_thread_role(thread)`, the task's effective role (`TASK_POLICY_ROLE`, RunningBoard's), darwin background
+  as `TASK_DARWINBG_APPLICATION`, a realtime thread of a task without a role as `TASK_GRAPHICS_SERVER`; and
+  `oneios_clpc_frame_deadline(thread)`, the deadline of the thread's work interval as its last notify gave it
+  (`kern_work_interval_notify` stores it in the interval, `wi_hosted_deadline`; 0 outside one). Compiled with the tree
+  and built into the kernel; on the PC (no 3D) nothing calls them.
+
+The report's new line: `oneios-perf:   0075: fills switched out N (not in the fill time); kernel entries made again
+unchanged M (no host map); perf hints H`. Built and booted on the PC (qemu-aarch64; before/after in `docs/booter.md`
+2.6c); not run on the phone. On the phone: the 0075 line, the fill time per fill against before, `kernel maps` in the
+pmap line, and xnuhost's `perf:   queue:` and `thermal: 30 s: host CPU ... sys ...` lines.
+
+## 0080-shared-region-protect.patch (fix-dyld-objc, 2026-11-15)
+
+The keyboard lagged everywhere (phone session 8644ae9-b: `oneios-cpu: Preferences[177] 102-104%, backboardd 34-44%,
+kbd[159] 12-16%`; `oneios-perf` per 30 s: 295,255 faults, 216,049 of them to vm_fault, 295,247 user maps and 281,109
+unmaps: map churn), and every process logged `triggered unnest of range ... of DYLD shared region` once, from launchd
+on. What was found, from the source and the PC's logs:
+
+- **The unnest.** The range is always the 32 MiB block that holds the start of `dyld_shared_cache_arm64e.25.dylddata`'s
+  `__DATA_CONST` (with the boot's slide: `0x1fd200000->0x1ff200000` at slide `0x1d130000`; that block holds the
+  `__DATA_CONST` of libobjc, dyld itself and the other first images). XNU logs an unnest only below the lowest writable
+  mapping, so the read-only `__DATA_CONST` is the one that shows; `__TPRO_CONST` and the `__AUTH_CONST` above it unnest
+  without a line. It comes from `vm_map_protect`: its exclusive range lock (`vm_range_lock_pmap_unnest_and_clip`,
+  `vm/vm_map_lock.c`) unnests the block and copies the constant submap's entries into the task's map before anything
+  looks at whether the protection changes. dyld 24A446 runs from the cache (`dyld MachO: 0x180482000`) and has two
+  shared-cache protect paths: `ProcessConfig::DyldCache::makeDataConstWritable` (`marking shared cache range ...`) and
+  `lsl::MemoryManager`'s protected memory (`__TPRO_CONST,__allocator`), which on a device whose kernel does not pass
+  `dyld_hw_tpro=1` (TPRO: per-thread write permission in hardware, which this host does not have) is made writable and
+  read-only again with `mach_vm_protect` around dyld's work. `mach_vm_protect` (-14) is the PC's top Mach trap while
+  processes start (7,375 per 30 s at 151 us each, about 90 per process launch).
+- **The map churn of those protects (ours).** `pmap_protect` flushed its whole range whatever changed, and here a flush
+  is an unmap of the task's host mappings (`hosted_pmap.h`): every page of the range is faulted in again at its next
+  use. `vm_map_protect` asks the pmap for the new protection minus write when it adds write, which changes no entry; so
+  each time dyld made its memory writable the whole range was unmapped for nothing, then each write went to vm_fault and
+  each read was filled again.
+- **The other slow paths of the phone's samples are iOS's own.** `objc::ObjectHashTable::forEachObject` under
+  `_dyld_for_each_objc_protocol` is the lookup in the cache's preoptimized protocol table (libobjc calls it only when
+  its shared-cache optimizations are on, so they are on); `DyldSharedCache::forEachImageTextSegment` under
+  `findImageMappedAt` is dyld's search of the cache's text segments for an address in a `r-x` mapping (the cache
+  header is valid and the cache is where dyld expects it); `lsl::Vector<dyld_image_info>::insert` is an image added to
+  the image list by a dlopen. Nothing of ours makes them slower than on an iPhone, except that each dyld API call that
+  makes its memory writable costs protects (above).
+
+What the patch changes:
+
+- **pmap_protect flushes only what changed** (`arm/pmap/pmap.c` `pmap_protect_options_internal`,
+  `hosted_protect_changes` in `hosted_pmap.h`): the span of the entries whose host mapping changed (the page or
+  `hosted_pte_prot`); entries that are the same keep their host mappings. `oneios-protect-flush-all=1` flushes the
+  whole range as before.
+- **A protect of the nested shared region that changes nothing leaves it nested** (`vm/vm_map.c`
+  `vm_map_protect_hosted_noop`): not the maximum, no `VM_PROT_COPY`, and every entry of the range (in the constant
+  submap, read under a shared range lock) already has the asked protection (no JIT or TPRO entry): `KERN_SUCCESS`, no
+  exclusive lock, no unnest. `oneios-sr-protect-noop=0` is the old way.
+- **`oneios-top=N`** (default 6, 0 off; printed with oneios-perf, each period): `oneios-top: shared region: V vm_protect
+  calls, N that changed nothing (left nested), U unnests; pmap_protect entries flushed F, kept mapped K (unchanged)`,
+  then the N processes the kernel's trap time went to most: `oneios-top: NAME[PID] cpu C%, T traps U us: vm_fault F (U
+  us), fills L, own unmaps M; calls NUMBER COUNT xMEAN_US ... (-N: Mach traps); vm_protect P (shared region S, unnests
+  X, last prot 0x.. from pc 0x.. lr 0x..)`. `cpu` is the process's user and system time since the report before
+  (TASK_POWER_INFO; -1 the first time it is listed), which the PC otherwise lacks (`oneios-cpu` comes from the GPU
+  archive, with 3D only). **`oneios-srprot:`** lines: the first 24 vm_protects of the shared region in a boot, with the
+  saved pc and lr and four return addresses (`oneios-tool sym` names them).
+
+The first build (`HOSTED_OUT=dyldobjc`, 744 s; prelink audit 0 failures, `stubs-check` 666 good, 0 bad;
+`kernel/tests/host.sh` 5 of 5) stopped 1 s into its first PC boot (`oneios-protect-flush-all=1
+oneios-sr-protect-noop=0`, qemu-aarch64, 8 vCPUs, 2560 MiB), right after `VM bootstrap: 30 maps, 128 entries and 16
+nodes available`, xnuhost exit 4.
+
+**Continuation, 2026-11-16: the early halt is fixed and the phone boots through the former `newfs_apfs` panic.**
+`vm_shared_region_create` now sets `hosted_shared_region_ready` only after it has made a region; both the vm_map shortcut
+and `hosted_top_note_protect` return before that. This covers the reporting call too, which still ran in the original
+halt's `oneios-sr-protect-noop=0` boot. Mac build `HOSTED_OUT=phonefix`; `kernel.kc` `f171b71e...`, prelink audit 2,712
+pairs and 0 failures. On the S24 Ultra (`ram=auto`, 6,912 MiB, `shmem_enabled=advise`): VM bootstrap continued,
+`newfs_apfs` finished instead of SIGSEGV, the seed verified (6,030 files, 14,816 folders), and xnuhost reported the
+first frame with content and `session/ready`. Log: `out/session-logs/2026-11-16/phonefix-xnuhost.log`. No PC A/B run yet.
+The report showed **0 shared-region no-ops** and continuing unnests, so the no-op half is not proven effective; the
+pmap report did show entries kept mapped (48,376 unchanged in one 30 s period). The typing comparison is still open.
+
+## 0049-wifi-association-event.patch (radio2, 2026-11-12)
+
+`kev_post_msg` (bsd/kern/kern_event.c) refuses an event that does not fit one mbuf without a cluster (`MLEN`), with
+`EMSGSIZE`. iOS 27's wifid reads a 540-byte record from the association event (ASSOC_DONE: ten 52-byte access point
+records, the join's result at 0x214 and a flag that it is valid at 0x218; an empty event is not safe on 24A446).
+The hosted Wi-Fi driver (`net/`) posts its events as kernel events, because it has no IO80211Family user client,
+the pipe these events take on Apple's hardware. On the phone on 2026-11-12 the supplicant joined an open network in
+3 s, the driver posted SSID_CHANGED, BSSID_CHANGED and LINK_CHANGED (32 bytes) and got `EMSGSIZE` (40) for
+ASSOC_DONE: wifid never learned of the join and Settings stayed at "connecting". With the patch an event of
+`KEV_VENDOR_APPLE` and `KEV_IEEE80211_CLASS` may be as long as an mbuf cluster (`MCLBYTES`) and is then built in one
+(`m_getcl`); every other event keeps the limit. It is UniXNU-sheng's `sheng-wifi-association-event.patch`, under
+`#if XNU_HOSTED`. Built (`HOSTED_OUT=radio`); not yet run.
+
+## net/: the Wi-Fi, en0 on the phone's radio (radio, radio2, 2026-11-12)
+
+No numbered patch: an archive (`oneios-tool kernel gen net`, hooked into `kernel/build-hosted.sh` like `hid/`) whose
+start, `oneios_net_start` (`net/OneiOSWifi.cpp`), `oneios_drivers_start` calls before the audio's (weak in
+`drivers/bridge/OneiOSBridge.c`). Before it the hosted kernel had no network driver and iOS no en0. It holds
+`IO80211Controller` and `IO80211Interface` (the class names wifid and configd know) as subclasses of the
+collection's **original** `IOEthernetController` and `IOEthernetInterface` (Apple's IONetworkingFamily stays in the
+collection: 25 of its 130 roots link it), a station whose scans and joins are messages to xnuhost's Wi-Fi bridge
+(`drivers/net/oneios_wifi_proto.h`, in-band on the virtio-net queues), and UniXNU-droidvm's virtio-net transport
+(`DroidVMVirtioNet.c`, staged: multicast passes its receive filter). The classes are compiled against
+IONetworkingFamily-188's headers, which the build checks against `net/IONetworking-24A446-v54.json` (250 and 221
+vtable slots, every discriminator); 159 original functions are bound through `.original` stubs, none of them
+non-virtual. `net/README.md` has the files, the check, the boot argument (`oneios-wifi=0`) and the log lines;
+`docs/hardware.md` section 3 the design, the host's side and what ran. Built on the Mac (`HOSTED_OUT=radio`) and
+prelinked: the import audit passes (0 failures) and `oneios-tool prelink stubs-check` finds 666 good stubs, 0 bad.
+
+## display/: colour, depth and the panel (fix-display-colour, 2026-11-13)
+
+No numbered patch: the display archive (`oneios-tool kernel gen display`) only. What iOS's render server renders
+into here (8-bit sRGB `BGRA`, or `RGhA` half floats narrowed to 8 bits by the CPU; a real iPhone's 10-bit `w40a` is
+refused by this display), what QuartzCore and MobileGestalt read about the panel, and the real iPhone18,2 tree's EDR
+and nits values: `display/README.md`, "Colour, depth and the panel". In the archive: with `oneios-display-wide=1`
+(xnuhost's `display-format=rgba16f`) half-float frames go to the virtio scanout as they are (LegacyDisplayProbe.cpp's
+offer and DroidVMVirtioGpuDisplay.cpp's resources carry the scanout format: `staged/display.rs` `DISPLAY`, `SCANOUT`);
+`OneiOSDisplay.cpp` logs `oneios-display: half-float frames: ...`, the display service's properties once
+(`oneios-display: properties: ...`) and each surface format the compositor swaps (`oneios-display: the compositor
+swaps format 'BGRA' ...: taken`). Without the boot argument the frames take the path they took before. Not compiled
+yet: the kernel build, prelink and a PC boot are the next step (`display/README.md`).
+
+## 0069-display-power-request.patch (fix-brightness-touch, 2026-11-14)
+
+iOS's display power for the host. backboardd turns its display off and on with
+`IOMobileFramebufferRequestPowerChange(fb, state)`, which is `IOConnectCallScalarMethod(selector 12, { state })` (24A446
+IOMobileFramebuffer `kern_RequestPowerChange`; QuartzCore's `CA::IOMobileFramebuffer::set_power_state`). This family
+answers it `kIOReturnUnsupported` without a platform subclass, so the request reached nothing. In
+`iokit/Kernel/IOUserClient.cpp` (`is_io_connect_method`, beside 0029's trace), after the method and whatever it
+answered, a call on `IOMobileFramebufferUserClient` with selector 12 and one scalar goes to
+`oneios_display_power_request` (weak; `drivers/brightness/OneiOSBacklight.cpp`), which logs `ONEIOS BACKLIGHT: display
+off: backboardd[N] asked its framebuffer (power change 0, answered 0x...)` and sends `OB_BRIGHT_POWER`: the host sleeps
+the touch IC and floors the panel at off, brings both back at on (`runtime/bridges/brightness/README.md`). The method's
+answer and arguments are not changed. `oneios-display-power-hook=0`: not passed. Checked: the patched file passes the
+kernel's recorded compile command with `-fsyntax-only`; built on the Linux PC (2026-11-14, `HOSTED_OUT=fixbr`, series through
+0069, xnu.macho 122efae5, 974 s); prelinked: audit 0 failures (2711 paired), `stubs-check` 666 good, 0 bad (kernel.kc
+7632e390). Not booted; the
+PC cannot press a phone's power key into a lit display. Whether backboardd calls it at the lock in this guest is [U] until a phone boot's
+log shows the line.

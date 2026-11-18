@@ -1,0 +1,1373 @@
+// SPDX-License-Identifier: MIT
+// xnuhost: boots a source-built XNU as a process on Android's Linux kernel (docs/booter.md).
+#define _GNU_SOURCE
+#include "xnuhost.h"
+#include "gpu3d.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include "bridges/devices.h"
+#include "bridges/camera.h"
+#include "encoder.h"
+#include "imageset.h"
+#include "xnuloader/boot.h"
+#include "xnuloader/machine.h"
+#include "xnuloader/macho.h"
+
+#define EXIT_GUEST_OFF 0
+#define EXIT_SETUP 2
+#define EXIT_RESTART 3
+#define EXIT_PANIC 4
+
+static xh_config config;
+static struct { uint32_t requested, reason, code; char why[96]; } stop_state;
+static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool guest_ready;
+static uint64_t boot_fb_pa;
+static unsigned fb_width, fb_height, fb_hz;
+
+bool xh_stopping(void) { return __atomic_load_n(&stop_state.requested, __ATOMIC_ACQUIRE) != 0; }
+
+uint64_t xh_mono_ms(void)
+{
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+void xh_stop(uint32_t reason, uint32_t code, const char *why)
+{
+  pthread_mutex_lock(&stop_lock);
+  if (!stop_state.requested) {
+    stop_state.reason = reason;
+    stop_state.code = code;
+    snprintf(stop_state.why, sizeof stop_state.why, "%s", why);
+    __atomic_store_n(&stop_state.requested, 1, __ATOMIC_RELEASE);
+  }
+  pthread_mutex_unlock(&stop_lock);
+}
+
+static void session_file(const char *name, const char *content)
+{
+  char path[600];
+  if (!*config.session || snprintf(path, sizeof path, "%s/%s", config.session, name) >= (int)sizeof path) return;
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) { LOGE("session: %s: %s", path, strerror(errno)); return; }
+  (void)!write(fd, content, strlen(content));
+  close(fd);
+}
+
+// The guest is up: session/ready (the switch's dead-man timer stops; the OneOS boot screen hands over to the display
+// helper) and the `guest ready: first frame` line, which the fork's boot stages and oneios-tool look for. When, is
+// ready.c's rule: the first frame of the guest's own with content, or ready-content-wait seconds after its first one.
+// The device's thread (xh_guest_frame), the main loop's tick and the ready host call all come through here.
+static xh_ready_state ready_rule;
+static pthread_mutex_t ready_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool guest_drawing;                  // a frame of the guest's own has been shown: the console's copy stops
+
+static void ready_now(xh_ready_why why, uint64_t now)
+{
+  if (why == XH_READY_NOT || why == XH_READY_ALREADY) return;
+  if (__atomic_exchange_n(&guest_ready, true, __ATOMIC_ACQ_REL)) return;
+  session_file("ready", "ready\n");
+  double after = (double)(now - ready_rule.first_ms) / 1000.0;
+  unsigned long long frames = (unsigned long long)ready_rule.frames;
+  if (why == XH_READY_CONTENT && frames <= 1) LOGI("guest ready: first frame (it has content)");
+  else if (why == XH_READY_CONTENT)
+    LOGI("guest ready: first frame with content, %.1f s and %llu frames after the guest's first (black) frame", after, frames - 1);
+  else if (why == XH_READY_BLACK_TIMEOUT)
+    LOGI("guest ready: first frame, all black: no frame with content in %d s after the guest's first (%llu frames); ready all the same (ready-content-wait)",
+         config.ready_content_wait, frames);
+  else if (why == XH_READY_ANY_FRAME) LOGI("guest ready: first frame (ready-content-wait=0: content not waited for)");
+  else LOGI("guest ready: first frame (the kernel's ready call)");
+}
+
+void xh_guest_ready(void)
+{
+  pthread_mutex_lock(&ready_lock);
+  ready_now(xh_ready_on_call(&ready_rule), xh_mono_ms());
+  pthread_mutex_unlock(&ready_lock);
+}
+
+bool xh_guest_frame(bool lit)
+{
+  uint64_t now = xh_mono_ms();
+  pthread_mutex_lock(&ready_lock);
+  bool first = !ready_rule.frames && !ready_rule.ready;
+  xh_ready_why why = xh_ready_on_frame(&ready_rule, lit, config.ready_content_wait, now);
+  if (first) {
+    __atomic_store_n(&guest_drawing, true, __ATOMIC_RELEASE);
+    // The marker of the rule before 2026-11-15 (ready at this frame), kept for the timings.
+    if (!lit && why == XH_READY_NOT)
+      LOGI("display: the guest's first frame of its own: all black; session/ready waits for one with content (up to %d s)", config.ready_content_wait);
+  }
+  ready_now(why, now);
+  bool ready = ready_rule.ready;
+  pthread_mutex_unlock(&ready_lock);
+  return ready;
+}
+
+static void ready_tick(void)
+{
+  if (__atomic_load_n(&guest_ready, __ATOMIC_ACQUIRE)) return;
+  uint64_t now = xh_mono_ms();
+  pthread_mutex_lock(&ready_lock);
+  ready_now(xh_ready_on_tick(&ready_rule, config.ready_content_wait, now), now);
+  pthread_mutex_unlock(&ready_lock);
+}
+
+static uint8_t *read_file(const char *path, size_t *size, size_t limit)
+{
+  struct stat st;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return NULL;
+  uint8_t *data = NULL;
+  if (fstat(fd, &st) == 0 && st.st_size > 0 && (size_t)st.st_size <= limit && (data = malloc((size_t)st.st_size))) {
+    size_t done = 0;
+    while (done < (size_t)st.st_size) {
+      ssize_t n = read(fd, data + done, (size_t)st.st_size - done);
+      if (n <= 0) { free(data); data = NULL; break; }
+      done += (size_t)n;
+    }
+    *size = (size_t)st.st_size;
+  }
+  close(fd);
+  return data;
+}
+
+// A sidecar of the kernel collection, DarwinBoot's naming: <kernel>.<suffix>.
+static xl_blob sidecar(const char *suffix, size_t limit)
+{
+  char path[600];
+  xl_blob blob = { 0 };
+  size_t size = 0;
+  if (snprintf(path, sizeof path, "%s.%s", config.kernel, suffix) >= (int)sizeof path) return blob;
+  blob.data = read_file(path, &size, limit);
+  blob.size = blob.data ? size : 0;
+  if (blob.data) LOGI("sidecar %s: %zu bytes", path, size);
+  return blob;
+}
+
+#if defined(__aarch64__) && defined(__linux__)
+#include <pthread.h>
+#include <sys/auxv.h>
+#ifdef __ANDROID__
+#include <android/api-level.h>
+void android_set_application_target_sdk_version(int target);
+#endif
+#include <sys/prctl.h>
+#ifndef HWCAP_PACA
+#define HWCAP_PACA (1 << 30)
+#endif
+
+static uint64_t pac_sign(uint64_t value)
+{
+  register uint64_t x17 __asm__("x17") = value, x16 __asm__("x16") = 0x1234;
+  __asm__ volatile("hint #8" : "+r"(x17) : "r"(x16));       // pacia1716: a NOP without PAC
+  return x17;
+}
+
+// One key set for the kernel and every task: a pointer signed here must come out the same in a
+// forked child (it would not after an exec, which is why nothing in the tree of xnuhost execs).
+static bool pac_shared_by_fork(void)
+{
+  int pipe_fd[2];
+  uint64_t probe = 0x0000001234567000ull, mine = pac_sign(probe), theirs = 0;
+  if (pipe(pipe_fd)) return false;
+  pid_t pid = fork();
+  if (pid == 0) { uint64_t v = pac_sign(probe); (void)!write(pipe_fd[1], &v, 8); _exit(0); }
+  close(pipe_fd[1]);
+  bool ok = pid > 0 && read(pipe_fd[0], &theirs, 8) == 8 && theirs == mine;
+  close(pipe_fd[0]);
+  if (pid > 0) waitpid(pid, NULL, 0);
+  // Signing must also do something. One signature can be all zero bits by chance (1 in 128 with
+  // the 7 signature bits of a 47-bit address space), so several values are tried.
+  bool signs = false;
+  for (uint64_t i = 0; i < 16 && !signs; i++) signs = pac_sign(probe + (i << 12)) != probe + (i << 12);
+  return ok && signs;
+}
+
+// The same must hold for xnuhost's own threads: the kernel's code runs on the vCPU threads and signs
+// pointers that every other vCPU and every task authenticates. Linux copies the keys to a new thread,
+// but bionic's pthread start resets the thread's APIA key (prctl PR_PAC_RESET_KEYS) for programs whose
+// target SDK is 31 or later, which a static binary is by default. main() lowers the target SDK first;
+// this checks that it worked.
+static void *pac_thread_probe(void *arg) { *(uint64_t *)arg = pac_sign(0x0000001234567000ull); return NULL; }
+static bool pac_shared_by_threads(void)
+{
+  uint64_t theirs = 0;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, pac_thread_probe, &theirs)) return false;
+  pthread_join(thread, NULL);
+  return theirs == pac_sign(0x0000001234567000ull);
+}
+
+static unsigned user_va_bits(void)
+{
+  static const unsigned candidates[] = { 52, 48, 47, 42, 39, 36 };
+  for (unsigned i = 0; i < sizeof candidates / sizeof *candidates; i++) {
+    void *want = (void *)((1ull << candidates[i]) - 0x10000000ull), *p = mmap(want, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p != MAP_FAILED) { munmap(p, 4096); if (p == want) return candidates[i]; }
+  }
+  return 0;
+}
+
+static void host_facts(void)
+{
+  g_info.abi = XH_ABI_VERSION;
+  g_info.host_page_size = (uint32_t)sysconf(_SC_PAGESIZE);
+  g_info.user_va_bits = user_va_bits();
+  g_info.timebase_hz = xh_counter_hz();
+  bool paca = getauxval(AT_HWCAP) & HWCAP_PACA;
+  bool by_fork = paca && pac_shared_by_fork(), by_thread = paca && pac_shared_by_threads();
+  if (by_fork && by_thread) g_info.features |= XH_FEATURE_PAC;
+  if (prctl(PR_PAC_SET_ENABLED_KEYS, 0, 0, 0, 0) == 0) g_info.features |= XH_FEATURE_PAC_KEYS_OFF;   // a no-op call: only asks
+  LOGI("host: page %u, user VA %u bits, counter %llu Hz, PAC %s%s", g_info.host_page_size, g_info.user_va_bits,
+       (unsigned long long)g_info.timebase_hz, paca ? ((g_info.features & XH_FEATURE_PAC) ? "yes, keys shared across fork and threads" : !by_fork ? "present but keys differ after fork" : "present but keys differ between threads") : "no",
+       (g_info.features & XH_FEATURE_PAC_KEYS_OFF) ? ", per-thread key control" : "");
+}
+#else
+static void host_facts(void)
+{
+  g_info.abi = XH_ABI_VERSION;
+  g_info.host_page_size = (uint32_t)sysconf(_SC_PAGESIZE);
+  g_info.timebase_hz = xh_counter_hz();
+  LOGI("host: not AArch64 Linux: the kernel cannot be entered here");
+}
+#endif
+
+static void gic_line(unsigned cpu, bool line) { xh_cpu_line(cpu, line); }
+
+// The guest's RAM held fixed for the session (ramfix.c, docs/booter.md 2.2 "Fixed RAM"): the kernel is told before it
+// starts (XH_FEATURE_RAM_FIXED: no free pages given back), and the whole memfd is prefaulted, locked where Linux allows
+// and it fits, on a nice-19 thread while the boot goes on. ram-giveback=1: 0058's way, nothing of this.
+static xh_huge_choice huge_choice;     // 2 MiB host pages for the RAM: what xh_huge_choose found (fix-ram-hugepages)
+static xh_ramfix_counters was;         // the `memory: fixed RAM` line's counters at its last line (first: the start)
+static bool have_was;
+
+static void ram_fix_start(void)
+{
+  char facts[400];
+  xh_ramfix_sample(&was);
+  have_was = true;
+  if (config.ram_giveback) {
+    LOGI("memory: ram-giveback=1: the guest's RAM is faulted in as it is used and its free pages are given back (0058); not prefaulted, not locked");
+    return;
+  }
+  g_info.features |= XH_FEATURE_RAM_FIXED;
+  if (!config.ram_prefault) { LOGI("memory: the guest's RAM is held for the session, not prefaulted (ram-prefault=0); free pages are not given back"); return; }
+  xh_ramfix_facts(facts, sizeof facts);
+  g_ramfix.lock = config.ram_lock;
+  g_ramfix.lock_why = config.ram_lock ? NULL : "ram-lock=0";
+  g_ramfix.unlock_below = (uint64_t)config.ram_unlock_below;
+  g_ramfix.meminfo = config.ram_meminfo;
+  // A lock is safe only with room beside it: the RAM must be within what fits (config.c, xh_ram_fit) at the start.
+  if (g_ramfix.lock && config.ram_fit_available && g_mem.size > config.ram_fit) {
+    // Not prefaulted either: an unlocked page iOS has not used is the first the host swaps (PC boot of 2026-11-14).
+    LOGI("memory: the guest's RAM is held for the session: %llu MiB, not locked and not prefaulted (more than fits beside the "
+         "session's needs: %llu MiB); free pages are not given back (ram-giveback=0); %s", (unsigned long long)(g_mem.size >> 20),
+         (unsigned long long)(config.ram_fit >> 20), facts);
+    // No prefault runs: done, so that the `memory: fixed RAM` line says "held, not locked" (it said "prefault running"
+    // for the whole session before 2026-11-15) and the 2 MiB pages line comes at once.
+    __atomic_store_n(&g_ramfix.done, true, __ATOMIC_RELEASE);
+    return;
+  }
+  char valve[160] = "";
+  if (g_ramfix.lock)
+    snprintf(valve, sizeof valve, " (the valve: unlocked once if host MemAvailable falls under %llu MiB, checked once a second)",
+             (unsigned long long)(g_ramfix.unlock_below >> 20));
+  LOGI("memory: the guest's RAM is held for the session: %llu MiB, prefaulted on a thread at nice 19 in %llu MiB steps, %s%s; free pages are "
+       "not given back (ram-giveback=0); %s", (unsigned long long)(g_mem.size >> 20), (unsigned long long)(XH_RAMFIX_STEP >> 20),
+       g_ramfix.lock ? "locked as it goes (mlock)" : g_ramfix.lock_why, valve, facts);
+  if (xh_ramfix_start(&g_ramfix, g_mem.host, g_mem.size, config.ram_meminfo)) LOGE("memory: the guest's RAM is not prefaulted");
+}
+
+// The pool behind /arm-io/virtio-gpu drm-host-pool, as Droid-VM's boards size it (--pre-alloc drm-host-mb=8):
+// drm2kgsl keeps its first 2 MiB unused, the rest holds 16 KiB of response buffer per 3D context.
+#define GPU_POOL_BYTES (8ull << 20)
+// The video encoder's media pool (runtime/bridges/encoder): the V4L2 OUTPUT (NV12) and CAPTURE (bitstream) buffers
+// the guest maps. 48 MiB fits 1080p-class widget/screenshot snapshots across the device's session slots; with the 8
+// MiB GPU pool it stays under the hosted kernel's 64 MiB mappable-pool bound (main.c, the RAM layout).
+#define MEDIA_POOL_BYTES (48ull << 20)
+static void gpu_log(int level, const char *line) { xh_log(level == 0 ? XH_LOG_ERROR : level == 1 ? XH_LOG_INFO : XH_LOG_DEBUG, "%s", line); }
+
+// ---- the host bridges (runtime/bridges): CPU placement, cpufreq, haptics, Bluetooth, network, sound ---
+static br_cpu_plan cpu_plan;
+static br_haptic *haptic;
+static br_camera *camera;          // the camera helper process (runtime/bridges/camera, bin/oneios-camera)
+static br_bright *brightness;     // the panel's backlight and the light sensor (runtime/bridges/brightness)
+// A power-key press from the evdev reader: the touch IC woken (iOS turns its display on or off next).
+static void power_key_pressed(void) { br_bright_key(brightness); }
+static br_battery *battery;       // the phone's battery for iOS (runtime/bridges/battery)
+static br_thermal *thermal;       // the phone's temperatures: iOS's pressure level and xnuhost's CPU step (runtime/bridges/thermal)
+static br_cpu_topology cpu_host;  // the host's CPUs, and the plan as made: the thermal steps narrow it
+static br_cpu_plan cpu_plan_base;
+static bool cpu_planned;
+extern unsigned xh_cpu_place_epoch;   // task.c: an iOS thread is placed again when it runs after this changes
+void xh_sysreg_stats_log(void);       // sysreg.c: the most frequent trapped instructions
+static bool net_up;
+static bool wifi_up;                // wlan0 is the guest's en0 (runtime/bridges/wifi)
+
+static void bridge_log(int level, const char *line) { xh_log(level == 0 ? XH_LOG_ERROR : level == 1 ? XH_LOG_INFO : XH_LOG_DEBUG, "%s", line); }
+
+// bluetooth=sim: the guest's /bluetooth node as with the phone's controller (H4, transport 1), with a made-up address
+// that the stand-in controller (runtime/bridges/bt/hci_sim.c) reports too.
+static void bt_sim_on(xl_machine *m)
+{
+  m->bt_transport = 1;
+  m->bt_speed = 3000000;
+  xl_machine_mac(m, 0, m->bt_mac);
+  br_hci_sim_set_address(m->bt_mac);
+  LOGI("bluetooth: on: a stand-in controller (bluetooth=sim), address %02x:%02x:%02x:%02x:%02x:%02x; no radio, no HAL",
+       m->bt_mac[0], m->bt_mac[1], m->bt_mac[2], m->bt_mac[3], m->bt_mac[4], m->bt_mac[5]);
+}
+// cpu-pin (default on): vCPU `vcpu`'s one host CPU, the rank-th CPU of its plan's mask among the vCPUs of its kind (so
+// the vCPUs of a kind take different CPUs while there are enough). The iOS thread a vCPU runs goes on the same CPU:
+// the hand-off between them is then a switch on one core, not a wake-up of another (docs/booter.md 2.6a: 3 us for a
+// system call there and back against 30 us across cores). Otherwise, and whenever a thermal step leaves fewer CPUs
+// than vCPUs of the kind (br_cpu_pin_mask; before 2026-11-13 they were stacked rank % CPUs, three to a core at
+// "trapping"), the plan's whole mask.
+static uint64_t place_mask(unsigned vcpu)
+{
+  uint64_t mask = __atomic_load_n(&cpu_plan.v[vcpu].affinity, __ATOMIC_ACQUIRE);     // the thermal step may narrow it
+  if (!config.cpu_pin || !mask) return mask;
+  return br_cpu_pin_mask(&cpu_plan, &cpu_plan_base, vcpu);
+}
+static void place(int tid, unsigned vcpu)
+{
+  if (vcpu >= cpu_plan.nvcpu) return;
+  uint64_t mask = place_mask(vcpu);
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (unsigned i = 0; i < 64 && i < CPU_SETSIZE; i++) if (mask >> i & 1) CPU_SET(i, &set);
+  if (sched_setaffinity(tid, sizeof set, &set) && tid == 0) LOGE("cpu: vCPU %u on host CPUs 0x%llx: %s", vcpu, (unsigned long long)mask, strerror(errno));
+}
+static int vcpu_tid(unsigned vcpu) { return vcpu < g_ncpu ? g_vcpu[vcpu].tid : 0; }
+// The thermal bridge's step (br_thermal_cap_for): the vCPUs and the iOS threads they run keep to fewer, slower cores
+// while the phone is hot. Affinities of xnuhost's own threads and its tasks' only: they end with the session, nothing
+// outside the process is written, so a SIGKILL leaves nothing to restore.
+static void thermal_step(void *ctx, const br_thermal_state *state)
+{
+  (void)ctx;
+  if (!cpu_planned) return;
+  br_cpu_plan_cap(&cpu_plan, &cpu_plan_base, &cpu_host, state->cap);
+  __atomic_fetch_add(&xh_cpu_place_epoch, 1, __ATOMIC_ACQ_REL);
+  for (unsigned i = 0; i < cpu_plan.nvcpu; i++) { int tid = vcpu_tid(i); if (tid > 0) place(tid, i); }
+  uint64_t p = cpu_plan.nvcpu ? __atomic_load_n(&cpu_plan.v[cpu_plan.nvcpu - 1].affinity, __ATOMIC_ACQUIRE) : 0;
+  LOGI("thermal: step %u (%s): P vCPUs on host CPUs 0x%llx%s", state->cap, br_thermal_level_name(state->level), (unsigned long long)p,
+       state->cap ? "" : " (all of their kind)");
+}
+// The host's cores as read at start (named files only, runtime/bridges/cpu), what each vCPU is described as to iOS, and the
+// cpuset xnuhost runs in: a cpuset of fewer CPUs (Android's background or system-background) would keep the vCPUs off the
+// X4 and the A720s whatever cpu-pin asks, so its CPUs are said here (host-overhead, 2026-11-15).
+static const char *core_name(unsigned part)
+{
+  return part == 0xd80 ? "Cortex-A520" : part == 0xd81 ? "Cortex-A720" : part == 0xd82 ? "Cortex-X4" : part == 0xd46 ? "Cortex-A510" :
+         part == 0xd4d ? "Cortex-A715" : part == 0xd4e ? "Cortex-X3" : part ? "an Arm core" : "unknown";
+}
+static void read_line(const char *path, const char *key, char *out, size_t size)
+{
+  out[0] = 0;
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  char line[512];
+  while (fgets(line, sizeof line, f)) {
+    if (key && strncmp(line, key, strlen(key))) continue;
+    const char *v = key ? line + strlen(key) : line;
+    while (*v == ' ' || *v == '\t') v++;
+    snprintf(out, size, "%s", v);
+    out[strcspn(out, "\n")] = 0;
+    break;
+  }
+  fclose(f);
+}
+static void log_cpu_layout(const br_cpu_topology *host)
+{
+  for (unsigned c = 0; c < host->ncpu; c++) {
+    const br_host_cpu *h = &host->cpu[c];
+    if (!h->present) continue;
+    LOGI("cpu: host CPU %u: %s (part 0x%x), %c, frequency domain of CPU %u, capacity %u, %u-%u kHz%s%s%.0u", c, core_name(h->part), h->part,
+         h->type, h->policy, h->capacity, h->min_khz, h->max_khz, h->boost_khz ? " (top as a boost frequency)" : "",
+         h->scaling_max_khz && h->scaling_max_khz < h->max_khz ? "; capped now: scaling_max_freq " : "",
+         h->scaling_max_khz && h->scaling_max_khz < h->max_khz ? h->scaling_max_khz : 0);
+  }
+  for (unsigned i = 0; i < cpu_plan.nvcpu; i++)
+    LOGI("cpu: vCPU %u (%c) is described to iOS as host CPU %u: %u-%u kHz, %u table entries, capacity %u", i, cpu_plan.v[i].type,
+         cpu_plan.v[i].host_cpu, cpu_plan.v[i].min_khz, cpu_plan.v[i].max_khz, cpu_plan.v[i].nfreq, cpu_plan.v[i].capacity);
+  char boost[32], cpuset[128], allowed[128];
+  read_line("/sys/devices/system/cpu/cpufreq/boost", NULL, boost, sizeof boost);
+  read_line("/proc/self/cpuset", NULL, cpuset, sizeof cpuset);
+  read_line("/proc/self/status", "Cpus_allowed_list:", allowed, sizeof allowed);
+  LOGI("cpu: xnuhost's cpuset %s, CPUs allowed %s; cpufreq boost %s", cpuset[0] ? cpuset : "(none)", allowed[0] ? allowed : "?",
+       boost[0] ? boost : "(no switch)");
+}
+
+// The clamp of the work on a vCPU (xnuhost.h xh_cpu_uclamp): what the guest's CLPC stand-in asks for it (DroidVMCpufreq's
+// SET_PERF, br_cpufreq_requested) or the GPU path's animation boost (xh_gpu_vcpu_boost), the higher one. thread_run gives it to
+// the iOS thread it releases.
+static br_cpufreq *cpu_freq;
+static unsigned vcpu_uclamp(unsigned vcpu)
+{
+  unsigned want = __atomic_load_n(&xh_gpu_vcpu_boost, __ATOMIC_RELAXED);
+  if (cpu_freq && vcpu < cpu_plan.nvcpu) {
+    unsigned asked = br_cpu_util_for(&cpu_plan, vcpu, br_cpufreq_requested(cpu_freq, vcpu));
+    if (asked > want) want = asked;
+  }
+  return want > 1024 ? 1024 : want;
+}
+static uint64_t cpufreq_read(void *opaque, uint64_t offset, unsigned size) { return br_cpufreq_read(opaque, offset, size); }
+static void cpufreq_write(void *opaque, uint64_t offset, unsigned size, uint64_t value) { br_cpufreq_write(opaque, offset, size, value); }
+
+static bool net_script(const char *verb)
+{
+  char command[700];
+  if (!*config.runtime || snprintf(command, sizeof command, "sh %s/bin/oneios-net.sh %s", config.runtime, verb) >= (int)sizeof command) return false;
+  int status = system(command);
+  if (status) LOGE("network: `oneios-net.sh %s` ended with status %d: the guest has no route out", verb, status);
+  return status == 0;
+}
+
+// ---- the image set (imageset.c): which disk is which volume, and the checks on what the guest reads ----
+static xh_imageset image_set;
+static bool have_image_set;
+static xh_disk_identity disk_identity[XH_MAX_DISKS];
+static char seed_sha256[65];
+
+static int image_set_open(void)
+{
+  const char *error = NULL;
+  int rc = xh_imageset_load(config.image, &image_set, &error);
+  if (rc < 0) { LOGE("image set %s: %s", config.image, error); return -1; }
+  if (rc > 0) { LOGI("image set: no manifest.json in %s: its disks are not verified and carry no identity", config.image); return 0; }
+  have_image_set = true;
+  const xh_imageset_file *seed = xh_imageset_role(&image_set, "data-seed");
+  for (unsigned i = 0; seed && i < 32; i++) snprintf(seed_sha256 + i * 2, 3, "%02x", seed->sha256[i]);
+  // The seed is unpacked by the kernel (0004: its node carries the hash); no helper disk.
+  return 0;
+}
+
+// The identity of disk i in its device tree node; a read-only image of the set gets its chunk checks.
+static int image_set_disk(unsigned i, xh_blk *disk)
+{
+  const char *error = NULL;
+  const xh_disk_config *c = &config.disk[i];
+  xh_disk_identity *id = &disk_identity[i];
+  if (!have_image_set || id->role) return 0;
+  if (c->data_store) {
+    *id = (xh_disk_identity){ .role = "data", .volume_uuid = image_set.data_uuid, .volume_name = image_set.data_name, .sha256_hex = seed_sha256 };
+    return 0;
+  }
+  const xh_imageset_file *f = xh_imageset_find(&image_set, c->path);
+  if (!f || c->writable) return 0;
+  if (!strcmp(f->role, "os") || !strcmp(f->role, "systemos") || !strcmp(f->role, "app")) {
+    xh_verify *verify = xh_verify_open(&image_set, f, &error);
+    if (!verify) { LOGE("disk %s: %s", c->path, error); return -1; }
+    if (xh_blk_bytes(disk) != f->size) { LOGE("disk %s: %llu bytes, manifest.json lists %llu", c->path, (unsigned long long)xh_blk_bytes(disk), (unsigned long long)f->size); return -1; }
+    xh_blk_set_verify(disk, verify);
+    *id = (xh_disk_identity){ .role = f->role, .verified = xh_verify_digest(verify), .volume_uuid = f->volume_uuid };
+  } else if (!strcmp(f->role, "data-seed")) {
+    *id = (xh_disk_identity){ .role = "seed", .bytes = f->size, .sha256_hex = seed_sha256 };
+  }
+  return 0;
+}
+
+// The speaker's output latency for the guest (DroidVMAudio.cpp as staged publishes the boot argument
+// oneios-audio-latency=FRAMES as the device's "output latency"): what the helper measures on its stream before the
+// guest boots (br_audio_probe_latency; the guest's speaker hands each period on as it starts, so nothing is added
+// for the guest), unless the boot arguments already say it. ONEIOS_AUDIO_PROBE=0: no probe, the kernel's default.
+static void audio_latency_arg(const br_audio_backend *audio, void *ctx)
+{
+  const char *given = strstr(config.boot_args, "oneios-audio-latency=");
+  if (given) {
+    unsigned frames = (unsigned)strtoul(given + strlen("oneios-audio-latency="), NULL, 10);
+    br_audio_told(audio, ctx, frames);
+    LOGI("audio: output latency %u frames (%u ms): the boot arguments' oneios-audio-latency, not measured", frames, frames / 48);
+    return;
+  }
+  const char *probe = getenv("ONEIOS_AUDIO_PROBE");
+  if (probe && !strcmp(probe, "0")) { LOGI("audio: ONEIOS_AUDIO_PROBE=0: the kernel's default output latency"); return; }
+  int frames = br_audio_probe_latency(audio, ctx, 2000);
+  if (frames <= 0) { LOGI("audio: speaker latency not measured (%s): the kernel's default output latency", strerror(frames ? -frames : EIO)); return; }
+  size_t used = strlen(config.boot_args);
+  if (snprintf(config.boot_args + used, sizeof config.boot_args - used, "%soneios-audio-latency=%d", used ? " " : "", frames) >=
+      (int)(sizeof config.boot_args - used)) {
+    config.boot_args[used] = 0;
+    LOGE("audio: no room in the boot arguments for oneios-audio-latency=%d: the kernel's default output latency", frames);
+    return;
+  }
+  br_audio_told(audio, ctx, (unsigned)frames);
+  LOGI("audio: speaker latency %d frames (%d ms) measured by the helper: oneios-audio-latency=%d", frames, frames / 48, frames);
+}
+
+static int boot(void)
+{
+  const char *error = NULL;
+  static xl_kernel kernel;
+  size_t image_size = 0;
+  uint8_t *image = read_file(config.kernel, &image_size, 1ull << 31);
+  if (!image) { LOGE("cannot read the kernel collection %s: %s", config.kernel, strerror(errno)); return -1; }
+  if (xl_macho_parse(image, image_size, &kernel, &error)) { LOGE("%s: %s", config.kernel, error); return -1; }
+  LOGI("kernel: %s, %s %s, link base 0x%llx, %u segments, %u members", config.kernel, kernel.fileset ? "collection" : "MH_EXECUTE",
+       kernel.cpusubtype == 2 ? "arm64e" : "arm64", (unsigned long long)kernel.base, kernel.nseg, kernel.nentries);
+  if (kernel.cpusubtype == 2 && !(g_info.features & XH_FEATURE_PAC)) { LOGE("an arm64e kernel needs pointer authentication with keys shared across fork; this host has none"); return -1; }
+
+  // RAM: the kernel's window, then the GPU's pool (the memory of the renderer's that the guest maps: each 3D
+  // context's response buffer), then the video encoder's media pool (its V4L2 OUTPUT/CAPTURE buffers), then the boot
+  // framebuffer the kernel's console draws into. The GPU pool and the media pool both lie between the window's end and
+  // the framebuffer, which the hosted kernel lets a task map (0024-gpu-pool.patch, hosted_pa_in_gpu_pool, up to 64
+  // MiB): GPU_POOL_BYTES + MEDIA_POOL_BYTES must stay under that, so no new pmap patch is needed for the media pool.
+  uint64_t fb_bytes = ((uint64_t)fb_width * fb_height * 4 + 0x1fffff) & ~0x1fffffull;
+  uint64_t pool_bytes = strcmp(config.gpu, "2d") ? GPU_POOL_BYTES : 0;
+  uint64_t media_bytes = strcmp(config.encoder, "off") ? MEDIA_POOL_BYTES : 0;
+  uint64_t window = config.ram_bytes - fb_bytes - pool_bytes - media_bytes;
+  // 2 MiB host pages for the RAM where this kernel allows them (fix-ram-hugepages; ramfix.c xh_huge_choose): shmem THP
+  // by madvise, only with the RAM held fixed (a give-back's pieces would split them).
+  xh_huge_choose("", config.ram_huge && !config.ram_giveback, &huge_choice);
+  if (xh_mem_map(kernel.base, huge_choice.mode == XH_HUGE_SHMEM) || xh_mem_io(XL_BOARD_IO_BASE, XL_BOARD_IO_SIZE)) return -1;
+  if (huge_choice.mode == XH_HUGE_SHMEM && !g_mem.huge)      // the line above it says why (qemu-user refuses the advice)
+    snprintf(huge_choice.why, sizeof huge_choice.why, "no (madvise(MADV_HUGEPAGE) refused)");
+  LOGI("memory: 2 MiB host pages: %s; shmem_enabled %s, hpage_pmd_size %llu, hugetlb pool %llu free of %llu KiB pages; the memfd's "
+       "offset 0 is at 0x%llx, %llu KiB below the window", g_mem.huge ? "yes, the window is mapped with MADV_HUGEPAGE (shmem THP)" : huge_choice.why,
+       *huge_choice.shmem_enabled ? huge_choice.shmem_enabled : "?", (unsigned long long)huge_choice.pmd_size,
+       (unsigned long long)huge_choice.hugetlb_free, (unsigned long long)(huge_choice.hugetlb_size >> 10),
+       (unsigned long long)g_mem.fd_phys, (unsigned long long)(g_mem.head >> 10));
+  uint64_t phys = g_mem.phys;                       // physical = where it is mapped (mem.c)
+  uint64_t media_pool_pa = phys + window + pool_bytes;              // after the GPU pool, before the framebuffer
+  boot_fb_pa = phys + window + pool_bytes + media_bytes;
+  if (xh_mem_kva() == 0) { g_info.kva_base = g_mem.kva; g_info.kva_size = g_mem.kva_size; }
+  LOGI("memory: %llu MiB at 0x%llx, physical = virtual (slide 0x%llx); I/O aperture 0x%llx",
+       (unsigned long long)(window >> 20), (unsigned long long)phys,
+       (unsigned long long)((uintptr_t)g_mem.host - kernel.base), (unsigned long long)(uintptr_t)g_mem.io_host);
+  ram_fix_start();
+
+  // The board: GIC, console, disks, input, display.
+  xl_device_kind kinds[XL_MAX_DEVICES];
+  unsigned ndev = 0;
+  xh_gic_init(config.ncpu, XL_BOARD_GIC_DIST, XL_BOARD_GIC_REDIST);
+  xh_gic_notify = gic_line;
+  xh_gic_map();
+  xh_uart_init(XL_BOARD_UART);
+  if (image_set_open()) return -1;
+  for (unsigned i = 0; i < config.ndisk; i++) {
+    xh_blk *disk = xh_blk_open(&config.disk[i], &error);
+    if (!disk) { LOGE("disk %s: %s (%s)", config.disk[i].path, error, strerror(errno)); return -1; }
+    if (image_set_disk(i, disk)) return -1;
+    if (!xh_virtio_blk_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, disk)) return -1;
+    LOGI("disk %u: %s, %llu MiB, %s%s%s%s", ndev, config.disk[i].path, (unsigned long long)(xh_blk_bytes(disk) >> 20),
+         config.disk[i].data_store ? "Data store" : config.disk[i].writable ? "writable" : "read-only",
+         disk_identity[i].role ? ", role " : "", disk_identity[i].role ? disk_identity[i].role : "", disk_identity[i].verified ? ", chunks verified" : "");
+    kinds[ndev++] = config.disk[i].data_store ? XL_DEV_DATA_STORE : XL_DEV_BLOCK;
+  }
+  xh_virtio *input = xh_virtio_input_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev);
+  kinds[ndev++] = XL_DEV_INPUT;
+  // The pen (pen.c, spen 2026-11-15; pen=off by default): a second input device, /arm-io/input-1, when the host has a pen
+  // digitizer (xh_pen_lookup: read only, never grabbed) or the input script has pen lines. The guest publishes it as
+  // iOS's pencil digitizer with oneios-pen=1, which is added to its command line here unless that already has one.
+  bool script_pen = false;
+  if (xh_input_script_load(config.input_script, &script_pen)) return -1;
+  static xh_input_pen pen;
+  memset(&pen, 0, sizeof pen);
+  pen.device.fd = -1;
+  if (strcmp(config.pen, "off")) {
+    char why[256] = "";
+    if (config.input && xh_pen_lookup(&pen.device, why, sizeof why) == 0) {
+      const char *how = "";
+      pen.rotate = xh_pen_rotation(config.pen_rotate, &pen.device, fb_width, fb_height, &how);
+      pen.mirror = config.pen_mirror;
+      char axes[256];
+      xh_pen_describe(&pen.device, axes, sizeof axes);
+      LOGI("pen: %s \"%s\": read only, not grabbed; %s; turned %u degrees (%s)%s%s%s", pen.device.path, pen.device.name, axes, pen.rotate, how,
+           pen.mirror ? ", mirrored" : "", *why ? "; " : "", why);
+    } else if (config.input) LOGI("pen: none found: %s", why);
+    if (pen.device.fd >= 0 || script_pen) {
+      pen.dev = xh_virtio_input_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev);
+      if (!pen.dev) return -1;
+      xh_pen_guest_device(pen.dev);
+      kinds[ndev++] = XL_DEV_INPUT;
+      if (!strstr(config.boot_args, "oneios-pen=")) {
+        size_t used = strlen(config.boot_args);
+        if (used + 13 >= sizeof config.boot_args) { LOGE("pen: no room in the boot arguments for oneios-pen=1"); return -1; }
+        snprintf(config.boot_args + used, sizeof config.boot_args - used, "%soneios-pen=1", used ? " " : "");
+      }
+      LOGI("pen: the guest's pen device is /arm-io/input-1 (%s)%s", pen.device.fd >= 0 ? "the host's pen" : "the input script's pen",
+           strstr(config.boot_args, "oneios-pen=1") ? "; oneios-pen=1" : "; the command line's oneios-pen= is kept");
+    }
+  } else if (script_pen) LOGI("pen: pen=off: the input script's pen lines are left out");
+  // The GPU: the 2D scanout always; with it the 3D half on the phone's Adreno (drm2kgsl on KGSL), when the host has it.
+  xh_gpu3d *gpu3d = NULL;
+  if (pool_bytes) {
+    const char *why = "";
+    // The GPU's level and priorities (gpu3d_kgsl.c, drm2kgsl patch 0008; docs/gpu.md 2.2b) read these.
+    setenv("ONEIOS_GPU_LEVEL", *config.gpu_level ? config.gpu_level : "deadline", 1);
+    if (!config.gpu_priority) setenv("ONEIOS_GPU_PRIORITY", "off", 1);
+    gpu3d = xh_gpu3d_kgsl_open(g_mem.fd, g_mem.fd_phys, g_mem.head + g_mem.size, xh_ram(phys + window, pool_bytes), phys + window, pool_bytes, gpu_log, &why);   // the memfd from its offset 0 (mem.c)
+    if (!gpu3d && !strcmp(config.gpu, "3d")) { LOGE("gpu: no 3D: %s", why); return -1; }
+    if (!gpu3d) LOGI("gpu: 2D only: %s", why);
+  }
+  if (!input || !xh_virtio_gpu_create_3d(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, fb_width, fb_height, gpu3d)) return -1;
+  kinds[ndev++] = XL_DEV_GPU;
+  // The hardware backend of each bridge (hw-backend, bridges/hw_backend.h): set before any of them opens.
+  br_hw_configure(&config.hw);
+  if (config.input) {
+    // Touch and the side keys: one lookup for both backends (input.c: event0..31 by their capabilities, never grabbed).
+    char touch_why[64], keys_why[64];
+    int touch_hw = br_hw_choose(&config.hw, BR_HW_TOUCH, BR_HW_UNSET, touch_why, sizeof touch_why);
+    int keys_hw = br_hw_choose(&config.hw, BR_HW_KEYS, BR_HW_UNSET, keys_why, sizeof keys_why);
+    LOGI("hw: touch: backend %s (%s); keys: backend %s (%s): the same lookup in both, /dev/input/event0..31 by their "
+         "capabilities, read only, never grabbed", br_hw_name(touch_hw), touch_why, br_hw_name(keys_hw), keys_why);
+  }
+  if (config.input && xh_input_start(input, pen.dev && pen.device.fd >= 0 ? &pen : NULL, fb_width, fb_height)) LOGE("input: could not start; continuing without");
+  if (xh_input_script_start(input, pen.dev && pen.device.fd < 0 ? pen.dev : NULL)) return -1;
+
+  static xl_machine machine;
+  machine.chip_id = 0x8150;
+  if (gpu3d) { machine.gpu_pool_base = phys + window; machine.gpu_pool_size = pool_bytes; }
+  // The guest's unique chip ID: made once, kept with the guest's data, so its MAC addresses and
+  // everything keyed on the ID stay the same across sessions.
+  if (*config.data) {
+    char path[600];
+    size_t size = 0;
+    snprintf(path, sizeof path, "%s/unique-chip-id", config.data);
+    uint8_t *saved = read_file(path, &size, 64);
+    if (saved && size == 8) memcpy(&machine.unique_chip_id, saved, 8);
+    else if (getentropy(&machine.unique_chip_id, 8) == 0) {
+      machine.unique_chip_id &= 0x0000ffffffffffffull;
+      int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+      if (fd >= 0) { (void)!write(fd, &machine.unique_chip_id, 8); close(fd); }
+    }
+    free(saved);
+    machine.have_chip_id = machine.unique_chip_id != 0;
+  }
+
+  // The bridges. Each one whose Linux side is missing says so and is left out; nothing else changes.
+  if (config.bridges) {
+    br_log_sink = bridge_log;
+    br_cpu_topology host;
+    if (br_cpu_read("/sys", &host) == 0 && br_cpu_plan_make(&host, config.ncpu, false, &cpu_plan) == 0) {
+      cpu_host = host;
+      cpu_plan_base = cpu_plan;
+      cpu_planned = true;
+      for (unsigned i = 0; i < config.ncpu; i++) machine.cpu_cluster[i] = cpu_plan.v[i].type;      // E vCPUs first, then P
+      xh_cpu_place = place;
+      br_cpufreq *cpufreq = br_cpufreq_create(&cpu_plan, vcpu_tid);
+      if (cpufreq && xh_mmio_add(&(xh_mmio_region){ .base = XL_BOARD_CPUFREQ, .size = (uint64_t)config.ncpu * BR_CPUFREQ_WINDOW, .name = "cpufreq",
+                                                    .opaque = cpufreq, .read = cpufreq_read, .write = cpufreq_write }) == 0) {
+        machine.cpufreq_base = XL_BOARD_CPUFREQ;
+        machine.cpufreq_size = (uint64_t)config.ncpu * BR_CPUFREQ_WINDOW;
+        cpu_freq = cpufreq;
+      }
+      xh_cpu_uclamp = vcpu_uclamp;
+      LOGI("cpu: %u E + %u P vCPUs on the host's %u E + %u P cores%s", cpu_plan.n_e, cpu_plan.n_p, host.n_e, host.n_p,
+           config.cpu_pin ? "; each vCPU and the iOS thread it runs on one core (cpu-pin=1)" : " (cpu-pin=0: a vCPU on any core of its kind)");
+      if (config.cpu_pin)
+        for (unsigned i = 0; i < config.ncpu; i++) LOGI("cpu%u: host CPU mask 0x%llx", i, (unsigned long long)place_mask(i));
+      log_cpu_layout(&host);
+    } else LOGI("cpu: no host topology under /sys: vCPUs are not placed");
+  }
+  if (!cpu_planned && config.cpu_pin == 2) {
+    // A bench run (make bench-arm64): vCPU i and the iOS thread it runs on host CPU i, as cpu-pin does on the phone.
+    cpu_plan.nvcpu = config.ncpu;
+    for (unsigned i = 0; i < config.ncpu; i++) cpu_plan.v[i].affinity = cpu_plan_base.v[i].affinity = 1ull << (i % 64), cpu_plan_base.v[i].type = 'P';
+    config.cpu_pin = 0;                       // the masks are single CPUs already
+    xh_cpu_place = place;
+    LOGI("cpu: cpu-pin=2: vCPU i and the iOS thread it runs on host CPU i");
+  }
+  if (config.bridges) {
+
+    // Bluetooth: the phone's controller through its HAL (hidl), or none (virtual). auto: hidl when the HAL is
+    // registered; the HAL itself is opened only when bluetoothd connects.
+    bool hidl = !strcmp(config.bluetooth, "hidl"), sim = !strcmp(config.bluetooth, "sim");
+    int hal = 0;
+    if (!strcmp(config.bluetooth, "auto")) { hal = br_hci_hidl_probe(); hidl = hal > 0; }
+    // Haptics: the phone's force-feedback device (auto), none (off), or the stand-in actuator (sim).
+    haptic = !strcmp(config.haptics, "sim") ? br_haptic_open_sim() : !strcmp(config.haptics, "off") ? NULL : br_haptic_open(NULL);
+    if (!haptic && !strcmp(config.haptics, "off")) LOGI("haptics: off (haptics=off): iOS gets no actuator");
+    if (!config.touch_sleep) setenv("ONEIOS_TSP_OFF", "0", 1);   // touch-sleep=0: the bridge reads this
+    brightness = br_bright_open(NULL);
+    if (brightness) xh_input_power_key = power_key_pressed;        // the touch IC is woken at each press
+    battery = br_battery_open(NULL);
+    thermal = br_thermal_open(NULL);
+    if (thermal) br_thermal_on_cap(thermal, thermal_step, NULL);
+    br_bridge_config bridge = { .haptic = haptic, .hci_factory = hidl ? br_hci_open_hidl : sim ? br_hci_open_sim : NULL,
+                                .brightness = brightness, .battery = battery, .thermal = thermal };
+    bool have_bridge = br_bridge_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, &bridge) != NULL;
+    if (have_bridge) kinds[ndev++] = XL_DEV_BRIDGE;
+    if (sim && have_bridge) bt_sim_on(&machine);
+    else if (sim) LOGI("bluetooth: off: no bridge device for the stand-in controller's packets");
+    else if (hidl && have_bridge) {
+      // The phone's controller, H4 over the bridge. bluetoothd's encodings (24A446, read from the binary): 1 H4,
+      // 2 H4DS, 3 H4BC, 10 virtual. Plain H4 is the one UniXNU carries to this bluetoothd over the same Skywalk UART
+      // pipe (drivers/bluetooth/oneios_bt_sk.c); the boot argument bt-transport-override=N tries another.
+      machine.bt_transport = 1;
+      machine.bt_speed = 3000000;
+      bool address = br_bt_address("/mnt/vendor/efs/bluetooth/bt_addr", machine.bt_mac) == 0;
+      if (!address) xl_machine_mac(&machine, 0, machine.bt_mac);
+      LOGI("bluetooth: on: the phone's controller through its HAL%s, address %02x:%02x:%02x:%02x:%02x:%02x%s; the HAL is opened when bluetoothd connects",
+           hal == 11 ? " 1.1" : hal == 10 ? " 1.0" : "", machine.bt_mac[0], machine.bt_mac[1], machine.bt_mac[2], machine.bt_mac[3],
+           machine.bt_mac[4], machine.bt_mac[5], address ? "" : " (made up: /mnt/vendor/efs/bluetooth/bt_addr not read)");
+    } else if (hidl) LOGI("bluetooth: off: no bridge device for the controller's packets");
+    else LOGI("bluetooth: off (%s): iOS gets no controller%s", config.bluetooth,
+              !strcmp(config.bluetooth, "virtual") ? "; bluetooth=hidl in xnuhost.conf (or --bluetooth hidl) for the phone's" : "");
+
+    // The network: the phone's Wi-Fi. wlan0 is iOS's for the session (docs/hardware.md section 3): en0 has wlan0's
+    // address, frames go between them as they are, scans and joins go to the vendor's Wi-Fi stack; no NAT.
+    // wifi=tap: the old route (a tap and oneios-net.sh's NAT), for a bench.
+    br_net_config net;
+    br_net_config_defaults(&net);
+    xl_machine_mac(&machine, 1, net.guest_mac);     // en0 (the tap's; the Wi-Fi's is wlan0's)
+    if (!strcmp(config.wifi, "tap")) {
+      if (br_virtio_net_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, &net, br_net_open_tap)) {
+        kinds[ndev++] = XL_DEV_NET;
+        net_up = net_script("up");                  // address, forwarding and NAT for the tap; undone at stop
+      }
+    } else if (!strcmp(config.wifi, "auto")) {
+      br_net_open_fn wlan = br_wlan_prepare("wlan0", config.session, net.guest_mac);
+      if (wlan && br_virtio_net_create_backend(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, &net, wlan, br_wlan_send)) {
+        kinds[ndev++] = XL_DEV_NET;
+        wifi_up = true;
+      } else if (wlan) br_wlan_close();
+    } else if (strcmp(config.wifi, "sim")) LOGI("wifi: off (wifi=off): iOS gets no network device");
+
+    char helper[600];
+    void *audio_ctx = NULL;
+    const br_audio_backend *audio = NULL;
+    if (*config.runtime && snprintf(helper, sizeof helper, "%s/bin/oneios-audio", config.runtime) < (int)sizeof helper) audio = br_audio_helper(helper, &audio_ctx);
+    if (!audio) audio = br_audio_null(&audio_ctx);
+    if (audio && br_virtio_snd_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, audio, audio_ctx)) {
+      kinds[ndev++] = XL_DEV_SND;
+      audio_latency_arg(audio, audio_ctx);
+    }
+
+    // The camera: a helper process (Android's camera libraries are shared libraries) that opens a camera only
+    // when the guest asks. ONEIOS_CAMERA=0 leaves it out; ONEIOS_CAMERA_BACKEND picks its back end (auto).
+    const char *camera_switch = getenv("ONEIOS_CAMERA");
+    if (ndev < XL_MAX_DEVICES && !(camera_switch && !strcmp(camera_switch, "0")) && *config.runtime &&
+        snprintf(helper, sizeof helper, "%s/bin/oneios-camera", config.runtime) < (int)sizeof helper && access(helper, X_OK) == 0) {
+      camera = br_camera_helper(helper, getenv("ONEIOS_CAMERA_BACKEND"));
+      if (camera && br_camera_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, camera)) kinds[ndev++] = XL_DEV_CAMERA;
+    }
+
+    // The video encoder (encoder=auto): the "droidvm,virtio-media" device over Android's MediaCodec, for iOS's
+    // paravirtualized VideoToolbox encoder (HEIC still images, then video). Off by default until the guest codec
+    // archive lands; both samsung and treble use MediaCodec, so one backend serves both. Its V4L2 buffers live in the
+    // media pool carved above.
+    if (ndev < XL_MAX_DEVICES && media_bytes && *config.runtime &&
+        snprintf(helper, sizeof helper, "%s/bin/oneios-encoder", config.runtime) < (int)sizeof helper && access(helper, X_OK) == 0) {
+      br_hw_select(BR_HW_ENCODER, BR_HW_UNSET);
+      if (br_encoder_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev,
+                            br_encoder_backend_helper(helper), xh_ram(media_pool_pa, media_bytes), media_pool_pa, media_bytes)) {
+        machine.media_pool_base = media_pool_pa;
+        machine.media_pool_size = media_bytes;
+        kinds[ndev++] = XL_DEV_MEDIA;
+        // The guest codec archive publishes iOS's paravirtualized VideoToolbox driver with this boot argument
+        // (DroidVMVTParavirt.cpp); droidvm-media (default on) brings up the transport (DroidVMVirtioMedia.c).
+        if (!strstr(config.boot_args, "droidvm-vt-paravirt=")) {
+          size_t used = strlen(config.boot_args);
+          if (used + 24 < sizeof config.boot_args)
+            snprintf(config.boot_args + used, sizeof config.boot_args - used, "%sdroidvm-vt-paravirt=1", used ? " " : "");
+        }
+      }
+    }
+  }
+
+  // wifi=sim: a made-up radio (runtime/bridges/wifi/sim.c) for a boot with no phone, with the bridges on or off:
+  // the guest's Wi-Fi driver and wifid get two networks to scan and join; no frame goes anywhere.
+  if (!strcmp(config.wifi, "sim") && ndev < XL_MAX_DEVICES) {
+    br_net_config net;
+    br_net_config_defaults(&net);
+    xl_machine_mac(&machine, 1, net.guest_mac);
+    br_net_open_fn sim = br_wifi_sim_prepare(net.guest_mac);
+    if (sim && br_virtio_net_create_backend(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, &net, sim, br_wifi_sim_send))
+      kinds[ndev++] = XL_DEV_NET;
+  }
+
+  // bluetooth=sim and/or haptics=sim with the bridges off (a PC boot): a bridge device that serves only the stand-ins.
+  bool bt_sim = !strcmp(config.bluetooth, "sim"), haptic_sim = !strcmp(config.haptics, "sim");
+  if (!config.bridges && (bt_sim || haptic_sim) && ndev < XL_MAX_DEVICES) {
+    br_log_sink = bridge_log;
+    if (haptic_sim) haptic = br_haptic_open_sim();
+    br_bridge_config bridge = { .haptic = haptic, .hci_factory = bt_sim ? br_hci_open_sim : NULL };
+    if (br_bridge_create(XL_BOARD_VIRTIO + ndev * XL_BOARD_VIRTIO_SIZE, XL_BOARD_VIRTIO_SPI + ndev, &bridge)) {
+      kinds[ndev++] = XL_DEV_BRIDGE;
+      if (bt_sim) bt_sim_on(&machine);
+    } else LOGI("%s: off: no bridge device for the stand-in's messages", bt_sim ? "bluetooth" : "haptics");
+  }
+
+  // clusters=EEPPPPPP: the cluster types by hand (a bench run with no host topology to plan from).
+  for (unsigned i = 0; i < config.ncpu && config.clusters[i]; i++) machine.cpu_cluster[i] = config.clusters[i];
+
+  // The device tree.
+  xl_machine_board(&machine, config.ncpu, kinds, ndev);
+  machine.timebase_hz = (uint32_t)g_info.timebase_hz;
+  machine.dram_base = phys;
+  machine.dram_size = window;
+  machine.model = "iPhone18,2";
+  machine.display_width = fb_width;
+  machine.display_height = fb_height;
+  machine.display_scale = config.scale;
+  machine.display_hz = fb_hz;
+  // Signed text the kernel changes at page-in (/chosen text-fixups): the configured ones, and what the UI scale needs.
+  if (config.scale_fixup)
+    config.text_fixups_length = xh_scale_fixups(have_image_set ? image_set.build : NULL, config.scale, config.text_fixups,
+                                                config.text_fixups_length, sizeof config.text_fixups);
+  if (config.text_fixups_length) {
+    machine.text_fixups = config.text_fixups;
+    machine.text_fixups_length = config.text_fixups_length;
+    unsigned count = 0;
+    for (unsigned i = 0; i < config.text_fixups_length; i++) count += !config.text_fixups[i];
+    LOGI("text fixups: %u for /chosen text-fixups (UI scale @%ux)", count, config.scale);
+  }
+  machine.host_vector = (uint64_t)(uintptr_t)xh_vector();
+  machine.user_va_limit = xh_tasks_va_limit();
+  machine.host_page_size = g_info.host_page_size;
+  if (getentropy(machine.random_seed, sizeof machine.random_seed)) { LOGE("no entropy for the kernel's seed"); return -1; }
+  xl_blob ramdisk = sidecar("ramdisk", 1ull << 30), trust = sidecar("trustcache", 16 << 20), addon = sidecar("gpuaddon", 64 << 20),
+          policies = sidecar("vroot", 128 << 20);
+  // Apple's trust caches of the set (IM4P) and the owner module, as the sidecar the kernel takes, unless one is shipped.
+  if (!trust.data && have_image_set && xh_imageset_find(&image_set, "trust/static.trustcache")) {
+    trust = xh_imageset_trustcaches(&image_set, &error);
+    if (!trust.data) { LOGE("trust caches of %s: %s", config.image, error); return -1; }
+    LOGI("trust caches: %u modules from the image set, %zu bytes", (unsigned)trust.data[0], trust.size);
+  }
+  // The root: the OS volume, matched by its APFS volume UUID.
+  const xh_imageset_file *os = have_image_set ? xh_imageset_role(&image_set, "os") : NULL;
+  if (os && *os->volume_uuid) machine.root_volume_uuid = os->volume_uuid;
+  machine.ramdisk = ramdisk.data != NULL;
+  machine.trust_cache = trust.data != NULL;
+  machine.gpu_addon = addon.data != NULL;
+  machine.root_policies = policies.data != NULL;
+  xl_adt_node *identity = NULL;
+  if (*config.identity) {
+    size_t size = 0;
+    uint8_t *data = read_file(config.identity, &size, 16 << 20);
+    identity = data ? xl_adt_parse(data, size, &error) : NULL;
+    if (!identity) { LOGE("identity tree %s: %s", config.identity, data ? error : strerror(errno)); return -1; }
+    machine.identity = identity;
+  }
+  xl_adt_node *tree = xl_machine_tree(&machine, &error);
+  if (!tree) { LOGE("device tree: %s", error); return -1; }
+  // A device tree shipped beside the kernel replaces the generated one node by node at the top
+  // level, except the nodes that describe this machine.
+  xl_blob shipped = sidecar("adt", 16 << 20);
+  if (shipped.data) {
+    xl_adt_node *other = xl_adt_parse(shipped.data, shipped.size, &error);
+    if (!other) { LOGE("%s.adt: %s", config.kernel, error); return -1; }
+    static const char *const ours[] = { "cpus", "arm-io", "psci", "pram" };
+    for (unsigned i = 0; i < other->nchildren; i++) {
+      const char *name = xl_adt_name(other->children[i]);
+      bool keep = false;
+      for (unsigned k = 0; k < sizeof ours / sizeof *ours; k++) keep |= !strcmp(name, ours[k]);
+      if (keep || !strcmp(name, "chosen")) continue;
+      size_t size = xl_adt_flat_size(other->children[i]);
+      uint8_t *flat = malloc(size);
+      xl_adt_flatten(other->children[i], flat);
+      xl_adt_remove(tree, name);
+      xl_adt_node *copy = xl_adt_parse(flat, size, &error), *slot = xl_adt_add(tree, name);
+      // xl_adt_add made an empty node of that name: fill it from the copy
+      for (unsigned p = 0; copy && p < copy->nprops; p++) xl_adt_set(slot, copy->props[p].name, copy->props[p].value, copy->props[p].length);
+      for (unsigned ch = 0; copy && ch < copy->nchildren; ch++) {
+        size_t csize = xl_adt_flat_size(copy->children[ch]);
+        uint8_t *cflat = malloc(csize);
+        xl_adt_flatten(copy->children[ch], cflat);
+        xl_adt_node *sub = xl_adt_parse(cflat, csize, &error), *into = xl_adt_add(slot, xl_adt_name(copy->children[ch]));
+        for (unsigned p = 0; sub && p < sub->nprops; p++) xl_adt_set(into, sub->props[p].name, sub->props[p].value, sub->props[p].length);
+        xl_adt_free(sub);
+        free(cflat);
+      }
+      xl_adt_free(copy);
+      free(flat);
+    }
+    // /chosen: the shipped properties are added to ours; the machine's own stay.
+    const xl_adt_node *their_chosen = xl_adt_child(other, "chosen");
+    xl_adt_node *chosen = xl_adt_find(tree, "chosen");
+    for (unsigned p = 0; their_chosen && p < their_chosen->nprops; p++)
+      if (!xl_adt_get(chosen, their_chosen->props[p].name))
+        xl_adt_set(chosen, their_chosen->props[p].name, their_chosen->props[p].value, their_chosen->props[p].length);
+    xl_adt_free(other);
+  }
+
+  // Each disk's identity for the kernel's storage (imageset.h).
+  for (unsigned i = 0, blocks = 0; have_image_set && i < config.ndisk; i++) {
+    char name[40];
+    if (config.disk[i].data_store) snprintf(name, sizeof name, "arm-io/data-store");
+    else snprintf(name, sizeof name, "arm-io/virtio-mmio-%u", blocks++);
+    xh_imageset_describe(xl_adt_find(tree, name), &disk_identity[i]);
+  }
+
+  xl_boot_request request = {
+    .image = { image, image_size }, .kernel = &kernel, .ram = g_mem.host, .window = window, .phys_base = phys,
+    .virt_base = (uint64_t)(uintptr_t)g_mem.host, .tree = tree, .command_line = config.boot_args,
+    .video = { boot_fb_pa, 1, (uint64_t)fb_width * 4, fb_width, fb_height, 32 },
+    .legacy_boot_args = config.legacy_boot_args, .ramdisk = ramdisk, .trustcache = trust, .gpu_addon = addon, .root_policies = policies,
+  };
+  xl_boot_layout layout;
+  if (xl_boot_place(&request, &layout, &error)) { LOGE("placing the kernel: %s", error); return -1; }
+  __builtin___clear_cache((char *)g_mem.host, (char *)g_mem.host + layout.used);
+  LOGI("placed: entry 0x%llx, boot_args 0x%llx, device tree %llu bytes, %llu MiB of the window used; boot-args \"%s\"",
+       (unsigned long long)layout.entry_va, (unsigned long long)layout.args_va, (unsigned long long)layout.tree_size,
+       (unsigned long long)(layout.used >> 20), config.boot_args);
+
+  g_info.ncpu = config.ncpu;
+  xh_setway_skip = config.setway_skip != 0;
+  LOGI("cpu: a trapped dc set/way %s (setway-skip=%d)", xh_setway_skip ? "ends the loop of its level at once" : "is one trap per line", xh_setway_skip ? 1 : 0);
+  g_info.ram_phys = phys; g_info.ram_virt = (uint64_t)(uintptr_t)g_mem.host; g_info.ram_size = window;
+  g_info.io_phys = g_mem.io_phys; g_info.io_virt = (uint64_t)(uintptr_t)g_mem.io_host; g_info.io_size = g_mem.io_size;
+  g_info.user_va_min = 0x100000000ull;
+  g_info.user_va_limit = xh_tasks_va_limit();
+  if (xh_tasks_available()) g_info.features |= XH_FEATURE_TASKS;
+  memcpy(g_info.video, request.video, sizeof g_info.video);
+  free(image);
+  xl_adt_free(tree);
+  xl_adt_free(identity);
+
+  if (xh_cpu_init(config.ncpu)) { LOGE("cannot set up %u CPUs", config.ncpu); return -1; }
+  if (!xh_vector()) { LOGE("this build cannot enter the kernel (not AArch64 Linux)"); return -1; }
+  return xh_cpu_start(0, layout.entry_va, layout.args_va, (uint64_t)(uintptr_t)xh_vector(), (uint64_t)(uintptr_t)&g_vcpu[0].cpu);
+}
+
+// A guest restart (PSCI SYSTEM_RESET, XH_HALT_RESTART: iOS restarting itself, or the kernel starting the
+// Data volume over for a new seed) is not the end of the session: for the OneOS fork xnuhost exiting means
+// "back to One UI". xnuhost starts itself again in place, same pid, cgroup and namespace: exec ends every
+// vCPU thread, the tasks went with xh_tasks_shutdown, and every descriptor but the log is closed (the RAM
+// memfd would otherwise stay alive). XNUHOST_RESTARTS counts them: a guest that restarts 8 times in a row
+// without ever getting ready is left, with exit 3.
+static char **start_argv;
+static void guest_restart(void)
+{
+  const char *counted = getenv("XNUHOST_RESTARTS");
+  int n = counted ? atoi(counted) : 0;
+  if (guest_ready) n = 0;
+  if (n >= 8) { LOGE("the guest restarted %d times without getting ready: not starting it again", n); return; }
+  char text[16];
+  snprintf(text, sizeof text, "%d", n + 1);
+  setenv("XNUHOST_RESTARTS", text, 1);
+  LOGI("the guest asked for a restart: starting again (%d)", n + 1);
+#ifdef SYS_close_range
+  if (syscall(SYS_close_range, 3u, ~0u, 0u))
+#endif
+    for (int fd = 3; fd < 4096; fd++) close(fd);
+  // XNUHOST_RUNNER: the emulator xnuhost itself runs under ("qemu-aarch64 -cpu cortex-a710"), which a PC with
+  // no binfmt entry needs in front of the program; unset on the phone.
+  const char *runner = getenv("XNUHOST_RUNNER");
+  if (runner && *runner) {
+    static char words[256];
+    static char *args[64];
+    int n = 0, argc = 0;
+    snprintf(words, sizeof words, "%s", runner);
+    for (char *w = strtok(words, " "); w && n < 8; w = strtok(NULL, " ")) args[n++] = w;
+    while (start_argv[argc]) argc++;
+    if (n && n + argc < 63) {
+      for (int i = 0; i < argc; i++) args[n + i] = start_argv[i];
+      execvp(args[0], args);
+    }
+  }
+  execv("/proc/self/exe", start_argv);
+  LOGE("restart: exec /proc/self/exe: %s", strerror(errno));
+}
+
+// Every 5 s: the guest's RAM that the host swapped out (held, st_blocks, less in the host's RAM, mincore), said in plain
+// words once past 64 MiB and again at each further 256 MiB (xh_swap_note): a swapped page stalls whichever vCPU or task
+// touches it next (the phone, 2026-11-14: 2126 MiB swapped out, Settings frozen). Read only.
+// Cheap (fix-ram-locked, 2026-11-15): while the whole RAM is locked nothing of it can be swapped, so nothing is read at all
+// (before, every 5 s: four /proc files, vmstat twice, and a mincore over all of the guest's RAM, 1.7 million pages at
+// 6.6 GiB); with part of it locked the mincore covers only the rest (ram_resident_from).
+static uint64_t ram_resident_from(uint64_t from)
+{
+  uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+  if (from >= g_mem.size) return g_mem.size;
+  return from + xh_ram_resident(g_mem.host + from, g_mem.size - from, page);
+}
+static bool ram_all_locked(void)
+{
+  return !g_ramfix.unlocked && __atomic_load_n(&g_ramfix.locked, __ATOMIC_RELAXED) == g_mem.size && g_mem.size;
+}
+static void swap_watch(void)
+{
+  static struct timespec last;
+  static uint64_t next, was_ins, was_outs;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  if (last.tv_sec && t.tv_sec - last.tv_sec < 5) return;
+  if (ram_all_locked()) { last.tv_sec = 0; last.tv_nsec = 0; return; }   // the next look (after a valve) starts afresh
+  // The host's swap traffic over the last interval (/proc/vmstat pswpin, pswpout: pages; zram on the phone, where it is
+  // also heat: 2026-11-14, about 9.5 MB/s in and 8 MB/s out while iOS's RAM was swapped).
+  uint64_t now_ins = 0, now_outs = 0;
+  (void)xh_vmstat_swaps(&now_ins, &now_outs);
+  uint64_t seconds = last.tv_sec ? (uint64_t)(t.tv_sec - last.tv_sec) : 0, ins = 0, outs = 0;
+  if (seconds && now_ins >= was_ins && now_outs >= was_outs) {
+    ins = (now_ins - was_ins) / seconds;
+    outs = (now_outs - was_outs) / seconds;
+  }
+  was_ins = now_ins;
+  was_outs = now_outs;
+  last = t;
+  struct stat st;
+  if (g_mem.fd < 0 || !g_mem.host || fstat(g_mem.fd, &st)) return;
+  uint64_t locked = __atomic_load_n(&g_ramfix.locked, __ATOMIC_RELAXED);
+  uint64_t held = (uint64_t)st.st_blocks * 512, in_ram = ram_resident_from(g_ramfix.unlocked ? 0 : locked);
+  uint64_t swapped = held > in_ram ? held - in_ram : 0, total = 0, available = 0;
+  if (!xh_swap_note(swapped, &next)) return;
+  (void)xh_meminfo(config.ram_meminfo, &total, &available);
+  uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+  LOGE("memory: the host swaps iOS's RAM: %llu MiB (host MemAvailable %llu MiB); host swap-ins %llu pages/s (%.1f MB/s), swap-outs "
+       "%llu pages/s (%.1f MB/s)", (unsigned long long)(swapped >> 20), (unsigned long long)(available >> 20), (unsigned long long)ins,
+       (double)(ins * page) / 1e6, (unsigned long long)outs, (double)(outs * page) / 1e6);
+}
+
+// The guest's RAM as chosen (config.c, ram=auto), once at the start.
+static void ram_choice_log(void)
+{
+  // What fits beside the session's needs (config.c xh_ram_fit, 2026-11-14): MemAvailable at the start, less the headroom,
+  // the GPU's allowance and the page tables' share of the guest.
+  char fits[300] = "";
+  if (config.ram_fit_available)
+    snprintf(fits, sizeof fits, "what fits beside the session's needs: %llu MiB (MemAvailable %llu MiB less %llu MiB headroom%s, %llu MiB for the GPU "
+             "and %d%% of the guest for page tables)", (unsigned long long)(config.ram_fit >> 20), (unsigned long long)(config.ram_fit_available >> 20),
+             (unsigned long long)((uint64_t)config.ram_session_reserve >> 20),
+             config.ram_lock_expected ? " with the lock" : config.ram_lock ? " (the lock is not expected to work here)" : "",
+             (unsigned long long)((uint64_t)config.ram_gpu_reserve >> 20), config.ram_pagetable_percent);
+  if (!config.ram_auto_total) {
+    LOGI("memory: the guest gets %llu MiB (ram=%s)%s%s", (unsigned long long)(config.ram_bytes >> 20), config.ram_given ? "SIZE" : "auto: no MemTotal, 4 GiB",
+         *fits ? "; " : "", fits);
+    // A size given by hand that the host cannot hold: Linux will swap the guest (zram), and every page iOS touches there stalls it.
+    if (config.ram_fit_available && config.ram_bytes > config.ram_fit)
+      LOGE("memory: ram=%llu MiB is more than this host can hold without swapping it (%llu MiB fit): the host will swap iOS's RAM; "
+           "give ram=auto or ram=%lluM", (unsigned long long)(config.ram_bytes >> 20), (unsigned long long)(config.ram_fit >> 20),
+           (unsigned long long)((config.ram_fit >> 20) & ~255ull));
+    return;
+  }
+  uint64_t total = config.ram_auto_total, floor = (uint64_t)config.ram_host_floor;
+  static const char *const bound[] = { "?", "the share", "the floor", "what fits" };
+  LOGI("memory: ram=auto: host MemTotal %llu MiB, MemAvailable %llu MiB; the guest gets %llu MiB: the least of %d%% (%llu MiB), "
+       "MemTotal less the host's floor of %llu MiB (%llu MiB) and %s, in 256 MiB steps (%s decides)", (unsigned long long)(total >> 20),
+       (unsigned long long)(config.ram_auto_available >> 20), (unsigned long long)(config.ram_bytes >> 20), config.ram_percent,
+       (unsigned long long)(total / 100 * (unsigned)config.ram_percent >> 20), (unsigned long long)(floor >> 20),
+       (unsigned long long)((total > floor ? total - floor : 0) >> 20), config.ram_fit_on ? fits : "nothing else (ram-fit=0)",
+       bound[config.ram_auto_bound < 4 ? config.ram_auto_bound : 0]);
+}
+
+// Every host-mem-log seconds: what the host has left and how much of the guest's RAM it holds (the memfd's pages that
+// were touched; the guest's free pages that were never touched, or were given back with ram_discard, are not), and what
+// the guest gave back with ram_discard. The
+// host's low-memory killer may end xnuhost when the host runs out: then the watcher returns to One UI. Read only.
+static void host_memory_tick(bool now)
+{
+  static struct timespec last;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  if (config.host_mem_log <= 0 && !now) return;
+  if (!now && last.tv_sec && t.tv_sec - last.tv_sec < config.host_mem_log) return;
+  last = t;
+  // One read of /proc/meminfo for every figure here (before, five: MemTotal and MemAvailable, SwapTotal, SwapFree,
+  // PageTables, and Mlocked in the counters).
+  static const char *const keys[8] = { "MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "PageTables", "Mlocked", "ShmemHugePages",
+                                       "ShmemPmdMapped" };
+  uint64_t mi[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  (void)xh_proc_values(config.ram_meminfo, keys, 8, mi);
+  uint64_t total = mi[0], available = mi[1], swap_total = mi[2], swap_free = mi[3], tables = mi[4];
+  struct stat st;
+  uint64_t held = g_mem.fd >= 0 && fstat(g_mem.fd, &st) == 0 ? (uint64_t)st.st_blocks * 512 : 0;
+  if (!total) return;
+  // What the guest gave back since the start (ram_discard: its free pages, kernel 0058), and the time it took.
+  uint64_t calls = __atomic_load_n(&g_discard.calls, __ATOMIC_RELAXED), bytes = __atomic_load_n(&g_discard.bytes, __ATOMIC_RELAXED);
+  uint64_t failed = __atomic_load_n(&g_discard.failed, __ATOMIC_RELAXED), ns = __atomic_load_n(&g_discard.ns, __ATOMIC_RELAXED);
+  LOGI("memory: host MemAvailable %llu MiB of %llu MiB; the guest's RAM holds %llu of %llu MiB; given back %llu MiB of free pages "
+       "in %llu calls (%llu failed, %llu ms)", (unsigned long long)(available >> 20), (unsigned long long)(total >> 20),
+       (unsigned long long)(held >> 20), (unsigned long long)(g_mem.size >> 20), (unsigned long long)(bytes >> 20),
+       (unsigned long long)calls, (unsigned long long)failed, (unsigned long long)(ns / 1000000));
+  // Where the host's memory is besides (2026-11-13): the guest's RAM that the host swapped out (zram on the phone: every
+  // touch of such a page is a fault in a vCPU or a task that decompresses it), the host's swap in use, and its page
+  // tables (each iOS task is a Linux process mapping the memfd). st_blocks counts a swapped page as held; mincore
+  // does not count it as in RAM. A second line, so that the one above keeps its form for the log tools. The locked part
+  // is resident while VmLck covers it: the mincore looks only at the rest (nothing with the whole RAM locked).
+  xh_ramfix_counters c;
+  xh_ramfix_sample(&c);
+  c.mlocked = mi[5];
+  uint64_t in_ram = g_mem.host ? ram_resident_from(xh_ramfix_unlocked_from(&g_ramfix, c.vm_locked)) : 0;
+  // Since fix-ram-hugepages: xnuhost's own share of the page tables (VmPTE: its window, the kernel's heap mappings; the
+  // rest are the iOS tasks' processes) and the host's 2 MiB shmem folios (all processes; on the phone xnuhost's memfd).
+  LOGI("memory: the guest's RAM: %llu MiB in the host's RAM, %llu MiB swapped out by the host; host swap %llu of %llu MiB used, "
+       "page tables %llu MiB (xnuhost's own %llu MiB); 2 MiB pages: host ShmemHugePages %llu MiB, ShmemPmdMapped %llu MiB",
+       (unsigned long long)(in_ram >> 20), (unsigned long long)((held > in_ram ? held - in_ram : 0) >> 20),
+       (unsigned long long)((swap_total > swap_free ? swap_total - swap_free : 0) >> 20), (unsigned long long)(swap_total >> 20),
+       (unsigned long long)(tables >> 20), (unsigned long long)(c.vm_pte >> 20), (unsigned long long)(mi[6] >> 20), (unsigned long long)(mi[7] >> 20));
+  // The fixed RAM (2026-11-13, ramfix.c): what is held and locked, what was refused, and since the last line the host's
+  // swap traffic (all processes) and this process's faults that needed the host's I/O (a swapped-out page read back).
+  // With the RAM held and locked, `held` stays at the RAM's size, `swapped out` at 0, and the KGSL figures (the host's
+  // own GPU memory for this process, beside the guest's pages the blobs are made of) flat once the UI is up.
+  char kgsl[400] = "";
+  size_t k = xh_kgsl_memory(getpid(), kgsl + 8, sizeof kgsl - 8);
+  if (k) memcpy(kgsl, "; KGSL: ", 8);
+  const char *state = config.ram_giveback ? "given back as freed (ram-giveback=1)" :
+                      !config.ram_prefault ? "held, not prefaulted" :
+                      !__atomic_load_n(&g_ramfix.done, __ATOMIC_ACQUIRE) ? "held, prefault running" :
+                      g_ramfix.unlocked ? "held, unlocked by the valve" : ram_all_locked() ? "held and locked" :
+                      g_ramfix.locked ? "held, locked in part" : "held, not locked";
+  LOGI("memory: fixed RAM: %s; prefaulted %llu of %llu MiB, locked %llu MiB (VmLck; host Mlocked %llu MiB); give-back refused %llu calls; "
+       "since the last line: host swap-ins +%llu, swap-outs +%llu pages, xnuhost major faults +%llu, minor +%llu%s", state,
+       (unsigned long long)(__atomic_load_n(&g_ramfix.prefaulted, __ATOMIC_RELAXED) >> 20), (unsigned long long)(g_mem.size >> 20),
+       (unsigned long long)(c.vm_locked >> 20), (unsigned long long)(c.mlocked >> 20),
+       (unsigned long long)__atomic_load_n(&g_discard_fixed_refused, __ATOMIC_RELAXED),
+       (unsigned long long)(have_was ? c.swap_ins - was.swap_ins : 0), (unsigned long long)(have_was ? c.swap_outs - was.swap_outs : 0),
+       (unsigned long long)(have_was ? c.major_faults - was.major_faults : 0), (unsigned long long)(have_was ? c.minor_faults - was.minor_faults : 0),
+       kgsl);
+  was = c;
+  have_was = true;
+}
+
+// The window's 2 MiB pages (fix-ram-hugepages): once when the prefault is done (or at once without one) and at the stop.
+// smaps_rollup walks every mapping of this process, so not every host-mem-log. ShmemPmdMapped is what xnuhost maps with
+// 2 MiB entries: with shmem THP and the RAM prefaulted, the whole window; the tasks map the same folios 4 KiB at a time.
+static void huge_report(const char *when)
+{
+  uint64_t shmem = 0, file = 0, anon = 0;
+  if (!g_mem.host || !xh_pmd_mapped_self(&shmem, &file, &anon)) return;
+  xh_ramfix_counters c;
+  xh_ramfix_sample(&c);
+  // With 4 KiB entries xnuhost's window alone takes 8 bytes per 4 KiB page: the size / 512 that 2 MiB entries save.
+  LOGI("memory: 2 MiB pages%s: xnuhost maps %llu of %llu MiB of the guest's RAM with 2 MiB entries (ShmemPmdMapped; FilePmdMapped %llu, "
+       "AnonHugePages %llu MiB); its page tables %llu MiB (VmPTE; 4 KiB entries for the whole window would be %llu MiB)", when,
+       (unsigned long long)(shmem >> 20), (unsigned long long)(g_mem.size >> 20), (unsigned long long)(file >> 20), (unsigned long long)(anon >> 20),
+       (unsigned long long)(c.vm_pte >> 20), (unsigned long long)((g_mem.size / 512) >> 20));
+}
+static void huge_tick(void)
+{
+  static bool said;
+  if (said || !g_mem.huge || (config.ram_prefault && !__atomic_load_n(&g_ramfix.done, __ATOMIC_ACQUIRE))) return;
+  said = true;
+  huge_report(config.ram_prefault ? " (the prefault done)" : "");
+}
+
+// Once a second while the guest's RAM is locked: the valve (ramfix.c). On the main thread (nice 0, SCHED_OTHER), so busy
+// vCPUs cannot starve it as they could the prefault's nice-19 thread, where it ran before 2026-11-15. One read of
+// /proc/meminfo a second while locked, nothing otherwise. The munlock it may do (once a session) holds this loop for as
+// long as it takes; the fork's kill is the backstop under everything.
+static void ram_valve_tick(void)
+{
+  static struct timespec last;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  if (last.tv_sec && t.tv_sec == last.tv_sec) return;
+  last = t;
+  uint64_t available = 0;
+  if (xh_ramfix_valve_tick(&g_ramfix, g_mem.host, &available))
+    LOGE("memory: host MemAvailable %llu MiB is under ram-unlock-below (%llu MiB): the guest's RAM is unlocked for the rest of "
+         "the session; the host may swap it now (it stays held, nothing is given back)", (unsigned long long)(available >> 20),
+         (unsigned long long)(g_ramfix.unlock_below >> 20));
+}
+
+// Every usb-log seconds (3): the phone's USB gadget, logged at the start and whenever it changed (usb.c). From the
+// main thread, which is not a realtime one: three property serials and one named sysfs file a poll. Read only.
+static xh_usb_watch usb_watch;
+static void usb_tick(bool now, const char *when)
+{
+  static struct timespec last;
+  struct timespec t;
+  if (config.usb_log <= 0) return;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  if (!now && last.tv_sec && t.tv_sec - last.tv_sec < config.usb_log) return;
+  last = t;
+  if (xh_usb_poll(&usb_watch, xh_usb_bionic()) || now) LOGI("%s%s", usb_watch.line, when);
+}
+
+int main(int argc, char **argv)
+{
+  start_argv = argv;
+#if defined(__ANDROID__) && defined(__aarch64__)
+  // Before any thread exists: bionic gives each new thread of a program with target SDK >= 31 its own
+  // APIA key. The kernel's vCPUs and the tasks need one key set (pac_shared_by_threads).
+  android_set_application_target_sdk_version(30);
+#endif
+  xh_config_defaults(&config);
+  if (xh_config_args(&config, argc, argv) || xh_config_finish(&config)) return EXIT_SETUP;
+  xh_log_open(NULL, config.log_level);
+  LOGI("xnuhost: session ABI %d, mode %s, pid %d", config.session_abi, config.mode, getpid());
+  host_facts();
+  if (!config.selftest) ram_choice_log();
+  if (!config.selftest) usb_tick(true, "");
+  if (config.selftest) {
+    // What must hold on a phone before anything else is worth trying.
+    bool ok = g_info.host_page_size <= 16384 && g_info.user_va_bits >= 39 && (g_info.features & XH_FEATURE_PAC);
+    int fd = (int)syscall(SYS_memfd_create, "xnuhost-selftest", 0u);
+    void *x = fd >= 0 && ftruncate(fd, 16384) == 0 ? mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_SHARED, fd, 0) : MAP_FAILED;
+    LOGI("selftest: executable shared memfd mapping: %s", x != MAP_FAILED ? "yes" : strerror(errno));
+    xh_mem_map_limit();
+    ok = ok && x != MAP_FAILED;
+    if (xh_mem_create(64 << 20) == 0 && xh_tasks_init(&config) == 0) {
+      LOGI("selftest: task factory: started; system-call trapping (seccomp): %s", xh_tasks_seccomp() ? "yes" : "NO");
+      ok = ok && xh_tasks_seccomp();
+      xh_tasks_shutdown();
+    } else ok = false;
+    LOGI("selftest: %s", ok ? "this host can run xnuhost" : "this host lacks something xnuhost needs (see above)");
+    return ok ? 0 : 1;
+  }
+
+  // Order matters: the RAM memfd and the task factory come first, while this process is still
+  // single-threaded and has nothing of the guest mapped.
+  xh_mem_map_limit();
+  if (xh_mem_create(config.ram_bytes)) return EXIT_SETUP;
+  if (config.tasks && xh_tasks_init(&config)) return EXIT_SETUP;
+
+  // Signals: the main thread waits for the stop signals; every thread started from here on
+  // inherits them blocked. vCPU threads open the ones they take themselves.
+  sigset_t stops;
+  sigemptyset(&stops);
+  sigaddset(&stops, SIGTERM); sigaddset(&stops, SIGINT); sigaddset(&stops, SIGHUP); sigaddset(&stops, SIGQUIT);
+  for (int s = SIGRTMIN; s <= SIGRTMIN + 3; s++) sigaddset(&stops, s);
+  pthread_sigmask(SIG_BLOCK, &stops, NULL);
+  signal(SIGPIPE, SIG_IGN);
+
+  if (*config.session) {
+    char pid[32];
+    snprintf(pid, sizeof pid, "%d\n", getpid());
+    session_file("xnuhost.pid", pid);
+  }
+  if (xh_display_init(&config, &fb_width, &fb_height, &fb_hz)) return EXIT_SETUP;
+  // The display driver's scale and refresh rate go on the kernel's command line (a value given there stays).
+  if (xh_display_boot_args(config.boot_args, sizeof config.boot_args, config.scale, fb_hz, config.display_format)) { LOGE("no room in the boot arguments for the display's switches"); return EXIT_SETUP; }
+  // 24A446's bluetoothd with the virtual machine hidden takes its chip path and dies (SIGSEGV at 0x350) in a loop that
+  // launchd then throttles for 1200 s (phone and PC, 2026-11-14; docs/hardware.md 4): said, not changed. [I] Its chip
+  // factory finds no chip for transport-encoding 1 outside a VM (only transport 9 or a product of its table gives one),
+  // and 0x350 is a field of the chip object it then reads through a null pointer.
+  if (xh_boot_args_hides_vmm_from(config.boot_args, "bluetoothd"))
+    LOGE("boot arguments: owner-hide-vmm names bluetoothd: it crashes in a loop that way (docs/hardware.md 4); take it out");
+  // bt-transport-override=10 hands bluetoothd its own simulated controller (BTVC: the transport's write goes to an object
+  // in bluetoothd's own process, which answers the commands itself): nothing reaches the kernel's transport or the phone's
+  // controller, and on the phone (main 3233fed, 2026-11-15) bluetoothd then exited(1) after 56 s, again and again.
+  if (xh_boot_args_bt_transport(config.boot_args) == 10)
+    LOGE("boot arguments: bt-transport-override=10 gives bluetoothd its own simulated controller, in its own process: "
+         "nothing reaches the phone's controller (docs/hardware.md 4); take it out");
+  xh_perf_init(&config);
+  if (boot()) { xh_tasks_shutdown(); return EXIT_SETUP; }
+
+  sigset_t waited;
+  sigemptyset(&waited);
+  sigaddset(&waited, SIGTERM); sigaddset(&waited, SIGINT); sigaddset(&waited, SIGHUP); sigaddset(&waited, SIGQUIT);
+  // The return's graceful shutdown (docs/booter.md "The return"): the first stop signal, when iOS is up and
+  // return-graceful-ms > 0, asks iOS to power off and keeps the vCPUs running up to an absolute deadline; then the
+  // stop below runs as always. A panic (it sets stop directly, not through a signal), a second signal, the guest
+  // halting itself, or the deadline all leave the wait at once. The way back never depends on any of this: the
+  // deadline is ours, and the fork's SIGKILL is the backstop under everything.
+  xh_return_state ret;
+  xh_return_init(&ret);
+  while (!xh_stopping()) {
+    struct timespec tick = { 0, 100 * 1000 * 1000 };
+    int signo = sigtimedwait(&waited, NULL, &tick);
+    if (signo == SIGQUIT) { xh_cpu_dump_all(); xh_tasks_dump(); xh_sysreg_stats_log(); xh_perf_log(true); continue; }      // debugging: where each vCPU is
+    if (signo > 0) {
+      switch (xh_return_on_signal(&ret, config.return_graceful_ms, guest_ready, xh_mono_ms())) {
+      case XH_RETURN_GRACEFUL: {
+        bool asked = br_bridge_request_shutdown();
+        LOGI("return: graceful shutdown asked%s; iOS has up to %d ms", asked ? "" : " (no bridge; nothing to ask, will time out)", config.return_graceful_ms);
+        break;
+      }
+      case XH_RETURN_STOP_SECOND:
+        LOGI("return: second request while shutting down; stopping now");
+        xh_stop(XH_HALT_OFF, 0, "second return request");
+        break;
+      case XH_RETURN_STOP_NOW: {
+        char why[48];
+        snprintf(why, sizeof why, "signal %d", signo);
+        xh_stop(XH_HALT_OFF, 0, why);
+        break;
+      }
+      }
+    }
+    if (xh_return_expired(&ret, xh_mono_ms())) {
+      LOGI("return: graceful shutdown timed out after %llu ms; stopping", (unsigned long long)xh_return_elapsed_ms(&ret, xh_mono_ms()));
+      xh_stop(XH_HALT_OFF, 0, "graceful shutdown timed out");
+    }
+    xh_perf_tick();                         // "perf:" lines every perf-log seconds
+    host_memory_tick(false);                // "memory: host MemAvailable" every host-mem-log seconds
+    swap_watch();                           // "memory: the host swaps iOS's RAM" when it does (nothing while all is locked)
+    ram_valve_tick();                       // the lock's valve, once a second while locked
+    huge_tick();                            // "memory: 2 MiB pages (the prefault done): ..." once
+    usb_tick(false, "");                    // "usb: state ..." when the USB gadget changed
+    ready_tick();                           // session/ready for an iOS that only draws black (ready-content-wait)
+    // Until the guest's display driver presents a frame of its own, show what its kernel console draws (not until
+    // ready: between its first frame and ready the frames are the guest's, and the console must not be copied over them).
+    bool console = !guest_ready && !__atomic_load_n(&guest_drawing, __ATOMIC_ACQUIRE);
+    xh_display *d = xh_display_get();
+    uint8_t *fb = xh_ram(boot_fb_pa, (uint64_t)fb_width * fb_height * 4);
+    if (console && d && fb && d->format == XH_PIXELS_BGRX8 && memcmp(d->pixels, fb, (size_t)d->stride * d->height)) {
+      memcpy(d->pixels, fb, (size_t)d->stride * d->height);
+      xh_display_flush(0, 0, d->width, d->height);
+    } else if (console && d && fb && d->format == XH_PIXELS_RGBA16F && d->width == fb_width && d->height == fb_height) {
+      // A half-float frame (display-format=rgba16f): the console's B,G,R,X bytes are compared with the last ones seen
+      // and decoded to linear light when they changed.
+      static uint8_t *seen;
+      size_t bytes = (size_t)fb_width * fb_height * 4;
+      if (!seen) seen = calloc(1, bytes);
+      if (seen && memcmp(seen, fb, bytes)) {
+        memcpy(seen, fb, bytes);
+        for (unsigned y = 0; y < d->height; y++)
+          xh_pixels_bgrx8_to_rgba16f(d->pixels + (size_t)y * d->stride, seen + (size_t)y * fb_width * 4, d->width);
+        xh_display_flush(0, 0, d->width, d->height);
+      }
+    }
+  }
+  // A return was asked: a guest-initiated restart in the window is iOS finishing its shutdown, not a reboot to re-run
+  // in place. Take it as the return (exit 0), so the fork's watcher goes back to One UI instead of xnuhost re-exec'ing.
+  if (ret.active && stop_state.reason == XH_HALT_RESTART) {
+    LOGI("return: the guest restarted during the graceful shutdown; taking it as the return");
+    stop_state.reason = XH_HALT_OFF;
+  }
+  // The guest shut itself down inside the window (its kernel's PSCI SYSTEM_OFF or halt set the stop): say how long it
+  // took. A timeout or a second request logged its own line above; a panic took the panic path (reason PANIC).
+  if (ret.active && stop_state.reason != XH_HALT_PANIC && strcmp(stop_state.why, "graceful shutdown timed out") != 0 &&
+      strcmp(stop_state.why, "second return request") != 0)
+    LOGI("return: iOS shut down in %llu ms", (unsigned long long)xh_return_elapsed_ms(&ret, xh_mono_ms()));
+
+  LOGI("stopping: %s (reason %u, code %u)", stop_state.why, stop_state.reason, stop_state.code);
+  host_memory_tick(true);
+  if (g_mem.huge) huge_report(" at the stop");
+  usb_tick(true, " (at the stop)");
+  for (unsigned i = 0; i < g_ncpu; i++)
+    LOGI("cpu%u: %s, %llu interrupts (%llu timer, %llu IPI acknowledged, %llu re-raised), %llu device accesses, %llu emulated instructions, %llu task traps", i,
+         g_vcpu[i].started ? "started" : "never started",
+         (unsigned long long)g_vcpu[i].stat_irqs, (unsigned long long)g_vcpu[i].stat_timer, (unsigned long long)g_vcpu[i].stat_sgi,
+         (unsigned long long)g_vcpu[i].stat_reraised, (unsigned long long)g_vcpu[i].stat_mmio, (unsigned long long)g_vcpu[i].stat_sysreg,
+         (unsigned long long)g_vcpu[i].stat_traps);
+  xh_sysreg_stats_log();                    // which trapped instructions kept the vCPUs busy
+  xh_perf_log(true);                        // what the trap path cost, step by step (perf.c)
+  // Debugging aid: XNUHOST_DUMP=FILE writes the first 64 MiB of the kernel's window at the stop (XNUHOST_DUMP_MB=N
+  // for more: a kernel collection's data is past 64 MiB).
+  if (getenv("XNUHOST_DUMP")) {
+    FILE *dump = fopen(getenv("XNUHOST_DUMP"), "wb");
+    uint64_t limit = (uint64_t)(getenv("XNUHOST_DUMP_MB") ? strtoul(getenv("XNUHOST_DUMP_MB"), NULL, 0) : 64) << 20;
+    if (dump) { fwrite(g_mem.host, 1, g_mem.size < limit ? g_mem.size : limit, dump); fclose(dump); }
+  }
+  xh_tasks_shutdown();
+  if (haptic) br_haptic_close(haptic);      // stops the motor
+  if (camera) br_camera_close(camera);      // the helper closes the camera and exits
+  if (brightness) br_bright_close(brightness);      // One UI's backlight level again, the light sensor as it was
+  if (battery) br_battery_close(battery);           // read only: the worker stops
+  if (thermal) br_thermal_close(thermal);           // read only; the step was affinities of our own threads
+  if (wifi_up) br_wlan_close();                     // the network left, the supplicant and wlan0 as One UI left them
+  if (net_up) net_script("down");
+  xh_input_script_stop();
+  xh_input_stop();
+  xh_display_close();
+  sync();                                   // the Data store's pages
+  // The RAM goes back to the host at once with this process (its last mapping and descriptor: the tasks and the factory
+  // are gone already); a kill does the same. Nothing to undo: mlock ends with the mapping.
+  xh_ramfix_stop(&g_ramfix);
+  LOGI("memory: the guest's RAM: %llu MiB held to the end, %llu MiB of it locked; the exit gives all of it back to the host",
+       (unsigned long long)(g_mem.size >> 20), (unsigned long long)(__atomic_load_n(&g_ramfix.locked, __ATOMIC_RELAXED) >> 20));
+  if (stop_state.reason == XH_HALT_RETURN) session_file("return.request", "the guest asked to return\n");
+  if (stop_state.reason == XH_HALT_RESTART) guest_restart();     // returns only if it could not
+  int code = stop_state.reason == XH_HALT_RESTART ? EXIT_RESTART : stop_state.reason == XH_HALT_PANIC ? EXIT_PANIC :
+             stop_state.code ? EXIT_PANIC : EXIT_GUEST_OFF;
+  LOGI("exit %d", code);
+  _exit(code);
+}

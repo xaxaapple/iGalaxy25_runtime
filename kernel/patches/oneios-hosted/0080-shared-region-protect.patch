@@ -1,0 +1,578 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -368,6 +368,11 @@
+  * Turn TTBR0 walks on at the user range. The caller has pointed TTBR0 at the empty table
+  * (or a user root), so no walk sees a table of the boot format.
+  */
++#if XNU_HOSTED
++/* 0080: in hosted_pmap.h, which is included at the end of this file */
++static bool hosted_protect_changes(pmap_t pmap, pt_entry_t before, pt_entry_t after);
++#endif /* XNU_HOSTED */
++
+ MARK_AS_PMAP_TEXT void
+ pmap_apply_user_tcr(void)
+ {
+@@ -5612,6 +5617,9 @@
+ 	const uint64_t pmap_page_size = PAGE_RATIO * pt_attr_page_size(pt_attr);
+ 	vm_map_address_t va = start;
+ 	unsigned int npages = 0;
++#if XNU_HOSTED
++	vm_map_address_t hosted_changed_lo = end, hosted_changed_hi = start;   /* 0080 */
++#endif /* XNU_HOSTED */
+ 
+ 	pmap_lock(pmap, PMAP_LOCK_EXCLUSIVE);
+ 
+@@ -5769,6 +5777,12 @@
+ 				need_strong_sync = true;
+ 			}
+ #endif /* HAS_FEAT_XS */
++#if XNU_HOSTED
++			if (hosted_protect_changes(pmap, spte, tmplate)) {
++				hosted_changed_lo = va < hosted_changed_lo ? va : hosted_changed_lo;
++				hosted_changed_hi = va + pmap_page_size;
++			}
++#endif /* XNU_HOSTED */
+ 
+ 			write_pte_fast(pte_p, tmplate);
+ 
+@@ -5778,7 +5792,20 @@
+ 			}
+ 		}
+ 		FLUSH_PTE_STRONG();
++#if XNU_HOSTED
++		/*
++		 * OneiOS hosted (0080): the TLB is the tasks' host mappings and a flush unmaps them (hosted_pmap.h), so a
++		 * flush of entries that did not change costs a fault on each of their pages the next time they are used.
++		 * Only the span of the entries whose host protection or page changed is flushed. vm_map_protect asks for the
++		 * new protection minus write when it adds write (dyld's protected memory each time it is made writable): no
++		 * entry changes then, and the whole range was unmapped and faulted in again for nothing.
++		 */
++		if (hosted_changed_hi > hosted_changed_lo) {
++			PMAP_UPDATE_TLBS(pmap, hosted_changed_lo, hosted_changed_hi, need_strong_sync, true);
++		}
++#else
+ 		PMAP_UPDATE_TLBS(pmap, start, va, need_strong_sync, true);
++#endif /* XNU_HOSTED */
+ 	} else {
+ 		va = end;
+ 	}
+diff --git a/osfmk/arm64/hosted/hosted_pmap.h b/osfmk/arm64/hosted/hosted_pmap.h
+--- a/osfmk/arm64/hosted/hosted_pmap.h
++++ b/osfmk/arm64/hosted/hosted_pmap.h
+@@ -150,6 +150,8 @@
+ 	return false;
+ }
+ 
++void hosted_top_note_unmap(pmap_t pmap);       /* 0080, hosted_user.c */
++
+ /* 0045: where the user unmaps come from: a flush of the task's own pmap, a flush of the shared region or commpage
+  * sent to it, and the tasks such a flush skipped because they never filled in that range. */
+ static struct {
+@@ -245,6 +247,35 @@
+ 	return prot;
+ }
+ 
++/*
++ * 0080: whether pmap_protect's new entry must be flushed: what the host maps for it (the page, hosted_pte_prot) changed.
++ * An entry whose host mapping is still right keeps it. oneios-protect-flush-all=1 flushes every entry of the range, as
++ * before 0080 (for a comparison). hosted_protect_kept counts the entries left mapped.
++ */
++static TUNABLE(uint32_t, hosted_protect_flush_all, "oneios-protect-flush-all", 0);
++static uint64_t hosted_protect_kept, hosted_protect_flushed;
++
++static bool
++hosted_protect_changes(pmap_t pmap, pt_entry_t before, pt_entry_t after)
++{
++	bool user = pmap != kernel_pmap;
++	if (hosted_protect_flush_all != 0 || pte_to_pa(before) != pte_to_pa(after) ||
++	    hosted_pte_prot(before, user) != hosted_pte_prot(after, user)) {
++		os_atomic_inc(&hosted_protect_flushed, relaxed);
++		return true;
++	}
++	os_atomic_inc(&hosted_protect_kept, relaxed);
++	return false;
++}
++
++void hosted_pmap_protect_stats(uint64_t out[2]);
++void
++hosted_pmap_protect_stats(uint64_t out[2])
++{
++	out[0] = os_atomic_load(&hosted_protect_flushed, relaxed);
++	out[1] = os_atomic_load(&hosted_protect_kept, relaxed);
++}
++
+ static inline bool
+ hosted_pa_in_window(pmap_paddr_t pa)
+ {
+@@ -901,6 +932,7 @@
+ 	if (pmap->hosted_task != 0) {
+ 		(void)HPC(task_unmap, pmap->hosted_task, va, size, 0, 0);
+ 		os_atomic_inc(&hosted_pmap_stats.user_unmaps, relaxed);
++		hosted_top_note_unmap(pmap);    /* 0080: oneios-top's "own unmaps" (hosted_user.c) */
+ 		hosted_check_unmapped(pmap, va, size);
+ 		/* 0050: the fault-around windows the flush touches are to be done again */
+ 		for (unsigned i = 0; i < sizeof(pmap->hosted_around) / sizeof(pmap->hosted_around[0]); i++) {
+diff --git a/osfmk/arm64/hosted/hosted_user.c b/osfmk/arm64/hosted/hosted_user.c
+--- a/osfmk/arm64/hosted/hosted_user.c
++++ b/osfmk/arm64/hosted/hosted_user.c
+@@ -51,6 +51,7 @@
+ #if XNU_HOSTED
+ 
+ #include <arm64/hosted/hosted.h>
++#include <mach/shared_region.h>         /* 0080 */
+ 
+ extern void sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, bool did_initiate_panic_lockdown);
+ extern void psignal(void *, int);
+@@ -137,11 +138,174 @@
+ 		out->fill_t += c->fill_t;
+ 	}
+ }
++static uint32_t hosted_perf_every = 30;
++
++/*
++ * 0080, oneios-top=N (default 6; 0 = off; only with oneios-perf): the N processes whose traps took the kernel most time
++ * in each oneios-perf period, one `oneios-top:` line each: their traps and kernel time, the faults that went to
++ * vm_fault and the fills from the tables, the host unmap orders of their own address space made in their own context,
++ * their most used system calls and Mach traps, and their vm_protect calls (those in the shared region, and the
++ * shared-region unnests they caused). oneios-perf says how much; this says who. A slot per process (by pid), claimed at
++ * its first trap of the period; the report takes the table and clears it. Counters of a slot reclaimed during the
++ * report may go to the next period: a report, not an exact sum.
++ */
++#define HOSTED_TOP_SLOTS 256
++#define HOSTED_TOP_CALLS 16
++struct hosted_top_slot {
++	int32_t  pid;                           /* 0: free */
++	char     name[20];
++	uint64_t traps, ticks;                  /* every trap counted by oneios-perf, and its time */
++	uint64_t vm_faults, vm_fault_ticks, fills, unmaps;
++	uint64_t protects, sr_protects, unnests;
++	uint32_t call[HOSTED_TOP_CALLS];        /* kind << 16 | number, + 1; 0: free */
++	uint64_t call_n[HOSTED_TOP_CALLS], call_t[HOSTED_TOP_CALLS];
++	uint64_t sr_pc, sr_lr, sr_prot;         /* the last shared-region vm_protect: where the call came from */
++};
++static struct hosted_top_slot hosted_top[HOSTED_TOP_SLOTS];
++static uint32_t hosted_top_lines = 6;
++static uint64_t hosted_top_unnests, hosted_top_sr_protects, hosted_top_sr_noops;
++
++struct proc;
++extern int proc_pid(struct proc *);
++extern const char *proc_best_name(struct proc *);
++
++/* The slot of the current thread's process; NULL for the kernel's threads, when off, or when the table is full. */
++static struct hosted_top_slot *
++hosted_top_slot(void)
++{
++	if (hosted_top_lines == 0 || hosted_perf_every == 0) {
++		return NULL;
++	}
++	task_t task = current_task();
++	struct proc *p = task != TASK_NULL && task != kernel_task ? (struct proc *)get_bsdtask_info(task) : NULL;
++	int32_t pid = p != NULL ? proc_pid(p) : 0;
++	if (pid <= 0) {
++		return NULL;
++	}
++	unsigned h = ((uint32_t)pid * 2654435761u) % HOSTED_TOP_SLOTS;
++	for (unsigned i = 0; i < 16; i++) {
++		struct hosted_top_slot *s = &hosted_top[(h + i) % HOSTED_TOP_SLOTS];
++		int32_t now = os_atomic_load(&s->pid, relaxed);
++		if (now == pid) {
++			return s;
++		}
++		if (now == 0 && os_atomic_cmpxchg(&s->pid, 0, pid, relaxed)) {
++			strlcpy(s->name, proc_best_name(p), sizeof(s->name));
++			return s;
++		}
++	}
++	return NULL;
++}
++
++static void
++hosted_top_call(struct hosted_top_slot *s, uint32_t key, uint64_t ticks)
++{
++	for (unsigned i = 0; i < HOSTED_TOP_CALLS; i++) {
++		uint32_t now = os_atomic_load(&s->call[i], relaxed);
++		if (now == 0 && !os_atomic_cmpxchg(&s->call[i], 0u, key, relaxed)) {
++			now = os_atomic_load(&s->call[i], relaxed);
++		} else if (now == 0) {
++			now = key;
++		}
++		if (now == key) {
++			os_atomic_inc(&s->call_n[i], relaxed);
++			os_atomic_add(&s->call_t[i], ticks, relaxed);
++			return;
++		}
++	}
++}
++
++/* hosted_pmap.h: a host unmap order for pmap's task (own: the pmap is the current thread's) */
++void hosted_top_note_unmap(pmap_t pmap);
++void
++hosted_top_note_unmap(pmap_t pmap)
++{
++	if (current_task() != kernel_task && pmap == get_task_pmap(current_task())) {
++		struct hosted_top_slot *s = hosted_top_slot();
++		if (s != NULL) {
++			os_atomic_inc(&s->unmaps, relaxed);
++		}
++	}
++}
++
++/*
++ * vm_map.c's vm_map_protect: a user call on its own map. The first 24 in the shared region of each boot are printed
++ * with where they came from (saved pc and lr, then four return addresses up the frame pointers: oneios-tool sym names
++ * them), as `oneios-srprot:` lines; noop says that 0080 found nothing to change and so left the region nested.
++ */
++extern bool hosted_shared_region_ready;
++
++void hosted_top_note_protect(vm_map_t map, uint64_t start, uint64_t end, uint32_t prot, bool set_max, bool noop);
++void
++hosted_top_note_protect(vm_map_t map, uint64_t start, uint64_t end, uint32_t prot, bool set_max, bool noop)
++{
++	static uint32_t printed;
++	if (!hosted_shared_region_ready || current_task() == kernel_task || map != current_map()) {
++		return;
++	}
++	struct hosted_top_slot *s = hosted_top_slot();
++	bool sr = start < SHARED_REGION_BASE_ARM64 + SHARED_REGION_SIZE_ARM64 && end > SHARED_REGION_BASE_ARM64;
++	arm_saved_state_t *state = get_user_regs(current_thread());
++	if (s != NULL) {
++		os_atomic_inc(&s->protects, relaxed);
++	}
++	if (!sr) {
++		return;
++	}
++	os_atomic_inc(noop ? &hosted_top_sr_noops : &hosted_top_sr_protects, relaxed);
++	uint64_t pc = state ? get_saved_state_pc(state) & 0x7fffffffffffULL : 0;
++	uint64_t lr = state ? get_saved_state_lr(state) & 0x7fffffffffffULL : 0;
++	if (s != NULL) {
++		os_atomic_inc(&s->sr_protects, relaxed);
++		s->sr_pc = pc;
++		s->sr_lr = lr;
++		s->sr_prot = prot | (set_max ? 0x100 : 0) | (noop ? 0x200 : 0);
++	}
++	if (os_atomic_inc_orig(&printed, relaxed) >= 24 || state == NULL || !ml_get_interrupts_enabled() ||
++	    get_preemption_level() != 0) {
++		return;
++	}
++	char line[4 * 16 + 1];
++	unsigned used = 0;
++	uint64_t fp = get_saved_state_fp(state);
++	line[0] = 0;
++	for (int depth = 0; depth < 4 && fp != 0 && (fp & 7) == 0; depth++) {
++		uint64_t pair[2];
++		if (vm_map_read_user(current_map(), (vm_map_address_t)fp, pair, sizeof(pair)) != KERN_SUCCESS) {
++			break;
++		}
++		used += (unsigned)snprintf(line + used, sizeof(line) - used, " 0x%llx", pair[1] & 0x7fffffffffffULL);
++		if (pair[0] <= fp) {
++			break;
++		}
++		fp = pair[0];
++	}
++	struct proc *p = (struct proc *)get_bsdtask_info(current_task());
++	printf("oneios-srprot: %s[%d] vm_protect 0x%llx-0x%llx prot 0x%x%s%s in the shared region: pc 0x%llx lr 0x%llx, frames%s\n",
++	    p ? proc_best_name(p) : "?", p ? proc_pid(p) : 0, start, end, prot, set_max ? " (max)" : "",
++	    noop ? " changes nothing: left nested" : "", pc, lr, line);
++}
++
++/* vm_map_lock.c: a range of the shared region unnested in map (each 32 MiB block once per address space) */
++void hosted_top_note_unnest(vm_map_t map);
++void
++hosted_top_note_unnest(vm_map_t map)
++{
++	os_atomic_inc(&hosted_top_unnests, relaxed);
++	if (current_task() != kernel_task && map == current_map()) {
++		struct hosted_top_slot *s = hosted_top_slot();
++		if (s != NULL) {
++			os_atomic_inc(&s->unnests, relaxed);
++		}
++	}
++}
++
+ static struct {
+ 	uint64_t at;
+ 	uint32_t kind, number;
++	struct hosted_top_slot *slot;           /* 0080 */
++	int32_t pid;
+ } hosted_perf_open[HOSTED_PERF_CPUS];
+-static uint32_t hosted_perf_every = 30;
+ 
+ static inline uint64_t
+ hosted_perf_now(void)
+@@ -158,6 +320,9 @@
+ 		hosted_perf_open[cpu].at = hosted_perf_now();
+ 		hosted_perf_open[cpu].kind = kind;
+ 		hosted_perf_open[cpu].number = number;
++		struct hosted_top_slot *s = hosted_top_slot();         /* 0080 */
++		hosted_perf_open[cpu].slot = s;
++		hosted_perf_open[cpu].pid = s != NULL ? s->pid : 0;
+ 	}
+ }
+ 
+@@ -181,6 +346,19 @@
+ 		os_atomic_inc(&hosted_perf.mach_n[number], relaxed);
+ 		os_atomic_add(&hosted_perf.mach_t[number], ticks, relaxed);
+ 	}
++	/* 0080: the process's share (its slot may have been cleared by a report since: then it is dropped) */
++	struct hosted_top_slot *s = hosted_perf_open[cpu].slot;
++	if (s != NULL && os_atomic_load(&s->pid, relaxed) == hosted_perf_open[cpu].pid) {
++		os_atomic_inc(&s->traps, relaxed);
++		os_atomic_add(&s->ticks, ticks, relaxed);
++		if (kind == HOSTED_PERF_K_VM_FAULT) {
++			os_atomic_inc(&s->vm_faults, relaxed);
++			os_atomic_add(&s->vm_fault_ticks, ticks, relaxed);
++		} else if (kind == HOSTED_PERF_K_BSD || kind == HOSTED_PERF_K_MACH) {
++			hosted_top_call(s, ((kind << 16) | (number & 0xffff)) + 1, ticks);
++		}
++	}
++	hosted_perf_open[cpu].slot = NULL;
+ }
+ 
+ /* cpu_idle (hosted_machine.c): the vCPU idles, so the open trap's time ends here, not at the next user entry. */
+@@ -763,6 +941,10 @@
+ 			}
+ 			if (filled) {
+ 				hosted_user_stats.fills++;
++				struct hosted_top_slot *s = hosted_top_slot();          /* 0080 */
++				if (s != NULL) {
++					os_atomic_inc(&s->fills, relaxed);
++				}
+ 				continue;
+ 			}
+ 			thread->machine.hosted_refill = (far & ~(uint64_t)ARM_PGMASK) | access;
+@@ -900,6 +1082,110 @@
+ 	printf("oneios-perf:   %s us\n", line);
+ }
+ 
++/* 0080: the processes of the period by the kernel's time on their traps (oneios-top), and the shared region's line */
++extern void hosted_pmap_protect_stats(uint64_t out[2]);
++static struct hosted_top_slot hosted_top_copy[HOSTED_TOP_SLOTS];
++extern struct proc *proc_find(int);
++extern int proc_rele(struct proc *);
++extern task_t proc_task(struct proc *);
++
++/*
++ * The process's CPU (user and system, TASK_POWER_INFO) since the last report that printed it, as a percentage of one
++ * vCPU over wall_us; -1 the first time (the PC has no oneios-cpu lines: the GPU archive prints them with 3D only).
++ */
++static int
++hosted_top_cpu(int32_t pid, uint64_t wall_us)
++{
++	static struct { int32_t pid; uint64_t mach; } seen[HOSTED_TOP_SLOTS];
++	struct proc *p = proc_find(pid);
++	if (p == NULL) {
++		return -1;
++	}
++	struct task_power_info info = {};
++	mach_msg_type_number_t count = TASK_POWER_INFO_COUNT;
++	task_t task = proc_task(p);
++	kern_return_t kr = task != TASK_NULL ? task_info(task, TASK_POWER_INFO, (task_info_t)&info, &count) : KERN_FAILURE;
++	proc_rele(p);
++	if (kr != KERN_SUCCESS) {
++		return -1;
++	}
++	uint64_t mach = info.total_user + info.total_system;
++	unsigned slot = ((uint32_t)pid * 2654435761u) % HOSTED_TOP_SLOTS;
++	int percent = -1;
++	if (seen[slot].pid == pid && mach >= seen[slot].mach) {
++		percent = (int)(hosted_perf_us(mach - seen[slot].mach) * 100 / (wall_us ? wall_us : 1));
++	}
++	seen[slot].pid = pid;
++	seen[slot].mach = mach;
++	return percent;
++}
++
++static void
++hosted_top_report(uint64_t wall_us)
++{
++	static uint64_t unnests_last, sr_last, noops_last, protect_last[2];
++	uint64_t ps[2];
++	hosted_pmap_protect_stats(ps);
++	uint64_t unnests = os_atomic_load(&hosted_top_unnests, relaxed), sr = os_atomic_load(&hosted_top_sr_protects, relaxed);
++	uint64_t noops = os_atomic_load(&hosted_top_sr_noops, relaxed);
++	printf("oneios-top: shared region: %llu vm_protect calls, %llu that changed nothing (left nested), %llu unnests; "
++	    "pmap_protect entries flushed %llu, kept mapped %llu (unchanged)\n", sr - sr_last, noops - noops_last,
++	    unnests - unnests_last, ps[0] - protect_last[0], ps[1] - protect_last[1]);
++	unnests_last = unnests;
++	sr_last = sr;
++	noops_last = noops;
++	protect_last[0] = ps[0];
++	protect_last[1] = ps[1];
++	if (hosted_top_lines == 0) {
++		return;
++	}
++	memcpy(hosted_top_copy, hosted_top, sizeof(hosted_top));
++	bzero(hosted_top, sizeof(hosted_top));
++	for (unsigned line_no = 0; line_no < hosted_top_lines; line_no++) {
++		struct hosted_top_slot *best = NULL;
++		for (unsigned i = 0; i < HOSTED_TOP_SLOTS; i++) {
++			struct hosted_top_slot *s = &hosted_top_copy[i];
++			if (s->pid > 0 && s->traps != 0 && (best == NULL || s->ticks > best->ticks)) {
++				best = s;
++			}
++		}
++		if (best == NULL) {
++			break;
++		}
++		char line[512];
++		unsigned used = 0;
++		int cpu = hosted_top_cpu(best->pid, wall_us);
++		used += (unsigned)snprintf(line + used, sizeof(line) - used,
++		    "%s[%d] cpu %d%%, %llu traps %llu us: vm_fault %llu (%llu us), fills %llu, own unmaps %llu; calls",
++		    best->name, best->pid, cpu, best->traps, hosted_perf_us(best->ticks), best->vm_faults,
++		    hosted_perf_us(best->vm_fault_ticks), best->fills, best->unmaps);
++		for (unsigned k = 0; k < 6 && used < sizeof(line) - 48; k++) {
++			unsigned top = HOSTED_TOP_CALLS;
++			for (unsigned i = 0; i < HOSTED_TOP_CALLS; i++) {
++				if (best->call[i] != 0 && best->call_n[i] != 0 && (top == HOSTED_TOP_CALLS || best->call_n[i] > best->call_n[top])) {
++					top = i;
++				}
++			}
++			if (top == HOSTED_TOP_CALLS) {
++				break;
++			}
++			uint32_t key = best->call[top] - 1;
++			used += (unsigned)snprintf(line + used, sizeof(line) - used, " %s%u %llu x%llu",
++			    (key >> 16) == HOSTED_PERF_K_MACH ? "-" : "", key & 0xffff, best->call_n[top],
++			    hosted_perf_us(best->call_t[top]) / best->call_n[top]);
++			best->call_n[top] = 0;
++		}
++		used += (unsigned)snprintf(line + used, sizeof(line) - used, "; vm_protect %llu (shared region %llu, unnests %llu",
++		    best->protects, best->sr_protects, best->unnests);
++		if (best->sr_protects != 0 && used < sizeof(line) - 64) {
++			used += (unsigned)snprintf(line + used, sizeof(line) - used, ", last prot 0x%llx from pc 0x%llx lr 0x%llx",
++			    best->sr_prot, best->sr_pc, best->sr_lr);
++		}
++		printf("oneios-top: %s)\n", line);
++		best->traps = 0;
++	}
++}
++
+ static void
+ hosted_perf_report_thread(__unused void *arg, __unused wait_result_t result)
+ {
+@@ -949,6 +1235,7 @@
+ 		hosted_perf_top("bsd (number calls x mean)", c.bsd_n, c.bsd_t, c0->bsd_n, c0->bsd_t, HOSTED_PERF_BSD, 12, false);
+ 		hosted_perf_top("mach traps", c.mach_n, c.mach_t, c0->mach_n, c0->mach_t, HOSTED_PERF_MACH, 8, true);
+ 		hosted_perf_kernel_threads(wall_us);    /* 0051 */
++		hosted_top_report(wall_us);             /* 0080 */
+ 		hosted_perf_last = c;
+ 		user_last = u;
+ 		for (unsigned i = 0; i < 18; i++) {
+@@ -966,6 +1253,10 @@
+ {
+ 	thread_t thread = THREAD_NULL;
+ 	(void)PE_parse_boot_argn("oneios-perf", &hosted_perf_every, sizeof(hosted_perf_every));
++	(void)PE_parse_boot_argn("oneios-top", &hosted_top_lines, sizeof(hosted_top_lines));     /* 0080 */
++	if (hosted_top_lines > 16) {
++		hosted_top_lines = 16;
++	}
+ 	if (hosted_perf_every == 0) {
+ 		return;
+ 	}
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -5789,6 +5789,45 @@
+ 	return KERN_SUCCESS;
+ }
+ 
++#if XNU_HOSTED
++/*
++ * OneiOS hosted (0080). Every process unnested the first 32 MiB block of the cache's __DATA_CONST (`triggered unnest of
++ * range ... of DYLD shared region`, from launchd on): the exclusive range lock of vm_map_protect unnests (and copies the
++ * constant submap's entries into the task's map) before anything looks at whether the protection changes at all. A
++ * call that asks for the protection every entry of the range already has (not the maximum, not VM_PROT_COPY, no JIT
++ * or TPRO entry) is answered here with KERN_SUCCESS under a shared lock: what vm_map_protect would have set is what is
++ * there, and the region stays nested (its pages filled from the shared tables, not faulted again into the task's).
++ * oneios-sr-protect-noop=0 turns it off (for a comparison). hosted_top_note_protect (arm64/hosted/hosted_user.c) counts
++ * the calls for oneios-top and prints the first ones with where they came from (oneios-srprot).
++ */
++#include <mach/shared_region.h>
++static TUNABLE(uint32_t, hosted_sr_protect_noop, "oneios-sr-protect-noop", 1);
++bool hosted_shared_region_ready = false;       /* vm_shared_region_create: the first region is fully made */
++extern void hosted_top_note_protect(vm_map_t map, uint64_t start, uint64_t end, uint32_t prot, bool set_max, bool noop);
++
++static bool
++vm_map_protect_hosted_noop(vm_map_t map, vm_map_offset_t start, vm_map_offset_t end, vm_prot_t new_prot)
++{
++	VM_MAP_LOCK_CTX_DECLARE(ctx);
++	vm_map_entry_t entry;
++	bool nested = false, same = true;
++
++	if (vm_map_range_sh_lock(ctx, &map, start, end, VMRL_SH_ATOMIC | VMRL_SH_DESCEND_INTO_CONSTANT) != KERN_SUCCESS) {
++		return false;   /* a hole: vm_map_protect says what is wrong */
++	}
++	while ((entry = vm_map_range_atomic_next(ctx))) {
++		if (vm_map_lock_ctx_is_in_pmap_nested_submap(ctx)) {
++			nested = true;
++		}
++		if (entry->is_sub_map || entry->protection != new_prot || entry->used_for_jit || entry->used_for_tpro) {
++			same = false;
++		}
++	}
++	vm_map_range_sh_unlock(ctx, &map);
++	return nested && same;
++}
++#endif /* XNU_HOSTED */
++
+ /*
+  *	vm_map_protect:
+  *
+@@ -5828,6 +5866,25 @@
+ 		return kr;
+ 	}
+ 
++#if XNU_HOSTED
++	/* 0080: a protection of the nested shared region that changes nothing leaves it nested.
++	 * The whole block waits until vm_shared_region_create has finished making the first
++	 * shared region: its shared-range scan and saved-state reads are not valid during
++	 * early bootstrap (the first build halted one second after "VM bootstrap" even with
++	 * oneios-sr-protect-noop=0, which still ran hosted_top_note_protect). */
++	if (hosted_shared_region_ready) {
++		bool noop = !set_max && !(new_prot & VM_PROT_COPY) && hosted_sr_protect_noop != 0 &&
++		    original_map != kernel_map && start < end &&
++		    start < SHARED_REGION_BASE_ARM64 + SHARED_REGION_SIZE_ARM64 && end > SHARED_REGION_BASE_ARM64 &&
++		    vm_map_protect_hosted_noop(original_map, start, end, new_prot);
++		hosted_top_note_protect(original_map, start, end, new_prot, set_max, noop);
++		if (noop) {
++			vmlp_api_end(VM_MAP_PROTECT, KERN_SUCCESS);
++			return KERN_SUCCESS;
++		}
++	}
++#endif /* XNU_HOSTED */
++
+ 	if (new_prot & VM_PROT_COPY) {
+ 		vm_map_offset_t         new_start;
+ 		vm_prot_t               cur_prot, max_prot;
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -926,1 +926,9 @@
+ done:
++#if XNU_HOSTED
++	{
++		/* 0080: vm_map_protect's hosted shortcut and report are valid from here on */
++		extern bool hosted_shared_region_ready;
++		hosted_shared_region_ready |= shared_region != NULL;
++	}
++#endif /* XNU_HOSTED */
++
+diff --git a/osfmk/vm/vm_map_lock.c b/osfmk/vm/vm_map_lock.c
+--- a/osfmk/vm/vm_map_lock.c
++++ b/osfmk/vm/vm_map_lock.c
+@@ -988,6 +988,13 @@
+ 	 * changed entry->use_pmap without having called pmap_unnest.
+ 	 */
+ 	KDBG(VMDBG_CODE(DBG_VM_PMAP_UNNEST) | DBG_FUNC_NONE, start, end);
++#if XNU_HOSTED
++	{
++		/* OneiOS hosted (0080): counted for oneios-top (arm64/hosted/hosted_user.c) */
++		extern void hosted_top_note_unnest(vm_map_t);
++		hosted_top_note_unnest(map);
++	}
++#endif /* XNU_HOSTED */
+ 
+ 	pmap_unnest(map->pmap, unnest_start, unnest_end - unnest_start);
+ }

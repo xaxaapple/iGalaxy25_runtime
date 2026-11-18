@@ -1,0 +1,89 @@
+#!/bin/bash
+# Build xnuhost for arm64 Android and leave it in STAGE/bin (runtime/package.sh calls this).
+#   runtime/build.sh STAGE        build and stage bin/xnuhost (static; the task stub is inside it) and the
+#                                 bridges' helpers bin/oneios-audio and bin/oneios-net.sh, and the display helper
+#                                 (runtime/display): bin/oneios-display, bin/liboneios-display.so, lib/oneios-display.dex,
+#                                 and the phone checks: bin/gpuctl, bin/bridgectl, bin/wifictl, bin/brightctl, bin/batteryctl, bin/thermalctl, bin/displayctl, bin/camctl
+#                                 Then runtime/package/elf-check.sh STAGE: every dynamic ELF file of the stage (the display
+#                                 helper's library, oneios-audio, oneios-camera, camctl) must need only API 30 stubs of the
+#                                 NDK and find each undefined symbol in one of them, or the build fails (exit 1)
+#   runtime/build.sh --test       host unit tests of the loader and of xnuhost, then the Android binary
+#                                 booting the test kernel under qemu-aarch64 when that is installed (on a Mac: the
+#                                 whole host suite in an arm64 Linux container, runtime/host-tests.sh)
+# Build hosts: Linux x86_64 (the NDK's linux-x86_64 tools) and macOS (darwin-x86_64; runtime/host.mk).
+# NDK: $NDK, else $ANDROID_NDK_HOME, else $HOME/Android/Sdk/ndk/28.2.13676358 (Linux) or
+#      $HOME/Library/Android/sdk/ndk/28.2.13676358 (macOS).
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+case "$(uname -s)" in
+  Darwin) NDK_HOST=darwin-x86_64; NDK_DEFAULT=$HOME/Library/Android/sdk/ndk/28.2.13676358 ;;
+  *)      NDK_HOST=linux-x86_64;  NDK_DEFAULT=$HOME/Android/Sdk/ndk/28.2.13676358 ;;
+esac
+NDK=${NDK:-${ANDROID_NDK_HOME:-$NDK_DEFAULT}}
+TOOLS=$NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin
+[ -x "$TOOLS/aarch64-linux-android30-clang" ] || { echo "build: no NDK at $NDK ($NDK_HOST)" >&2; exit 1; }
+STRIP=$TOOLS/llvm-strip
+# Build every make target in parallel (sub-makes inherit MAKEFLAGS). JOBS overrides, as the kernel build.
+export MAKEFLAGS="${MAKEFLAGS:--j${JOBS:-$(getconf _NPROCESSORS_ONLN)}}"
+if [ "${1:-}" = --test ] && [ "$(uname -s)" = Darwin ]; then
+  exec env NDK="$NDK" "$ROOT/runtime/host-tests.sh"
+fi
+if [ "${1:-}" = --test ]; then
+  make -s -C "$ROOT/runtime/loader" NDK="$NDK" test android
+  make -s -C "$ROOT/runtime/xnuhost" NDK="$NDK" test
+  make -s -C "$ROOT/runtime/display" NDK="$NDK" test all
+  exit 0
+fi
+STAGE=${1:?usage: runtime/build.sh STAGE | --test}
+make -s -C "$ROOT/runtime/xnuhost" NDK="$NDK" build/android/xnuhost
+mkdir -p "$STAGE/bin"
+"$STRIP" -o "$STAGE/bin/xnuhost" "$ROOT/runtime/xnuhost/build/android/xnuhost"
+make -s -C "$ROOT/runtime/bridges" NDK="$NDK" build/android/oneios-audio
+"$STRIP" -o "$STAGE/bin/oneios-audio" "$ROOT/runtime/bridges/build/android/oneios-audio"
+cp "$ROOT/runtime/bridges/net/oneios-net.sh" "$STAGE/bin/oneios-net.sh"
+# The camera helper, and camctl: the camera alone, for a check on the phone (runtime/bridges/camera/README.md)
+make -s -C "$ROOT/runtime/bridges/camera" NDK="$NDK" build/android/oneios-camera build/android/camctl
+"$STRIP" -o "$STAGE/bin/oneios-camera" "$ROOT/runtime/bridges/camera/build/android/oneios-camera"
+"$STRIP" -o "$STAGE/bin/camctl" "$ROOT/runtime/bridges/camera/build/android/camctl"
+chmod 0755 "$STAGE/bin/oneios-camera" "$STAGE/bin/camctl"
+# The video encoder helper, and encctl: the encoder alone, for a check on the phone (runtime/bridges/encoder/README.md)
+make -s -C "$ROOT/runtime/bridges/encoder" NDK="$NDK" build/android/oneios-encoder build/android/encctl
+"$STRIP" -o "$STAGE/bin/oneios-encoder" "$ROOT/runtime/bridges/encoder/build/android/oneios-encoder"
+"$STRIP" -o "$STAGE/bin/encctl" "$ROOT/runtime/bridges/encoder/build/android/encctl"
+chmod 0755 "$STAGE/bin/oneios-encoder" "$STAGE/bin/encctl"
+# gpuctl: the GPU path alone, for a check on the phone (runtime/xnuhost/tools/gpuctl.c, docs/gpu.md)
+make -s -C "$ROOT/runtime/xnuhost" NDK="$NDK" build/android/gpuctl
+"$STRIP" -o "$STAGE/bin/gpuctl" "$ROOT/runtime/xnuhost/build/android/gpuctl"
+chmod 0755 "$STAGE/bin/gpuctl"
+# The other phone checks, which the OneOS fork's Hardware checks screen runs with One UI up (as root):
+# bridgectl (cpu, haptic, haptic-pattern, bt, audio), brightctl (info, levels, als), batteryctl (reads the battery), thermalctl (the temperatures; `watch` logs them) and displayctl (test; it
+# starts bin/oneios-display beside itself). Each folder's README has the commands and what a good run prints.
+make -s -C "$ROOT/runtime/bridges" NDK="$NDK" build/android/bridgectl build/android/wifictl
+make -s -C "$ROOT/runtime/bridges/brightness" NDK="$NDK" build/android/brightctl
+make -s -C "$ROOT/runtime/bridges/battery" NDK="$NDK" build/android/batteryctl
+make -s -C "$ROOT/runtime/bridges/thermal" NDK="$NDK" build/android/thermalctl
+make -s -C "$ROOT/runtime/display" NDK="$NDK" build/android/displayctl
+"$STRIP" -o "$STAGE/bin/bridgectl" "$ROOT/runtime/bridges/build/android/bridgectl"
+# wifictl: the Wi-Fi bridge alone (status and scan are read only; join takes wlan0 as a session does; restore gives
+# wlan0's settings back after a killed xnuhost). runtime/bridges/README.md, docs/hardware.md section 3.
+"$STRIP" -o "$STAGE/bin/wifictl" "$ROOT/runtime/bridges/build/android/wifictl"
+chmod 0755 "$STAGE/bin/wifictl"
+"$STRIP" -o "$STAGE/bin/brightctl" "$ROOT/runtime/bridges/brightness/build/android/brightctl"
+"$STRIP" -o "$STAGE/bin/batteryctl" "$ROOT/runtime/bridges/battery/build/android/batteryctl"
+"$STRIP" -o "$STAGE/bin/thermalctl" "$ROOT/runtime/bridges/thermal/build/android/thermalctl"
+"$STRIP" -o "$STAGE/bin/displayctl" "$ROOT/runtime/display/build/android/displayctl"
+chmod 0755 "$STAGE/bin/bridgectl" "$STAGE/bin/brightctl" "$STAGE/bin/batteryctl" "$STAGE/bin/thermalctl" "$STAGE/bin/displayctl"
+# The display helper: a launcher, the library app_process loads, and the dex with the layer (needs javac and d8).
+D=$ROOT/runtime/display/build/android
+make -s -C "$ROOT/runtime/display" NDK="$NDK" build/android/oneios-display build/android/liboneios-display.so build/android/oneios-display.dex
+mkdir -p "$STAGE/lib"
+"$STRIP" -o "$STAGE/bin/oneios-display" "$D/oneios-display"
+"$STRIP" -o "$STAGE/bin/liboneios-display.so" "$D/liboneios-display.so"
+cp "$D/oneios-display.dex" "$STAGE/lib/oneios-display.dex"
+chmod 0644 "$STAGE/lib/oneios-display.dex"
+chmod 0755 "$STAGE/bin/xnuhost" "$STAGE/bin/oneios-audio" "$STAGE/bin/oneios-net.sh" "$STAGE/bin/oneios-display" "$STAGE/bin/liboneios-display.so"
+# Can Android load what was built? A shared object links with undefined symbols unless its link has -z defs
+# (host.mk: ANDROID_SO_LDFLAGS), and the phone then refuses it (liboneios-display.so, 2026-11-14): a stage with
+# such a file fails here, on the build machine (docs/building.md section 4).
+NDK="$NDK" "$ROOT/runtime/package/elf-check.sh" "$STAGE"
+echo "build: $STAGE/bin/xnuhost ($(wc -c < "$STAGE/bin/xnuhost" | tr -d ' ') bytes)"

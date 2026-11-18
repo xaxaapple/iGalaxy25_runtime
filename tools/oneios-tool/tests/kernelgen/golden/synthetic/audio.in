@@ -1,0 +1,69 @@
+// A made-up source for the edit list "audio": every anchor once, between lines of its own.
+// (before anchor 0)
+extern kmod_info_t g_kernel_kmod_info;
+// (before anchor 1)
+    bool isInput;
+// (before anchor 2)
+    uint32_t channels() const { return isInput ? InputChannels : OutputChannels; }
+// (before anchor 3)
+        transportSet(!isInput, true);
+// (before anchor 4)
+        transportSet(!isInput, false);
+// (before anchor 5)
+            const uint32_t played = droidvm_snd_play(at, PeriodFrames);
+// (before anchor 6)
+            droidvm_audio_played = droidvm_audio_played + played;
+// (before anchor 7)
+        droidvm_audio_periods = droidvm_audio_periods + 1;
+// (before anchor 8)
+    DroidVMAudioDevice *device = OSTypeAlloc(DroidVMAudioDevice);
+// (before anchor 9)
+    setNumber(e, "output latency", Latency);
+// (before anchor 10)
+    bool speaker = publishDevice(resources, false, "Speaker", "droidvm-audio-out");
+    bool mic = publishDevice(resources, true, "Mic", "droidvm-audio-in");
+// (before anchor 11)
+    IOLog("DroidVMAudio: published Speaker=%d Mic=%d as IOAudio2Devices\n", speaker, mic);
+// (before anchor 12)
+    droidvm_audio_clients = droidvm_audio_clients + 1;
+// (before anchor 13)
+    droidvm_audio_clients = droidvm_audio_clients - 1;
+// (before anchor 14)
+    droidvm_audio_selectors = droidvm_audio_selectors + 1;
+// (before anchor 15)
+        droidvm_audio_bad_selectors = droidvm_audio_bad_selectors + 1;
+// (before anchor 16)
+        if (a->scalarInputCount < 1 || a->structureInputSize != sizeof f) return kIOReturnBadArgument;
+// (before anchor 17)
+        memcpy(&f, a->structureInput, sizeof f);
+// (before anchor 18)
+    droidvm_audio_maps = droidvm_audio_maps + 1;
+// (before anchor 19)
+uint32_t droidvm_snd_capture(int16_t *frames, uint32_t count);
+// (before anchor 20)
+    uint32_t seed;
+// (before anchor 21)
+    ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, Shared, RingFrames * 2 * channels(), page_size);
+// (before anchor 22)
+    setNumber(e, "output safety offset", SafetyOffset);
+// (before anchor 23)
+    setNumber(e, "io buffer frame size", RingFrames);
+// (before anchor 24)
+void DroidVMAudioDevice::engineMain(void *self, wait_result_t) { static_cast<DroidVMAudioDevice *>(self)->run(); }
+// (before anchor 25)
+        const uint64_t deadline = startTime + absolute(done + PeriodFrames);
+// (before anchor 26)
+        int16_t *at = buffer + uint32_t(done % RingFrames) * ch;
+// (before anchor 27)
+        done += PeriodFrames;
+// (before anchor 28)
+        if (done % RingFrames == 0) {
+// (before anchor 29)
+            s->hostTime = startTime + absolute(done);
+// (before anchor 30)
+            s->sampleTime = done;
+// (before anchor 31)
+    droidvm_audio_stage = 3;
+// (before anchor 32)
+    droidvm_audio_stage = 4;
+// (the end)

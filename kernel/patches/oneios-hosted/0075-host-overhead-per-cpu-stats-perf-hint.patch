@@ -1,0 +1,427 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6784,6 +6784,10 @@
+ 
+ 
+ 	const bool nowait_requested = (options & PMAP_OPTIONS_NOWAIT) != 0;
++#if XNU_HOSTED
++	/* 0075: the entry as it was, so that one made again unchanged costs no host mapping (hosted_kernel_enter_same) */
++	const pt_entry_t hosted_before = pmap == kernel_pmap ? hosted_kernel_pte(v) : 0;
++#endif /* XNU_HOSTED */
+ 	do {
+ #if XNU_MONITOR
+ 		kr = pmap_enter_options_ppl(pmap, v, pa, prot, fault_type, flags, wired, options | PMAP_OPTIONS_NOWAIT);
+@@ -6809,7 +6813,7 @@
+ 	 * OneiOS hosted: the kernel's own entries are mapped in the host as they are made. A kernel stack must be
+ 	 * there before it is used (xnuhost writes interrupted frames onto it), and a fault per page would be slow.
+ 	 */
+-	if (kr == KERN_SUCCESS && pmap == kernel_pmap) {
++	if (kr == KERN_SUCCESS && pmap == kernel_pmap && !hosted_kernel_enter_same(v, hosted_before)) {
+ 		hosted_kernel_enter(v, PAGE_SIZE);
+ 	}
+ #endif /* XNU_HOSTED */
+diff --git a/osfmk/arm64/hosted/hostcall.h b/osfmk/arm64/hosted/hostcall.h
+--- a/osfmk/arm64/hosted/hostcall.h
++++ b/osfmk/arm64/hosted/hostcall.h
+@@ -43,9 +43,22 @@
+   uint64_t host_sp;           // 0x30    host only
+   uint64_t kernel_data;       // 0x38 K  free for the kernel (its cpu_data pointer)
+   uint64_t tpidr_el1;         // 0x40 K  shadow of TPIDR_EL1 for trapped mrs/msr (current thread)
+-  uint64_t reserved[7];       // 0x48
++  uint32_t perf_hint;         // 0x48 K  what the user thread this vCPU runs needs (XH_HINT_*), written by the kernel before
++                              //         thread_run (kernel 0075); 0 = no hint (an older kernel). Read by thread_run (its
++                              //         uclamp) and by any host code on the vCPU (the GPU path: the submitting thread's role)
++  uint32_t perf_reserved;     // 0x4c
++  uint64_t reserved[6];       // 0x50
+ };                            // 0x80; host-private data follows
+ 
++// perf_hint: bits 0-10 the utilisation clamp floor the thread asks for (0-1024), and its role from XNU's own policy
++// (thread_get_perfcontrol_class, the task's effective QoS and darwin-background state: RunningBoard's roles reach it there).
++#define XH_HINT_VALID       (1u << 16)    // the kernel wrote this word
++#define XH_HINT_BACKGROUND  (1u << 17)    // background or utility QoS, darwin background: no floor, capped at XH_HINT_BG_MAX
++#define XH_HINT_UI          (1u << 18)    // UI, above-UI or user-initiated class (an app's main thread, its frame workers)
++#define XH_HINT_REALTIME    (1u << 19)    // a realtime thread (the render server's, audio)
++#define XH_HINT_FLOOR(h)    ((h) & 0x7ffu)
++#define XH_HINT_BG_MAX      512u          // uclamp.max of a background thread: it never holds a core at its top clock
++
+ // ---- saved register frames ---------------------------------------------------------------------
+ struct xh_vreg { uint64_t lo, hi; };
+ 
+diff --git a/osfmk/arm64/hosted/hosted.h b/osfmk/arm64/hosted/hosted.h
+--- a/osfmk/arm64/hosted/hosted.h
++++ b/osfmk/arm64/hosted/hosted.h
+@@ -160,6 +160,9 @@
+ extern void hosted_tlb_flush_pmap(struct pmap *pmap);
+ extern bool hosted_kernel_fill(uint64_t va, uint32_t access);
+ extern void hosted_kernel_enter(uint64_t va, uint64_t size);
++/* 0075: the kernel's leaf entry of va now; whether an entry just made is the one it was (then it is mapped already) */
++extern uint64_t hosted_kernel_pte(uint64_t va);
++extern bool hosted_kernel_enter_same(uint64_t va, uint64_t before);
+ extern bool hosted_user_fill(struct pmap *pmap, uint64_t va, uint32_t access);
+ extern void hosted_pmap_destroy(struct pmap *pmap);
+ extern uint64_t hosted_pmap_task(struct pmap *pmap);
+diff --git a/osfmk/arm64/hosted/hosted_pmap.h b/osfmk/arm64/hosted/hosted_pmap.h
+--- a/osfmk/arm64/hosted/hosted_pmap.h
++++ b/osfmk/arm64/hosted/hosted_pmap.h
+@@ -160,6 +160,7 @@
+  * TLB lock's taken, contended, wait ticks, held ticks. Read without the lock: a report, not an exact sum. */
+ static uint64_t hosted_fault_around_maps;          /* 0046 (hosted_fill_around_locked) */
+ static uint64_t hosted_fault_around_skipped;       /* 0050: windows done already */
++static uint64_t hosted_kernel_enters_same;         /* 0075: kernel entries made again unchanged (hosted_kernel_enter_same) */
+ void hosted_pmap_perf(uint64_t out[18]);
+ void
+ hosted_pmap_perf(uint64_t out[18])
+@@ -181,7 +182,7 @@
+ 	out[14] = hosted_unmap_stats.skipped;
+ 	out[15] = os_atomic_load(&hosted_fault_around_maps, relaxed);      /* 0046 */
+ 	out[16] = os_atomic_load(&hosted_fault_around_skipped, relaxed);   /* 0050 */
+-	out[17] = 0;
++	out[17] = os_atomic_load(&hosted_kernel_enters_same, relaxed);   /* 0075 */
+ }
+ 
+ /*
+@@ -403,6 +404,38 @@
+ 	hosted_tlb_unlock(old);
+ }
+ 
++/*
++ * 0075 (host-overhead, 2026-11-15): the kernel's leaf entry of va as it is now (0 outside the kernel's own range), for
++ * pmap_enter's hook: an entry made again exactly as it was (the VM enters wired kernel pages again on a wire, a fault on a
++ * kernel object, a protection it already has) has its host mapping already. That mapping was made when the entry was
++ * (hosted_kernel_enter) and goes only with a flush, which maps a still valid entry again at once
++ * (hosted_tlb_flush_region), so an unchanged valid entry is mapped: no mmap in xnuhost (each one with xnuhost's mmap_lock
++ * taken for writing, which stops every vCPU's page faults meanwhile). An entry made before the host layer was up is
++ * filled at its first fault (hosted_kernel_fill), as before.
++ */
++/* hosted_kernel_enters_same: declared with the other counters, above */
++pt_entry_t hosted_kernel_pte(uint64_t va);
++pt_entry_t
++hosted_kernel_pte(uint64_t va)
++{
++	va &= ~(uint64_t)ARM_PGMASK;
++	if (va < hosted_kva_base || va >= hosted_kva_end || kernel_pmap->tte == NULL) {
++		return 0;
++	}
++	return hosted_walk(kernel_pmap, va);
++}
++
++bool hosted_kernel_enter_same(uint64_t va, pt_entry_t before);
++bool
++hosted_kernel_enter_same(uint64_t va, pt_entry_t before)
++{
++	if (before == 0 || hosted_pte_prot(before, false) == 0 || hosted_kernel_pte(va) != before) {
++		return false;
++	}
++	os_atomic_inc(&hosted_kernel_enters_same, relaxed);
++	return true;
++}
++
+ /* ---- debug: what every task has mapped in the host (boot-arg hosted_mapcheck=1) --------------- */
+ 
+ /*
+diff --git a/osfmk/arm64/hosted/hosted_user.c b/osfmk/arm64/hosted/hosted_user.c
+--- a/osfmk/arm64/hosted/hosted_user.c
++++ b/osfmk/arm64/hosted/hosted_user.c
+@@ -60,10 +60,37 @@
+ #define HC(name, ...)   hosted_hc(HOSTED_FN(name), hosted_cpu(), HC_PAD(__VA_ARGS__ __VA_OPT__(, ) 0, 0, 0, 0, 0))
+ #define HC_PAD(a1, a2, a3, a4, a5, ...) (uint64_t)(a1), (uint64_t)(a2), (uint64_t)(a3), (uint64_t)(a4), (uint64_t)(a5)
+ 
+-struct hosted_user_stats {
++struct hosted_user_counts {
+ 	uint64_t runs, syscalls, faults, fills, refills, interrupts, illegal, brk, fpe, exited;
+ 	uint64_t twins_made, twins_dropped;
+-} hosted_user_stats;
++	uint64_t fills_switched;                /* 0075: fills during which the thread was switched out (their time not counted) */
++	uint64_t hints;                         /* 0075: perf_hint changes written for the host */
++	uint64_t audit_tick, pad;
++};
++
++/*
++ * 0075 (host-overhead, 2026-11-15): the counters are per vCPU. Every vCPU wrote the same cache lines on every user stay
++ * (hosted_user_stats.runs++ and the audit tick's atomic add on each return to user mode, the perf report's atomic adds per
++ * trap): 34,000 stays a second on the phone, each a line taken from whichever vCPU wrote it last. The report sums them.
++ * A counter of a thread that moved vCPU between two increments may lose one: it is a report, not an exact sum.
++ */
++#define HOSTED_STATS_CPUS 16
++static struct hosted_user_counts hosted_user_cpu[HOSTED_STATS_CPUS] __attribute__((aligned(128)));
++#define hosted_user_stats (hosted_user_cpu[(unsigned)cpu_number() & (HOSTED_STATS_CPUS - 1)])
++
++static struct hosted_user_counts
++hosted_user_stats_sum(void)
++{
++	struct hosted_user_counts s = {};
++	for (unsigned i = 0; i < HOSTED_STATS_CPUS; i++) {
++		const struct hosted_user_counts *c = &hosted_user_cpu[i];
++		s.runs += c->runs; s.syscalls += c->syscalls; s.faults += c->faults; s.fills += c->fills; s.refills += c->refills;
++		s.interrupts += c->interrupts; s.illegal += c->illegal; s.brk += c->brk; s.fpe += c->fpe; s.exited += c->exited;
++		s.twins_made += c->twins_made; s.twins_dropped += c->twins_dropped; s.fills_switched += c->fills_switched;
++		s.hints += c->hints;
++	}
++	return s;
++}
+ 
+ /*
+  * 0041, oneios-perf=SECONDS (default 30, 0 = off): what the kernel does with the traps of user code, on the console
+@@ -85,7 +112,31 @@
+ 	uint64_t kind_n[5], kind_t[5];
+ 	uint64_t fill_t;                        /* hosted_user_fill on the trap path, all of them */
+ };
+-static struct hosted_perf_counts hosted_perf, hosted_perf_last;
++/* 0075: one set per vCPU (above); hosted_perf is this vCPU's, the report adds them up */
++static struct hosted_perf_counts hosted_perf_cpu[HOSTED_PERF_CPUS] __attribute__((aligned(128))), hosted_perf_last;
++#define hosted_perf (hosted_perf_cpu[(unsigned)cpu_number() & (HOSTED_PERF_CPUS - 1)])
++
++static void
++hosted_perf_sum(struct hosted_perf_counts *out)
++{
++	bzero(out, sizeof(*out));
++	for (unsigned i = 0; i < HOSTED_PERF_CPUS; i++) {
++		const struct hosted_perf_counts *c = &hosted_perf_cpu[i];
++		for (unsigned k = 0; k < HOSTED_PERF_BSD; k++) {
++			out->bsd_n[k] += c->bsd_n[k];
++			out->bsd_t[k] += c->bsd_t[k];
++		}
++		for (unsigned k = 0; k < HOSTED_PERF_MACH; k++) {
++			out->mach_n[k] += c->mach_n[k];
++			out->mach_t[k] += c->mach_t[k];
++		}
++		for (unsigned k = 0; k < 5; k++) {
++			out->kind_n[k] += c->kind_n[k];
++			out->kind_t[k] += c->kind_t[k];
++		}
++		out->fill_t += c->fill_t;
++	}
++}
+ static struct {
+ 	uint64_t at;
+ 	uint32_t kind, number;
+@@ -493,6 +544,108 @@
+ }
+ 
+ /*
++ * 0075: the time all processors have idled since boot, up to now (recount keeps a processor's idle time current, where its
++ * busy time is added to a task only when a thread changes state), and how many processors there are. The oneios-cpu window
++ * (gpu/OneiOSAdreno.cpp, cpu_window.h) bounds its "all" and each process's share by the busy time this gives.
++ */
++uint64_t hosted_processors_idle_mach(uint32_t *count);
++uint64_t
++hosted_processors_idle_mach(uint32_t *count)
++{
++	uint64_t idle = 0;
++	uint32_t n = 0;
++	for (processor_t p = processor_list; p != PROCESSOR_NULL; p = p->processor_list) {
++		struct recount_usage usage = { 0 };
++		uint64_t idle_time = 0;
++		recount_processor_usage(&p->pr_recount, &usage, &idle_time);
++		idle += idle_time;
++		n++;
++	}
++	*count = n;
++	return idle;
++}
++
++/*
++ * 0075, the hosted CLPC's signal for the GPU path (gpu/OneiOSAdreno.cpp oneios_gpu_hint, fix-gpu-perf, which declares both
++ * weak and falls back without them):
++ *   oneios_clpc_thread_role      the role of the thread's task as a task_role_t (RunningBoard's, through the task policy);
++ *                                a realtime thread of a task with no role of its own is the render server's
++ *                                (TASK_GRAPHICS_SERVER), a darwin-background thread TASK_DARWINBG_APPLICATION
++ *   oneios_clpc_frame_deadline   the deadline of the work interval the thread has adopted (its last notify: the render
++ *                                server's frame), mach absolute time, 0 when it is in none
++ */
++extern uint64_t hosted_work_interval_deadline(thread_t thread);
++int oneios_clpc_thread_role(thread_t thread);
++int
++oneios_clpc_thread_role(thread_t thread)
++{
++	if (thread == THREAD_NULL || get_threadtask(thread) == TASK_NULL) {
++		return -1;
++	}
++	if (proc_get_effective_thread_policy(thread, TASK_POLICY_DARWIN_BG)) {
++		return TASK_DARWINBG_APPLICATION;
++	}
++	int role = proc_get_effective_task_policy(get_threadtask(thread), TASK_POLICY_ROLE);
++	if ((role == TASK_UNSPECIFIED || role == TASK_DEFAULT_APPLICATION) &&
++	    thread_get_perfcontrol_class(thread) == PERFCONTROL_CLASS_REALTIME) {
++		return TASK_GRAPHICS_SERVER;
++	}
++	return role;
++}
++
++uint64_t oneios_clpc_frame_deadline(thread_t thread);
++uint64_t
++oneios_clpc_frame_deadline(thread_t thread)
++{
++	return thread == THREAD_NULL ? 0 : hosted_work_interval_deadline(thread);
++}
++
++/*
++ * 0075, the hosted CLPC's hint (hostcall.h perf_hint): what the user thread about to run on this vCPU needs from the host's
++ * scheduler, from XNU's own policy. On an iPhone CLPC turns the performance-control class into cluster clocks; here the host
++ * does, through the uclamp of the Linux thread that runs the user code (xnuhost's thread_run gives it at the release):
++ *   realtime (the render server, audio)         floor 1024, XH_HINT_REALTIME | XH_HINT_UI
++ *   UI, above-UI (an app's main thread, frames) floor 1024, XH_HINT_UI
++ *   user-initiated                              floor 768,  XH_HINT_UI
++ *   default (non-UI)                            no floor of its own (the vCPU's request: DroidVMCpufreq's interactive groups)
++ *   utility, background, darwin-background      XH_HINT_BACKGROUND: no floor and a ceiling (xnuhost, XH_HINT_BG_MAX)
++ * RunningBoard's roles reach the class through the task's QoS clamp and darwin-background state (a background or suspended
++ * app's threads are clamped to background QoS), so a backgrounded process never holds a fast core at its top clock. The
++ * GPU path in xnuhost reads the same word on the submitting vCPU (fix-gpu-perf). Interrupts masked: one store per change.
++ */
++static inline void
++hosted_perf_hint(thread_t thread)
++{
++	uint32_t hint = XH_HINT_VALID;
++	switch (thread_get_perfcontrol_class(thread)) {
++	case PERFCONTROL_CLASS_REALTIME:
++		hint |= XH_HINT_REALTIME | XH_HINT_UI | 1024;
++		break;
++	case PERFCONTROL_CLASS_UI:
++	case PERFCONTROL_CLASS_ABOVEUI:
++		hint |= XH_HINT_UI | 1024;
++		break;
++	case PERFCONTROL_CLASS_USER_INITIATED:
++		hint |= XH_HINT_UI | 768;
++		break;
++	case PERFCONTROL_CLASS_BACKGROUND:
++	case PERFCONTROL_CLASS_UTILITY:
++		hint |= XH_HINT_BACKGROUND;
++		break;
++	default:
++		break;
++	}
++	if (!(hint & XH_HINT_UI) && proc_get_effective_thread_policy(thread, TASK_POLICY_DARWIN_BG)) {
++		hint = XH_HINT_VALID | XH_HINT_BACKGROUND;
++	}
++	struct xh_cpu *cpu = hosted_cpu();
++	if (cpu->perf_hint != hint) {
++		cpu->perf_hint = hint;
++		hosted_user_stats.hints++;
++	}
++}
++
++/*
+  * arm64_thread_exception_return and return_to_user of locore.s, then the EL0 exception vectors: never
+  * returns. Entered on the thread's kernel stack with nothing above it worth keeping.
+  */
+@@ -534,8 +687,8 @@
+ 			}
+ 		}
+ 
+-		static uint32_t hosted_audit_tick;
+-		if (__improbable((os_atomic_inc(&hosted_audit_tick, relaxed) & 0x3ff) == 0)) {
++		/* 0075: the tick is this vCPU's (it was one word every vCPU added to on every return) */
++		if (__improbable((++hosted_user_stats.audit_tick & 0x3ff) == 0)) {
+ 			(void)ml_set_interrupts_enabled(TRUE);
+ 			(void)hosted_check_audit(thread->machine.hosted_pmap, "audit");         /* hosted_mapcheck=1 */
+ 		}
+@@ -564,6 +717,7 @@
+ 		bool keep_x18 = (thread->machine.arm_machine_flags &
+ 		    (ARM_MACHINE_THREAD_PRESERVE_X18_SAVE | ARM_MACHINE_THREAD_PRESERVE_X18_INITIAL)) != 0;
+ 		hosted_perf_enter_user();               /* 0041 */
++		hosted_perf_hint(thread);               /* 0075 */
+ 		int64_t rc = hosted_user_enter(twin, context, thread->machine.cthread_self, keep_x18, &trap);
+ #if PRECISE_USER_KERNEL_TIME
+ 		recount_leave_user();
+@@ -594,8 +748,19 @@
+ 			/* The software TLB: the page tables may allow what the task's host mapping does not have. */
+ 			(void)ml_set_interrupts_enabled(TRUE);
+ 			uint64_t fill_began = hosted_perf_now();
++			const uint32_t switches = thread->c_switch;
+ 			bool filled = hosted_user_fill(thread->machine.hosted_pmap, far, access);
+-			os_atomic_add(&hosted_perf.fill_t, hosted_perf_now() - fill_began, relaxed);
++			/*
++			 * 0075: the fill's own time only. The fill runs with interrupts on, and the interrupt that ended the stay
++			 * (or one that came meanwhile) is often taken right here, with its preemption: the thread then waits while
++			 * others run, and that wait was counted as the fill's (the phone's 49,701 fills "took" 11.4 s per 30 s, 230 us
++			 * each, against 22 us for a vm_fault). A fill the thread was switched out of is counted apart.
++			 */
++			if (thread->c_switch == switches) {
++				os_atomic_add(&hosted_perf.fill_t, hosted_perf_now() - fill_began, relaxed);
++			} else {
++				hosted_user_stats.fills_switched++;
++			}
+ 			if (filled) {
+ 				hosted_user_stats.fills++;
+ 				continue;
+@@ -738,18 +903,18 @@
+ static void
+ hosted_perf_report_thread(__unused void *arg, __unused wait_result_t result)
+ {
+-	static struct hosted_user_stats user_last;
++	static struct hosted_user_counts user_last;
+ 	static uint64_t pmap_last[18], copies_last, copy_faults_last;
+ 	uint64_t last = mach_absolute_time();
+ 	for (;;) {
+ 		assert_wait_timeout((event_t)&hosted_perf_every, THREAD_UNINT, hosted_perf_every * 1000, NSEC_PER_MSEC);
+ 		(void)thread_block(THREAD_CONTINUE_NULL);
+ 		uint64_t now = mach_absolute_time(), wall = now - last;
+-		struct hosted_user_stats u = hosted_user_stats;
++		struct hosted_user_counts u = hosted_user_stats_sum();
+ 		uint64_t pm[18];
+ 		hosted_pmap_perf(pm);
+ 		static struct hosted_perf_counts c;
+-		c = hosted_perf;
++		hosted_perf_sum(&c);
+ 		const struct hosted_perf_counts *c0 = &hosted_perf_last;
+ 		uint64_t wall_us = hosted_perf_us(wall) ? hosted_perf_us(wall) : 1;
+ #define D(f) (u.f - user_last.f)
+@@ -774,6 +939,10 @@
+ 		    "fault-around maps %llu, windows done already %llu\n", pm[8] - pmap_last[8], pm[9] - pmap_last[9],
+ 		    hosted_perf_us(pm[10] - pmap_last[10]), pm[11] - pmap_last[11], pm[12] - pmap_last[12], pm[13] - pmap_last[13],
+ 		    pm[14] - pmap_last[14], pm[15] - pmap_last[15], pm[16] - pmap_last[16]);
++		/* 0075: the fills' time is their own (a fill whose thread was switched out is counted here, not timed); the kernel's
++		 * own entries made again unchanged (no host map); the hints given to the host for its clocks */
++		printf("oneios-perf:   0075: fills switched out %llu (not in the fill time); kernel entries made again unchanged %llu "
++		    "(no host map); perf hints %llu\n", D(fills_switched), pm[17] - pmap_last[17], D(hints));
+ #undef D
+ #undef KN
+ #undef KT
+diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
+--- a/osfmk/kern/work_interval.c
++++ b/osfmk/kern/work_interval.c
+@@ -153,6 +153,10 @@
+ 	uint64_t wi_id;
+ 	struct os_refcnt wi_ref_count;
+ 	uint32_t wi_create_flags;
++#if XNU_HOSTED
++	/* 0075, the hosted CLPC: the deadline of the interval's last notify (mach time), for the GPU path */
++	uint64_t wi_hosted_deadline;
++#endif /* XNU_HOSTED */
+ 
+ 	/* for debugging purposes only, does not hold a ref on port */
+ 	ipc_port_t wi_port;
+@@ -1079,6 +1083,9 @@
+ 
+ 	uint64_t urgency_param1, urgency_param2;
+ 	kwi_args->urgency = (uint16_t)thread_get_urgency(thread, &urgency_param1, &urgency_param2);
++#if XNU_HOSTED
++	os_atomic_store(&work_interval->wi_hosted_deadline, kwi_args->deadline, relaxed);      /* 0075 */
++#endif /* XNU_HOSTED */
+ 
+ 	splx(s);
+ 
+@@ -1088,6 +1095,22 @@
+ 	return KERN_SUCCESS;
+ }
+ 
++#if XNU_HOSTED
++/*
++ * 0075, the hosted CLPC for the GPU path (gpu/OneiOSAdreno.cpp, fix-gpu-perf's oneios_clpc_frame_deadline): the deadline
++ * of the work interval `thread` has adopted, as its last notify gave it (mach absolute time; the render server's frame),
++ * or 0 when it is in none. Read without a lock: called for the current thread, whose work interval does not change under
++ * it.
++ */
++uint64_t hosted_work_interval_deadline(thread_t thread);
++uint64_t
++hosted_work_interval_deadline(thread_t thread)
++{
++	struct work_interval *work_interval = thread->th_work_interval;
++	return work_interval ? os_atomic_load(&work_interval->wi_hosted_deadline, relaxed) : 0;
++}
++#endif /* XNU_HOSTED */
++
+ /* Start at 1, 0 is not a valid work interval ID */
+ static _Atomic uint64_t unique_work_interval_id = 1;
+ 

@@ -1,0 +1,37 @@
+2026-11-15 09:00:00.000000Z kernel[0] Default this file is written by hand for `ioslog health`'s tests, in the form `ioslog show` writes (no Apple file); its counts are in crates/oneios-ioslog/src/health_tests.rs
+2026-11-15 09:00:01.100000Z backboardd[52] Default [com.apple.BackBoard:Common] start OS watchdog...
+2026-11-15 09:00:02.000000Z kernel[0] Default memorystatus_perform_idle_demotion() timed out stuck process 98 [coreauthd], moving to idle band
+2026-11-15 09:00:02.500000Z kernel[0] Default memorystatus_perform_idle_demotion() timed out stuck process 101 [profiled], moving to idle band
+2026-11-15 09:00:03.000000Z kernel[0] Default memorystatus_perform_idle_demotion() timed out stuck process 140 [profiled], moving to idle band
+2026-11-15 09:00:03.200000Z kernel[0] Default memorystatus: containermanagerd_system [88] is neither clean (0x8F) nor assertion-less (0x84) and cannot therefore be idle - overriding to pri 30
+2026-11-15 09:00:10.000000Z Preferences[512] Default [com.apple.hangtracer:] Hang detected: 0.52s (always-on hang reporting)
+2026-11-15 09:01:12.000000Z Preferences[512] Default [com.apple.hangtracer:] Hang detected: 61.27s (always-on hang reporting)
+2026-11-15 09:01:15.000000Z Preferences[512] Default [com.apple.hangtracer:] Hang detected: 2.10s (always-on hang reporting)
+2026-11-15 09:01:17.000000Z Preferences[512] Default [com.apple.hangtracer:] Hang detected: 1.00s (always-on hang reporting)
+2026-11-15 09:01:20.000000Z SpringBoard[30] Default [com.apple.hangtracer:] Hang detected: 39.34s (always-on hang reporting)
+2026-11-15 09:01:21.000000Z SpringBoard[30] Default [com.apple.hangtracer:] Hang detected: 0.75s (always-on hang reporting)
+2026-11-15 09:01:25.000000Z MobileSafari[600] Default [com.apple.hangtracer:] Hang detected: 3.5 s (always-on hang reporting)
+2026-11-15 09:01:26.000000Z MobileSafari[600] Default [com.apple.hangtracer:] a message of two lines:
+its second line: Hang detected: 1.25s (always-on hang reporting)
+2026-11-15 09:01:27.000000Z SpringBoard[30] Default [com.apple.hangtracer:] HangTracer is enabled; no hang detected in this line
+2026-11-15 09:02:00.000000Z chronod[87] Error [com.apple.chrono:extensions] Extension process termination watchdogged: com.example.weather.widget
+2026-11-15 09:02:05.000000Z chronod[87] Error [com.apple.chrono:extensions] Extension process termination watchdogged: com.example.weather.widget
+2026-11-15 09:02:09.000000Z chronod[87] Error [com.apple.chrono:extensions] Extension process termination watchdogged: com.example.clock.widget
+2026-11-15 09:02:10.000000Z SpringBoard[30] Default [com.apple.FrontBoard:Process] [xpcservice<com.example.clock.widget([osservice<com.apple.chronod>:87])>:120] Process exited: <RBSProcessExitContext| specific, status:<RBSProcessExitStatus| domain:watchdog(20) code:0x8BADF00D>>.
+2026-11-15 09:02:11.000000Z SpringBoard[30] Default [com.apple.FrontBoard:Process] [osservice<com.apple.chronod>:87] Process exited: <RBSProcessExitContext| specific, status:<RBSProcessExitStatus| domain:signal(2) code:SIGABRT(6)>>.
+2026-11-15 09:02:12.000000Z backboardd[52] Fault the watchdog fired after 20 s without a name in the line
+2026-11-15 09:03:00.000000Z SpringBoard[30] Error [com.apple.example:client] Initial XPC call to server timed out (com.example.photos.service)
+2026-11-15 09:03:05.000000Z SpringBoard[30] Error [com.apple.example:client] Initial XPC call to server timed out (com.example.photos.service)
+2026-11-15 09:03:09.000000Z SpringBoard[30] Error [com.apple.example:client] Default XPC timeout reached for com.example.settings.service
+2026-11-15 09:03:12.000000Z Preferences[512] Error XPC timeout, with no service in the line
+2026-11-15 09:04:00.000000Z kernel[0] Default memorystatus: killing_idle_process pid 420 [nfcd] jetsam_coalition_id:320 (idle 0) 2048KB - memorystatus_available_pages: 9000
+2026-11-15 09:04:01.000000Z kernel[0] Default memorystatus: killing_specific_process pid 512 [Preferences] (per-process-limit 3) 812000KB - memorystatus_available_pages: 9000
+2026-11-15 09:04:02.000000Z kernel[0] Default memorystatus: killing process 600 [MobileSafari] in high band FOREGROUND (100) - memorystatus_available_pages: 800
+2026-11-15 09:04:03.000000Z kernel[0] Default memorystatus: killing_top_process pid 701 [MobileSafari] (vm-pageshortage 30) 400000KB - memorystatus_available_pages: 700
+2026-11-15 09:05:00.000000Z kernel[0] Default chronod[87] Corpse allowed 1 of 5
+2026-11-15 09:05:01.000000Z kernel[0] Default chronod[131] Corpse allowed 2 of 5
+2026-11-15 09:05:02.000000Z kernel[0] Default Preferences[512] Corpse failure, too many 6
+2026-11-15 09:06:00.000000Z chronod[87] Error [com.apple.imageio:chronod] writeImageAtIndex: *** CMPhotoCompressionSessionAddImage: err = kCMBaseObjectError_UnsupportedOperation [-12782] (codec: 'hvc1')
+2026-11-15 09:06:01.000000Z chronod[87] Error [com.apple.imageio:chronod] writeImageAtIndex: *** CMPhotoCompressionSessionAddImage: err = kCMBaseObjectError_UnsupportedOperation [-12782] (codec: 'hvc1')
+2026-11-15 09:06:02.000000Z SpringBoard[30] Error [com.apple.imageio:] writeImageAtIndex:99: *** CMPhotoCompressionSessionAddImage: err = -16993
+2026-11-15 09:10:00.000000Z SpringBoard[30] Default [com.apple.SpringBoard:Common] the last entry

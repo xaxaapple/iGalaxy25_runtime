@@ -1,0 +1,218 @@
+# Typing on the PC (xnuhost --input-script FILE; format: src/input_script.c): after the boot, go Home, open Search (a
+# swipe down in the middle of the Home Screen, which brings up the keyboard), then tap keys of the keyboard's top two
+# rows and the space bar: 100 keys, 1.4 a second (70 s); then the same again from Home. For a before and an after
+# run of a fix that is about typing (kbd's and the search's process in the oneios-cpu, oneios-perf and oneios-top
+# lines). The axes are input-demo.script's (a 1440 x 3120 panel). The key places are a 6.9-inch iPhone's keyboard at
+# its proportions (rows at about 75 % and 80 % of the height, the space bar at 91 %), not measured on a screenshot: a tap
+# that misses a key types nothing or another key, which does not matter for a load.
+abs 0x2f 0 9             # ABS_MT_SLOT
+abs 0x39 0 65535         # ABS_MT_TRACKING_ID
+abs 0x35 0 1439 10       # ABS_MT_POSITION_X
+abs 0x36 0 3119 10       # ABS_MT_POSITION_Y
+wait 1080000             # 18 min: SpringBoard and the Home Screen under qemu (before `ready`: `repeat` does not wait again)
+ready
+swipe 720 3100 720 1500 300   # up from the bottom edge: Home (from the Lock Screen too)
+wait 5000
+swipe 720 1100 720 1900 300   # down in the middle of the Home Screen: Search and its keyboard
+wait 20000
+tap 72 2340
+wait 700
+tap 216 2340
+wait 700
+tap 360 2340
+wait 700
+tap 504 2340
+wait 700
+tap 648 2340
+wait 700
+tap 792 2340
+wait 700
+tap 936 2340
+wait 700
+tap 1080 2340
+wait 700
+tap 1224 2340
+wait 700
+tap 1368 2340
+wait 700
+tap 144 2500
+wait 700
+tap 288 2500
+wait 700
+tap 432 2500
+wait 700
+tap 576 2500
+wait 700
+tap 720 2840             # space
+wait 700
+tap 864 2500
+wait 700
+tap 1008 2500
+wait 700
+tap 1152 2500
+wait 700
+tap 1296 2500
+wait 700
+tap 720 2840
+wait 700
+tap 72 2340
+wait 700
+tap 216 2340
+wait 700
+tap 360 2340
+wait 700
+tap 504 2340
+wait 700
+tap 648 2340
+wait 700
+tap 792 2340
+wait 700
+tap 936 2340
+wait 700
+tap 1080 2340
+wait 700
+tap 1224 2340
+wait 700
+tap 1368 2340
+wait 700
+tap 144 2500
+wait 700
+tap 288 2500
+wait 700
+tap 432 2500
+wait 700
+tap 576 2500
+wait 700
+tap 720 2840
+wait 700
+tap 864 2500
+wait 700
+tap 1008 2500
+wait 700
+tap 1152 2500
+wait 700
+tap 1296 2500
+wait 700
+tap 720 2840
+wait 700
+tap 72 2340
+wait 700
+tap 216 2340
+wait 700
+tap 360 2340
+wait 700
+tap 504 2340
+wait 700
+tap 648 2340
+wait 700
+tap 792 2340
+wait 700
+tap 936 2340
+wait 700
+tap 1080 2340
+wait 700
+tap 1224 2340
+wait 700
+tap 1368 2340
+wait 700
+tap 144 2500
+wait 700
+tap 288 2500
+wait 700
+tap 432 2500
+wait 700
+tap 576 2500
+wait 700
+tap 720 2840
+wait 700
+tap 864 2500
+wait 700
+tap 1008 2500
+wait 700
+tap 1152 2500
+wait 700
+tap 1296 2500
+wait 700
+tap 720 2840
+wait 700
+tap 72 2340
+wait 700
+tap 216 2340
+wait 700
+tap 360 2340
+wait 700
+tap 504 2340
+wait 700
+tap 648 2340
+wait 700
+tap 792 2340
+wait 700
+tap 936 2340
+wait 700
+tap 1080 2340
+wait 700
+tap 1224 2340
+wait 700
+tap 1368 2340
+wait 700
+tap 144 2500
+wait 700
+tap 288 2500
+wait 700
+tap 432 2500
+wait 700
+tap 576 2500
+wait 700
+tap 720 2840
+wait 700
+tap 864 2500
+wait 700
+tap 1008 2500
+wait 700
+tap 1152 2500
+wait 700
+tap 1296 2500
+wait 700
+tap 720 2840
+wait 700
+tap 72 2340
+wait 700
+tap 216 2340
+wait 700
+tap 360 2340
+wait 700
+tap 504 2340
+wait 700
+tap 648 2340
+wait 700
+tap 792 2340
+wait 700
+tap 936 2340
+wait 700
+tap 1080 2340
+wait 700
+tap 1224 2340
+wait 700
+tap 1368 2340
+wait 700
+tap 144 2500
+wait 700
+tap 288 2500
+wait 700
+tap 432 2500
+wait 700
+tap 576 2500
+wait 700
+tap 720 2840
+wait 700
+tap 864 2500
+wait 700
+tap 1008 2500
+wait 700
+tap 1152 2500
+wait 700
+tap 1296 2500
+wait 700
+tap 720 2840
+wait 700
+repeat

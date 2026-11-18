@@ -1,0 +1,31 @@
+[package]
+name = "oneios-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oneios-tool"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+oneios-sym.workspace = true
+oneios-ksym.workspace = true
+oneios-log.workspace = true
+oneios-image.workspace = true
+oneios-prelink.workspace = true
+oneios-kernel.workspace = true
+oneios-ioslog.workspace = true
+oneios-phone.workspace = true
+oneios-package.workspace = true
+oneios-testkit.workspace = true
+oneios-serve.workspace = true
+oneios-common.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+# tests/serve.rs: the lines of `serve`, and SIGTERM to it
+serde_json.workspace = true
+libc.workspace = true
+sha2.workspace = true

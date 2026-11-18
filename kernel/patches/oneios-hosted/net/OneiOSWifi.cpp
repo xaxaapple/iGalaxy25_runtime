@@ -1,0 +1,1158 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+//
+// OneiOS: the guest's Wi-Fi, en0, on the phone's radio. docs/hardware.md section 3; README.md beside this file.
+//
+// One IOKit controller of the IEEE 802.11 kind over xnuhost's virtio-net device (/arm-io/net, UniXNU-droidvm's
+// transport DroidVMVirtioNet.c): configd names its interface en0 and configures it (DHCP, IPv6, DNS: iOS's own), and
+// wifid drives it through the Apple80211 requests of IO80211.framework (SIOCGA80211/SIOCSA80211 on the interface,
+// which IONetworkInterface hands to performCommand) and the IEEE 802.11 kernel events it watches. The station below
+// it is the phone's: each scan, join and leave is a message to xnuhost's Wi-Fi bridge (runtime/bridges/wifi), which
+// drives the vendor's wpa_supplicant and nl80211 on wlan0; the frames go between en0 and wlan0 as they are, with
+// wlan0's address. The messages travel in-band on the same queues as frames of their own type
+// (drivers/net/oneios_wifi_proto.h).
+//
+// After UniXNU-droidvm f9121cd (BSD-2-Clause-Patent): package/DroidVMWifi.inc (the classes configd and wifid know a
+// Wi-Fi interface by, the request layouts and answers, which follow UniXNU-sheng's WifiNet.cpp), with its station
+// replaced by the host's and its controller given the transport; package/DroidVMVirtioNetIf.cpp (the start). No
+// Ethernet controller: an iPhone's en0 is its Wi-Fi.
+//
+// The classes subclass the kernel collection's own IOEthernetController and IOEthernetInterface (Apple's
+// IONetworkingFamily is a root of the collection, and 25 other roots link it, so it cannot be replaced): compiled
+// against IONetworkingFamily-188's headers with __PRIVATE_SPI__, whose vtables are the collection's slot for slot
+// (build-oneios-net.py checks every slot's discriminator against IONetworking-24A446-v54.json at each build). Calls
+// into the family go through generated stubs (the virtual functions by their slots, the parents' constructors and
+// destructors); nothing calls a non-virtual function of the family.
+#include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOService.h>
+#include <IOKit/network/IOEthernetController.h>
+#include <IOKit/network/IOEthernetInterface.h>
+#include <IOKit/network/IONetworkMedium.h>
+#include <IOKit/network/IOOutputQueue.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <mach/kmod.h>
+#include <mach/mach_time.h>
+#include <net/ethernet.h>
+#include <net/if_media.h>
+#include <net/kpi_interface.h>
+#include <pexpert/pexpert.h>
+#include <stdarg.h>
+#include <sys/kern_event.h>
+#include <sys/proc.h>
+#include "oneios_wifi_proto.h"
+
+extern kmod_info_t g_kernel_kmod_info;
+extern vm_offset_t vm_kernel_slide;
+// The generated bindings (build-oneios-net.py): the parents' metaclasses as linked and their instance sizes.
+extern "C" const uint64_t oneios_net_controller_meta_link, oneios_net_interface_meta_link;
+extern "C" const uint32_t oneios_net_controller_size, oneios_net_interface_size;
+// OneiOSWifiLayout.cpp: IONetworkInterface::setInterfaceSubType's store, made with the family's own member layout.
+extern "C" bool oneios_net_set_subtype(IONetworkInterface *interface, uint32_t subtype);
+extern char oneios_net_controller_meta[] __asm__("__ZN17IO80211Controller10gMetaClassE");
+extern char oneios_net_interface_meta[] __asm__("__ZN16IO80211Interface10gMetaClassE");
+// The kernel's own event post. Not kev_msg_post, the one for kernel extensions: that one refuses every vendor code
+// that is not a registered third party's, KEV_VENDOR_APPLE among them (EINVAL), and with it no IEEE 802.11 event of
+// this driver ever reached wifid: it asked for a scan, the scan was done, and it never fetched the results (the
+// phone, 2026-11-12). UniXNU-sheng's driver posts with this function. (sys/kern_event.h declares it without C
+// linkage; the symbol is the C one.)
+extern "C" int oneios_kev_post_msg(struct kev_msg *event_msg) __asm__("_kev_post_msg");
+
+extern "C" {
+int droidvm_net_tx_frame(const void *frame, unsigned length);   // DroidVMVirtioNet.c
+void droidvm_net_start(void);                                   // DroidVMVirtioNet.c
+int droidvm_net_if_attach(const uint8_t mac[6]);                 // called by the transport's worker
+void droidvm_net_if_input(const void *frame, unsigned length);   // the transport's worker, one frame at a time
+void oneios_net_start(void);                                     // oneios_drivers_start (drivers/bridge/OneiOSBridge.c)
+// For a debugger or a memory read: how far the start got, the requests, the frames.
+volatile uint32_t oneios_wifi_stage, oneios_wifi_requests, oneios_wifi_refused, oneios_wifi_last_refused;
+volatile uint64_t oneios_wifi_rx, oneios_wifi_tx, oneios_wifi_dropped;
+}
+
+#define WIFI_FRAME 1514
+#define WIFI_SPEED (866ULL * 1000 * 1000)
+
+namespace oneios_wifi {
+
+#define SIOCSA80211 0x802869c8UL   // _IOW('i', 200, struct apple80211req)
+#define SIOCGA80211 0xc02869c9UL   // _IOWR('i', 201, struct apple80211req)
+
+struct apple80211req {
+    char req_if_name[16];
+    int32_t req_type;
+    int32_t req_val;
+    uint32_t req_len;
+    user_addr_t req_data __attribute__((aligned(8)));
+};
+
+// request types (IO80211.framework's numbers)
+enum {
+    kSsid = 1, kAuthType = 2, kCipherKey = 3, kChannel = 4, kPowerSave = 5, kTxPower = 7, kRate = 8, kBssid = 9, kScanReq = 10,
+    kScanResult = 11, kCardCaps = 12, kState = 13, kPhyMode = 14, kOpMode = 15, kRssi = 16, kNoise = 17, kPower = 19, kAssociate = 20,
+    kAssociateResult = 21, kDisassociate = 22, kHostApMode = 25, kSupportedChannels = 27, kLocale = 28, kDeauth = 29, kDriverVersion = 43,
+    kHardwareVersion = 44, kCountryCode = 51, kRadioInfo = 54, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103,
+    kRssiBounds = 106, kChannelsInfo = 207, kHwSupportedChannels = 254,
+};
+// events: class IEEE 802.11 (6), subclass 1, the data starting with the interface name
+enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10 };
+// ASSOCIATE_RESULT as the framework reads it: 0 while the join runs, 1 joined, anything else a failure; 9 and 21 are
+// the ones Settings words as a timeout and as a wrong password (UniXNU-sheng's WifiNet.cpp, which joins real networks
+// on this OS build).
+enum { kAssocRunning = 0, kAssocOk = 1, kAssocFailed = 2, kAssocTimeout = 9, kAssocBadKey = 21 };
+// apple80211_cipher_type of an association's key: 6 the 32-byte pairwise master key (the daemon derived it from the
+// passphrase), 10 the passphrase itself
+enum { kCipherPmk = 6, kCipherPassphrase = 10 };
+
+struct channel { uint32_t version, channel, flags; };
+struct channels_list { uint32_t version, count; channel list[401]; uint32_t unused; };
+struct scan_result {
+    uint32_t version; channel ch; uint16_t noise_known; int16_t noise, snr, rssi; uint16_t beacon_interval, capability; uint8_t bssid[6];
+    uint8_t rate_count, unused0; uint32_t rates[15]; uint8_t ssid_length, ssid[32], unused1[3]; uint32_t age_ms; uint8_t flags, unused2;
+    uint16_t elements_length; uint8_t elements[1024];
+};
+// An association request's network: the same in both layouts below.
+struct assoc_parameters {
+    uint32_t ssid_length; uint8_t ssid[32]; uint8_t bssid[6], unused[2];
+    uint32_t key_version, key_length, key_cipher; uint16_t key_flags, key_index; uint8_t key[64];
+};
+struct assoc_request {         // the older layout, 592 bytes (DroidVMWifi.inc's)
+    uint32_t version; uint16_t mode, auth_lower, auth_upper, unused0; assoc_parameters network; uint8_t rest[0x250 - 0x88];
+};
+// 24A446's IO80211 __performAssociation has 32-bit authentication fields: the network moves by four bytes and the
+// request is 656 bytes (UniXNU-sheng's WifiNet.cpp, read from the same OS build). Both layouts say version 1.
+struct assoc_request27 {
+    uint32_t version; uint16_t mode, unused0; uint32_t auth_lower, auth_upper; assoc_parameters network; uint8_t rest[0x290 - 0x8c];
+};
+// 24A446's _dispatchAsyncAssocEvent reads ten 52-byte access point records, then the result at 0x214 and its
+// validity flag at 0x218: an empty ASSOC_DONE event is not safe on this build (the same source).
+struct assoc_event27 {
+    uint8_t attempts[10][52];
+    uint32_t reserved[2], reason, result, has_result;
+};
+struct link_event {
+    uint8_t down, unused0[3]; int32_t rssi; uint16_t snr, noise; uint8_t unused1[4]; uint8_t involuntary, unused2[3]; uint32_t reason, subreason;
+    uint8_t unused3[4];
+};
+// 24A446's scan record is 2280 bytes (IO80211.framework's __addScanResultToList reads fields up to 0x8e6 and asks
+// CURRENT_NETWORK with that length): the 1164-byte record's fields at the same places, a longer element area, and a
+// tail. The tail starts with the BSS's TIMESTAMP at 0x8d0: 64 bits, nanoseconds of the continuous clock (the framework
+// stores it as the record's "TIMESTAMP"; CoreWiFi's -[CWFScanResult age] is clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+// minus it, and CWFFilteredScanResults drops a result older than the scan's maxAge or before its minTimestamp). It was
+// zero until 2026-11-13, so every result was as old as the phone's uptime and auto-join saw none ("All scan results are
+// filtered out", the phone). The flags and counts at 0x8d8 to 0x8e6 stay zero. A caller with a buffer of that size gets
+// the whole record, so the tail is never what its buffer held before.
+enum { kScanRecord27 = 2280, kScanRecordTimestamp = 0x8d0, kScanRecordPhyMode = 0x8e0, kChannelsInfoSize = 10016 };
+// PHY_MODE (IO80211's __addScanResultToList reads 32 bits at 0x8e0 of the 2280-byte record, after AP_MODE from the
+// capability's ESS and IBSS bits): APPLE80211_MODE_11A 0x2, 11B 0x4, 11G 0x8, 11N 0x10, 11AC 0x80, 11AX 0x100, the
+// ones the network's elements show. It was zero (no mode) until 2026-11-14.
+enum { kPhy11a = 0x2, kPhy11b = 0x4, kPhy11g = 0x8, kPhy11n = 0x10, kPhy11ac = 0x80, kPhy11ax = 0x100 };
+static_assert(sizeof(apple80211req) == 0x28, "request layout");
+static_assert(sizeof(scan_result) == 1164 && __builtin_offsetof(scan_result, ssid_length) == 0x60 &&
+              __builtin_offsetof(scan_result, age_ms) == 0x84 && __builtin_offsetof(scan_result, elements) == 0x8c, "scan result layout");
+static_assert(sizeof(assoc_parameters) == 0x7c && __builtin_offsetof(assoc_parameters, key) == 0x3c &&
+              __builtin_offsetof(assoc_parameters, key_length) == 0x30 && __builtin_offsetof(assoc_parameters, key_cipher) == 0x34, "association network");
+static_assert(sizeof(assoc_request) == 592 && __builtin_offsetof(assoc_request, network) == 0x0c, "older association layout");
+static_assert(sizeof(assoc_request27) == 656 && __builtin_offsetof(assoc_request27, network) == 0x10, "24A446 association layout");
+static_assert(sizeof(assoc_event27) == 540 && __builtin_offsetof(assoc_event27, result) == 0x214 &&
+              __builtin_offsetof(assoc_event27, has_result) == 0x218, "24A446 association event");
+static_assert(sizeof(channels_list) == 4824, "channel list layout");
+static_assert(sizeof(link_event) == 32, "link event layout");
+static_assert(sizeof(ow_bss) == 56 && sizeof(ow_state) == 92 && sizeof(ow_join) == 108, "OneiOS Wi-Fi message layout");
+
+// ---- the station: the host's radio ----
+enum { kStaOff = OW_LINK_OFF, kStaIdle = OW_LINK_IDLE, kStaScanning = OW_LINK_SCANNING, kStaAuth = OW_LINK_AUTH, kStaAssoc = OW_LINK_ASSOC,
+       kStaKeys = OW_LINK_KEYS, kStaUp = OW_LINK_UP };
+enum { kMaxNetworks = 64, kScanTimeoutMs = 10000, kJoinTimeoutMs = 30000, kScanReuseMs = 8000, kScanReuseDelayMs = 20 };
+struct Net { ow_bss bss; uint8_t ies[OW_MAX_IES]; uint64_t seen_ns; };   // seen_ns: when the radio last saw it (TIMESTAMP)
+
+static IOLock *gLock;                  // everything below
+static Net *gScan, *gFill;             // the last finished scan, and the one the host is sending
+static unsigned gScanCount, gFillCount;
+static uint32_t gScanGeneration;       // one more at each finished scan: a reader's cursor of an older one starts again
+static bool gScanning;
+// SCAN_RESULT's cursor, one per reading thread: IO80211.framework reads a scan's records in one loop of
+// SCAN_RESULT requests until EIO (_getAsyncScanResults), and every client that monitors SCAN_DONE with a scan of its
+// own does so (wifid, wifip2pd, ... each with its own event socket). One cursor for all of them (until 2026-11-15)
+// split the list between two loops that ran together, and a loop that stopped early left the next one to start in
+// the middle: each reader got another part of the list at each scan. A slot is freed at its EIO; the oldest goes
+// when all are taken.
+struct Reader { const void *thread; uint32_t generation, cursor; uint64_t used; };
+enum { kReaders = 8 };
+static Reader gReaders[kReaders];
+static uint64_t gReaderClock;
+// With gLock held: the calling thread's cursor, at 0 for a scan it has not read from yet.
+static Reader &reader_locked(const void *thread) {
+    Reader *r = nullptr;
+    for (Reader &x : gReaders) if (x.thread == thread) { r = &x; break; }               // its own
+    if (!r) for (Reader &x : gReaders) if (!x.thread) { r = &x; break; }                // a free one
+    if (!r) { r = &gReaders[0]; for (Reader &x : gReaders) if (x.used < r->used) r = &x; }   // the least recently used
+    if (r->thread != thread || r->generation != gScanGeneration) { r->thread = thread; r->generation = gScanGeneration; r->cursor = 0; }
+    r->used = ++gReaderClock;
+    return *r;
+}
+static Net gCurrent;                   // the joined network (kStaAuth and above: the one being joined)
+static uint32_t gState = kStaIdle;
+static bool gPower = true, gRadio;     // gRadio: the host said it has the phone's radio
+static int gAssocResult = kAssocFailed;
+static bool gAssocModern;              // the last ASSOCIATE had the 24A446 layout: its ASSOC_DONE carries the result
+static bool gKeyed;                    // the last join had a key
+static int32_t gRssi = -127, gNoise = -95;
+static uint32_t gRate;
+static char gCountry[3] = "XX";
+static ow_channel gChannels[OW_MAX_CHANNELS];   // the host's channel list (OW_CHANNELS); empty: the built-in one
+static unsigned gChannelCount;
+static uint8_t gMac[6];
+static ifnet_t gIf;
+static thread_call_t gScanTimeout, gJoinTimeout, gScanReuse;
+static void (*gLink)(bool up);         // the controller's link status
+static uint32_t gLogged[256 / 32];
+
+static void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void log(const char *fmt, ...) {
+    char line[384]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    IOLog("ONEIOS WIFI: %s\n", line);
+}
+
+// When iOS took en0, for the lines that say so: milliseconds since oneios_net_start (the board's late start, a few
+// seconds after xnuhost's own start; the guest's counter is the host's, which runs since the phone booted, so the
+// driver's start is the zero), and IOKit's busy count at that moment (configd's InterfaceNamer and others wait for
+// IOKit to be quiet: the service root stays busy until the IOKit daemon, driverkitd on iOS, has sent its dexts'
+// personalities; the kernel logs "KextLog: driverkitd is active" then).
+static uint64_t gStartTime;
+static uint32_t since_start_ms() {
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - gStartTime, &ns); return static_cast<uint32_t>(ns / 1000000);
+}
+static unsigned iokit_busy() { IOService *root = IOService::getServiceRoot(); return root ? root->getBusyState() : 0; }
+// The first time each of these happened (one line each, with the time and who did it).
+enum { kSeenNamed, kSeenEnabled, kSeenRequest, kSeenPower, kSeenScan, kSeenJoin, kSeenCount };
+static bool gSeen[kSeenCount];
+static void first_time(unsigned what, const char *text) {
+    if (what >= kSeenCount || __atomic_exchange_n(&gSeen[what], true, __ATOMIC_RELAXED)) return;
+    char who[24] = "?"; proc_selfname(who, sizeof who);
+    const uint32_t ms = since_start_ms();
+    log("first %s: by %s[%d], +%u.%03u s after the driver's start, IOKit busy %u", text, who, proc_selfpid(), ms / 1000, ms % 1000, iokit_busy());
+}
+
+// A message to the host's bridge, as a frame of our own type on the transmit queue.
+static void send(uint16_t type, const void *payload, uint16_t length) {
+    uint8_t frame[WIFI_FRAME];
+    if (length > OW_MAX_PAYLOAD) return;
+    memcpy(frame, ow_address, 6);
+    memcpy(frame + 6, gMac, 6);
+    frame[12] = (uint8_t)(OW_ETHERTYPE >> 8); frame[13] = (uint8_t)OW_ETHERTYPE;
+    ow_header h = { OW_MAGIC, type, length };
+    memcpy(frame + 14, &h, sizeof h);
+    if (length) memcpy(frame + 14 + sizeof h, payload, length);
+    if (droidvm_net_tx_frame(frame, 14 + sizeof h + length)) log("message %u to the host not sent (transmit queue full or down)", type);
+}
+
+// ---- the rates: one line a minute while anything happened (kept: it is what says whether iOS asks again and again) ----
+// `ONEIOS WIFI: 60 s: events 10x6 4x1; scans asked 6 (started 3, reused 3, joined 0, refused 0), done 6 (2 networks), timed out 0;
+// records 18; power sets 0 (changed 0); by wifid 6/18 ...` (asked scans / records read, per process). Armed at the
+// first count after a line, so an idle interface logs nothing.
+enum { kRateSeconds = 60, kRateWho = 5 };
+enum { kRateScanAsked, kRateScanStarted, kRateScanReused, kRateScanJoined, kRateScanRefused, kRateScanDone, kRateScanTimeout, kRateRead, kRatePowerSet,
+       kRatePowerChanged, kRateKinds };
+struct RateWho { char name[16]; uint32_t scans, reads; };
+struct Rates { uint32_t events[16], kinds[kRateKinds], networks; RateWho who[kRateWho]; };
+static IOLock *gRateLock;
+static Rates gRates;
+static bool gRateArmed;
+static thread_call_t gRateCall;
+static void rate_line(thread_call_param_t, thread_call_param_t) {
+    IOLockLock(gRateLock);
+    const Rates r = gRates; memset(&gRates, 0, sizeof gRates); gRateArmed = false;
+    IOLockUnlock(gRateLock);
+    char events[96] = "", who[120] = "";
+    size_t n = 0;
+    for (unsigned c = 0; c < 16; c++)
+        if (r.events[c] && n < sizeof events) n += static_cast<size_t>(snprintf(events + n, sizeof events - n, "%s%u%sx%u", n ? " " : "", c, c == 15 ? "+" : "", r.events[c]));
+    n = 0;
+    for (const RateWho &w : r.who)
+        if (w.name[0] && n < sizeof who) n += static_cast<size_t>(snprintf(who + n, sizeof who - n, " %s %u/%u", w.name, w.scans, w.reads));
+    const uint32_t *k = r.kinds;
+    log("%u s: events %s; scans asked %u (started %u, reused %u, joined %u, refused %u), done %u (%u networks), timed out %u; records %u; "
+        "power sets %u (changed %u); by%s", kRateSeconds, events[0] ? events : "none", k[kRateScanAsked], k[kRateScanStarted],
+        k[kRateScanReused], k[kRateScanJoined], k[kRateScanRefused], k[kRateScanDone], r.networks, k[kRateScanTimeout], k[kRateRead], k[kRatePowerSet],
+        k[kRatePowerChanged], who[0] ? who : " nobody");
+}
+static void rate_arm_locked() {
+    if (gRateArmed || !gRateCall) return;
+    gRateArmed = true;
+    uint64_t at; clock_interval_to_deadline(kRateSeconds, kSecondScale, &at); thread_call_enter_delayed(gRateCall, at);
+}
+// kind: one of kRate*; by: the calling process is counted under its name (a request's thread only).
+static void tally(unsigned kind, bool by = false, uint32_t value = 0) {
+    if (!gRateLock) return;
+    char name[16] = "";
+    if (by) proc_selfname(name, sizeof name);
+    IOLockLock(gRateLock);
+    gRates.kinds[kind]++;
+    if (kind == kRateScanDone) gRates.networks = value;
+    if (by) {
+        RateWho *slot = nullptr;   // the slots fill in order: a name already counted comes before the first free one
+        for (RateWho &w : gRates.who) {
+            if (!w.name[0]) { slot = &w; strlcpy(w.name, name, sizeof w.name); break; }
+            if (!strncmp(w.name, name, sizeof w.name)) { slot = &w; break; }
+        }
+        if (!slot) { slot = &gRates.who[kRateWho - 1]; strlcpy(slot->name, "others", sizeof slot->name); }   // the last takes the rest
+        if (kind == kRateScanAsked) slot->scans++; else if (kind == kRateRead) slot->reads++;
+    }
+    rate_arm_locked();
+    IOLockUnlock(gRateLock);
+}
+static void rate_event(uint32_t code) {
+    if (!gRateLock) return;
+    IOLockLock(gRateLock);
+    gRates.events[code < 15 ? code : 15]++;
+    rate_arm_locked();
+    IOLockUnlock(gRateLock);
+}
+
+static void post_event(uint32_t code, const void *payload, size_t length) {
+    rate_event(code);
+    uint8_t data[16 + sizeof(assoc_event27)]; if (length > sizeof data - 16) length = sizeof data - 16;   // the largest event
+    memset(data, 0, 16);
+    if (gIf) snprintf(reinterpret_cast<char *>(data), 16, "%s%u", ifnet_name(gIf), ifnet_unit(gIf));
+    if (length) memcpy(data + 16, payload, length);
+    struct kev_msg msg; memset(&msg, 0, sizeof msg);
+    msg.vendor_code = KEV_VENDOR_APPLE; msg.kev_class = 6; msg.kev_subclass = 1; msg.event_code = code;
+    msg.dv[0].data_length = static_cast<uint32_t>(16 + length); msg.dv[0].data_ptr = data;
+    const int error = oneios_kev_post_msg(&msg);
+    static unsigned said;   // the first events with their outcome: an event that is not posted is a daemon that waits for ever
+    if (said < 24 || error) {
+        if (said < 64) { ++said; log("event %u for %s, %u bytes -> %d", code, reinterpret_cast<const char *>(data), static_cast<unsigned>(length), error); }
+    }
+}
+
+// ASSOC_DONE: with the join's result where the daemon reads one.
+static void post_assoc_done() {
+    if (!gAssocModern) { post_event(kEvAssocDone, nullptr, 0); return; }
+    assoc_event27 *ev = static_cast<assoc_event27 *>(IOMallocZeroData(sizeof(assoc_event27)));
+    if (!ev) return;
+    IOLockLock(gLock);
+    ev->result = static_cast<uint32_t>(gAssocResult); ev->has_result = 1;
+    memcpy(ev->attempts[0], gCurrent.bss.bssid, 6);
+    IOLockUnlock(gLock);
+    post_event(kEvAssocDone, ev, sizeof *ev);
+    IOFreeData(ev, sizeof(assoc_event27));
+}
+
+// The link for the network configuration (configd's DHCP waits for it), then the Apple80211 link event.
+static void link_event_post(bool up, bool involuntary, uint32_t reason) {
+    link_event ev; memset(&ev, 0, sizeof ev);
+    ev.down = up ? 0 : 1; ev.rssi = gRssi; ev.noise = static_cast<uint16_t>(gNoise); ev.snr = static_cast<uint16_t>(gRssi - gNoise);
+    ev.involuntary = involuntary ? 1 : 0; ev.reason = reason;
+    post_event(kEvLinkChanged, &ev, sizeof ev);
+}
+static void link_changed(bool up, bool involuntary, uint32_t reason) {
+    if (gLink) gLink(up);
+    link_event_post(up, involuntary, reason);
+}
+
+// The joined network went away (a leave, the host's link down, power off): the events a driver sends.
+static void leave_locked(bool involuntary, uint32_t reason, bool *notify) {
+    const bool was_up = gState == kStaUp;
+    if (gState >= kStaAuth && gState < kStaUp && gAssocResult == kAssocRunning) gAssocResult = kAssocFailed;
+    gState = gPower ? kStaIdle : kStaOff;
+    *notify = was_up;
+    (void)involuntary; (void)reason;
+}
+static void left(bool involuntary, uint32_t reason) {
+    post_event(kEvSsidChanged, nullptr, 0); post_event(kEvBssidChanged, nullptr, 0);
+    link_changed(false, involuntary, reason);
+}
+
+// The last good scan's results stand for kScanReuseMs after it finished (gReuseUntil, absolute time; 0: none).
+static uint64_t gReuseUntil;
+static bool gReusing;                  // a reused scan's SCAN_DONE is on its way
+static void scan_finished_locked(bool good) {
+    gReuseUntil = 0;
+    if (good) clock_interval_to_deadline(kScanReuseMs, kMillisecondScale, &gReuseUntil);
+}
+static void scan_timeout(thread_call_param_t, thread_call_param_t) {
+    IOLockLock(gLock);
+    const bool was = gScanning;
+    if (was) {   // the host never finished: what came is the result (not one to give again)
+        Net *t = gScan; gScan = gFill; gFill = t; gScanCount = gFillCount; gFillCount = 0; gScanGeneration++; gScanning = false;
+        if (gState == kStaScanning) gState = kStaIdle;
+        scan_finished_locked(false);
+    }
+    IOLockUnlock(gLock);
+    if (was) { log("scan: no end from the host in %u ms", kScanTimeoutMs); tally(kRateScanTimeout); post_event(kEvScanDone, nullptr, 0); }
+}
+static void join_timeout(thread_call_param_t, thread_call_param_t) {
+    IOLockLock(gLock);
+    const bool was = gAssocResult == kAssocRunning && gState >= kStaAuth && gState < kStaUp;
+    if (was) { gAssocResult = kAssocTimeout; gState = gPower ? kStaIdle : kStaOff; }
+    IOLockUnlock(gLock);
+    if (was) { log("join: no result from the host in %u ms", kJoinTimeoutMs); post_assoc_done(); }
+}
+static void arm(thread_call_t call, unsigned ms) {
+    uint64_t at; clock_interval_to_deadline(ms, kMillisecondScale, &at); thread_call_enter_delayed(call, at);
+}
+
+// The SCAN_DONE of a request answered with the last scan's records, a moment after the request: IO80211 marks its
+// asynchronous scan as pending around the ioctl, and an event that came first would go to the plain callback.
+static void scan_reused(thread_call_param_t, thread_call_param_t) {
+    IOLockLock(gLock);
+    gReusing = false; gScanGeneration++;   // every reader starts the list again
+    const unsigned count = gScanCount;
+    IOLockUnlock(gLock);
+    tally(kRateScanDone, false, count);
+    post_event(kEvScanDone, nullptr, 0);
+}
+
+// A scan request: one scan of the host's at a time; a request while one runs gets that one's SCAN_DONE (one event for
+// both). A request within kScanReuseMs of the end of the last good scan gets that scan's records again (with their
+// own ages and TIMESTAMPs, so a client's age filter sees how old they are) and no new radio scan: on the PC
+// (wifi=sim, 2026-11-15) locationd's Wi-Fi positioning asked wifid for two scans every 6 s for as long as the boot
+// ran (`Async scan requested by "locationd"`, `@WifiFlow, outcome, nofix`: no fix, location off, no GNSS), 20 radio
+// scans a minute; on the phone a scan takes seconds, so the radio scanned back to back and every other client's scan
+// (auto-join, Settings) and a join queued behind them. With no radio (the host has not answered, or power is off)
+// the request is refused and no event is posted: until 2026-11-15 it got an empty SCAN_DONE at once, an event for a
+// scan that never ran, which a daemon that scans again on an empty list answers with the next request at once.
+static int scan() {
+    IOLockLock(gLock);
+    const bool radio = gRadio && gPower;
+    const bool joined = radio && (gScanning || gReusing);
+    const bool reuse = radio && !joined && gReuseUntil && mach_absolute_time() < gReuseUntil;
+    const bool start = radio && !joined && !reuse;
+    if (start) { gScanning = true; gFillCount = 0; if (gState == kStaIdle) gState = kStaScanning; }
+    if (reuse) gReusing = true;
+    IOLockUnlock(gLock);
+    tally(kRateScanAsked, true);
+    if (!radio) { tally(kRateScanRefused); return ENETDOWN; }
+    if (joined) { tally(kRateScanJoined); return 0; }
+    if (reuse) { tally(kRateScanReused); arm(gScanReuse, kScanReuseDelayMs); return 0; }
+    tally(kRateScanStarted);
+    send(OW_SCAN, nullptr, 0); arm(gScanTimeout, kScanTimeoutMs);
+    return 0;
+}
+
+// A join request: the host joins with the vendor's supplicant and answers OW_JOIN_RESULT.
+static int join(const assoc_parameters &a) {
+    ow_join j; memset(&j, 0, sizeof j);
+    if (a.ssid_length == 0 || a.ssid_length > 32 || a.key_length > 64) return EINVAL;
+    j.ssid_length = static_cast<uint8_t>(a.ssid_length); memcpy(j.ssid, a.ssid, a.ssid_length);
+    memcpy(j.bssid, a.bssid, 6);
+    j.security = OW_SECURITY_AUTO;
+    if (a.key_length == 32 && a.key_cipher == kCipherPmk) { j.key_raw = 1; j.key_length = 32; memcpy(j.key, a.key, 32); }
+    else if (a.key_length >= 8 && a.key_length <= 63) {   // a passphrase (cipher 10; another cipher with such a key is taken as one too, and logged)
+        j.key_length = static_cast<uint8_t>(a.key_length); memcpy(j.key, a.key, a.key_length);
+        if (a.key_cipher != kCipherPassphrase) log("join: a key of %u bytes of kind %u: taken as a passphrase", a.key_length, a.key_cipher);
+    }
+    else if (a.key_length) { log("join: a key of %u bytes of kind %u is not one the host can use", a.key_length, a.key_cipher); return EINVAL; }
+    else j.security = OW_SECURITY_OPEN;
+    IOLockLock(gLock);
+    if (!gRadio || !gPower) { gAssocResult = kAssocFailed; IOLockUnlock(gLock); post_assoc_done(); return ENXIO; }
+    bool notify = false;
+    if (gState == kStaUp) leave_locked(false, 0, &notify);
+    memset(&gCurrent, 0, sizeof gCurrent);
+    gCurrent.bss.ssid_length = j.ssid_length; memcpy(gCurrent.bss.ssid, j.ssid, j.ssid_length); memcpy(gCurrent.bss.bssid, j.bssid, 6);
+    for (unsigned i = 0; i < gScanCount; i++) {   // what the last scan knew of it, until the host says
+        if (gScan[i].bss.ssid_length == j.ssid_length && !memcmp(gScan[i].bss.ssid, j.ssid, j.ssid_length)) { gCurrent = gScan[i]; break; }
+    }
+    gState = kStaAuth; gAssocResult = kAssocRunning; gKeyed = j.key_length != 0;
+    IOLockUnlock(gLock);
+    if (notify) left(false, 0);
+    log("join: a network name of %u bytes, %s", j.ssid_length, j.key_raw ? "a PSK" : j.key_length ? "a passphrase" : "open");
+    send(OW_JOIN, &j, sizeof j);
+    memset(&j, 0, sizeof j);
+    arm(gJoinTimeout, kJoinTimeoutMs);
+    return 0;
+}
+static void leave() {
+    bool notify = false;
+    IOLockLock(gLock);
+    const bool pending = gAssocResult == kAssocRunning && gState >= kStaAuth && gState < kStaUp;   // a join that is cut short
+    if (gState >= kStaAuth) leave_locked(false, 0, &notify);
+    IOLockUnlock(gLock);
+    if (pending) thread_call_cancel(gJoinTimeout);
+    send(OW_LEAVE, nullptr, 0);
+    if (notify) left(false, 0);
+    if (pending) post_assoc_done();   // the daemon's wait for the join ends now, with a failure (UniXNU-sheng's order)
+}
+
+// A join that worked, in the order of UniXNU-sheng's driver: the link (configd starts DHCP when it comes up), the
+// join's result, then the network's name and access point and the Apple80211 link event.
+static void joined() {
+    if (gLink) gLink(true);
+    post_assoc_done();
+    post_event(kEvSsidChanged, nullptr, 0); post_event(kEvBssidChanged, nullptr, 0);
+    link_event_post(true, false, 0);
+}
+
+// ---- the host's messages (the transport's receive worker) ----
+// The continuous clock in nanoseconds: what clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) gives user space.
+static uint64_t continuous_ns() { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_continuous_time(), &ns); return ns; }
+static void copy_bss(Net &to, const ow_bss &bss, const uint8_t *ies, size_t available) {
+    to.bss = bss;
+    const uint64_t now = continuous_ns(), ago = static_cast<uint64_t>(bss.age_ms) * 1000000ULL;
+    to.seen_ns = ago < now ? now - ago : now;   // when the radio last saw it: the host says how long ago
+    size_t n = bss.ie_length;
+    if (n > available) n = available;
+    if (n > OW_MAX_IES) n = OW_MAX_IES;
+    to.bss.ie_length = static_cast<uint16_t>(n);
+    memcpy(to.ies, ies, n);
+}
+
+static void host_message(uint16_t type, const uint8_t *payload, size_t length) {
+    switch (type) {
+    case OW_STATE: {
+        if (length < sizeof(ow_state)) return;
+        ow_state s; memcpy(&s, payload, sizeof s);
+        bool notify = false;
+        IOLockLock(gLock);
+        const bool first = !gRadio && s.radio == OW_RADIO_OK, lost = gRadio && s.radio != OW_RADIO_OK;
+        gRadio = s.radio == OW_RADIO_OK;
+        if (s.country[0] >= 'A' && s.country[0] <= 'Z' && s.country[1] >= 'A' && s.country[1] <= 'Z') { gCountry[0] = (char)s.country[0]; gCountry[1] = (char)s.country[1]; }
+        // A state that says "up" for the network a join waits for is that join's result too: the result message
+        // itself can be lost when the receive ring is full (the host sends the state every 2 s while joined).
+        const bool completes = s.link == OW_LINK_UP && gAssocResult == kAssocRunning && gState >= kStaAuth && gState < kStaUp &&
+            s.bss.ssid_length == gCurrent.bss.ssid_length && !memcmp(s.bss.ssid, gCurrent.bss.ssid, gCurrent.bss.ssid_length > 32 ? 32 : gCurrent.bss.ssid_length);
+        if (completes) { gState = kStaUp; gAssocResult = kAssocOk; }
+        if (s.link == OW_LINK_UP) {
+            gRssi = s.rssi_dbm; gNoise = s.noise_dbm ? s.noise_dbm : -95; gRate = s.tx_rate_mbps;
+            if (gState == kStaUp) copy_bss(gCurrent, s.bss, payload + sizeof s, length - sizeof s);
+        } else if (gState == kStaUp) leave_locked(true, s.reason, &notify);
+        IOLockUnlock(gLock);
+        if (first) log("the host has the phone's radio (%02x:%02x:%02x:..)", s.mac[0], s.mac[1], s.mac[2]);
+        if (lost) log("the host has no radio any more");
+        if (notify) { log("link down (reason %u)", s.reason); left(true, s.reason); }
+        if (completes) { thread_call_cancel(gJoinTimeout); log("join done: joined (the host's state says so)"); joined(); }
+        break;
+    }
+    case OW_BSS: {
+        if (length < sizeof(ow_bss)) return;
+        ow_bss bss; memcpy(&bss, payload, sizeof bss);
+        IOLockLock(gLock);
+        if (gScanning && gFillCount < kMaxNetworks) copy_bss(gFill[gFillCount++], bss, payload + sizeof bss, length - sizeof bss);
+        IOLockUnlock(gLock);
+        break;
+    }
+    case OW_SCAN_DONE: {
+        ow_scan_done d = {}; memcpy(&d, payload, length < sizeof d ? length : sizeof d);
+        IOLockLock(gLock);
+        const bool was = gScanning;
+        if (was) {
+            Net *t = gScan; gScan = gFill; gFill = t; gScanCount = gFillCount; gFillCount = 0; gScanGeneration++; gScanning = false;
+            if (gState == kStaScanning) gState = kStaIdle;
+            scan_finished_locked(d.error == 0);
+        }
+        const unsigned count = gScanCount;
+        IOLockUnlock(gLock);
+        if (was) { thread_call_cancel(gScanTimeout); tally(kRateScanDone, false, count); post_event(kEvScanDone, nullptr, 0); }
+        static unsigned shown;
+        if (shown++ < 20) log("scan done: %u networks (host error %d)", count, d.error);
+        break;
+    }
+    case OW_CHANNELS: {
+        ow_channels head = {}; if (length < sizeof head) return;
+        memcpy(&head, payload, sizeof head);
+        unsigned n = head.count;
+        if (n > OW_MAX_CHANNELS) n = OW_MAX_CHANNELS;
+        if (n > (length - sizeof head) / sizeof(ow_channel)) n = static_cast<unsigned>((length - sizeof head) / sizeof(ow_channel));
+        IOLockLock(gLock);
+        memcpy(gChannels, payload + sizeof head, n * sizeof(ow_channel)); gChannelCount = n;
+        IOLockUnlock(gLock);
+        if (n) log("the host's channels: %u, %u MHz to %u MHz", n, gChannels[0].freq_mhz, gChannels[n - 1].freq_mhz);
+        break;
+    }
+    case OW_JOIN_RESULT: {
+        ow_join_result r = {}; memcpy(&r, payload, length < sizeof r ? length : sizeof r);
+        IOLockLock(gLock);
+        const bool pending = gAssocResult == kAssocRunning && gState >= kStaAuth && gState < kStaUp;
+        if (pending) {
+            if (r.status == OW_JOIN_OK) { gState = kStaUp; gAssocResult = kAssocOk; }
+            else {
+                gState = gPower ? kStaIdle : kStaOff;
+                gAssocResult = r.status == OW_JOIN_AUTH ? kAssocBadKey : r.status == OW_JOIN_TIMEOUT ? kAssocTimeout : kAssocFailed;
+            }
+        }
+        IOLockUnlock(gLock);
+        if (!pending) break;
+        thread_call_cancel(gJoinTimeout);
+        log("join %s (status %u, 802.11 code %u)", r.status == OW_JOIN_OK ? "done: joined" : "failed", r.status, r.code);
+        if (r.status == OW_JOIN_OK) joined(); else post_assoc_done();
+        break;
+    }
+    default: break;
+    }
+}
+
+// ---- Apple80211 ----
+static void fill_channel(channel &c, uint32_t mhz) {
+    c.version = 1;
+    if (mhz >= 5925) { c.channel = (mhz - 5950) / 5; c.flags = 0x2 | 0x10 | 0x2000; }   // 6 GHz
+    else if (mhz >= 4900) { c.channel = (mhz - 5000) / 5; c.flags = 0x2 | 0x10; }
+    else { c.channel = mhz == 2484 ? 14 : (mhz - 2407) / 5; c.flags = 0x2 | 0x8; }
+}
+// The channels the radio may use: the host's list (OW_CHANNELS, from nl80211's wiphy on the phone), or until it came
+// (an older runtime) the 2.4 GHz channels 1 to 13 and the common 5 GHz ones, with no restriction flags.
+static unsigned channel_list(ow_channel out[OW_MAX_CHANNELS]) {
+    IOLockLock(gLock);
+    unsigned n = gChannelCount;
+    memcpy(out, gChannels, n * sizeof(ow_channel));
+    IOLockUnlock(gLock);
+    if (n) return n;
+    static const uint16_t known[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+                                      5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620,
+                                      5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825 };
+    for (uint16_t f : known) out[n++] = ow_channel{ f, 0, 0 };
+    return n;
+}
+// The rates of a BSS's Supported Rates and Extended Supported Rates elements, in 500 kb/s units without the basic bit.
+static unsigned rates_of(const Net &n, uint32_t *out, unsigned max) {
+    unsigned count = 0;
+    for (unsigned i = 0; i + 2 <= n.bss.ie_length;) {
+        const uint8_t id = n.ies[i], len = n.ies[i + 1];
+        if (i + 2u + len > n.bss.ie_length) break;
+        if (id == 1 || id == 50) for (unsigned k = 0; k < len && count < max; k++) out[count++] = n.ies[i + 2 + k] & 0x7f;
+        i += 2u + len;
+    }
+    return count;
+}
+// The network's PHY modes from its band, rates and elements: HT Capabilities (45) is 11n, VHT Capabilities (191)
+// 11ac, the HE Capabilities extension (255, extension 35) 11ax; 2.4 GHz is 11b, and 11g too with an OFDM rate.
+static uint32_t phy_mode_of(const Net &n) {
+    uint32_t mode = 0;
+    if (n.bss.freq_mhz >= 4900) mode |= kPhy11a;
+    else {
+        uint32_t rates[15]; const unsigned count = rates_of(n, rates, 15);
+        mode |= kPhy11b;
+        for (unsigned i = 0; i < count; i++)   // an OFDM rate (500 kb/s units: 6, 9, 12, 18 Mb/s and up; 11b has 1, 2, 5.5, 11)
+            if (rates[i] == 12 || rates[i] == 18 || rates[i] == 24 || rates[i] >= 36) { mode |= kPhy11g; break; }
+    }
+    for (unsigned i = 0; i + 2 <= n.bss.ie_length;) {
+        const uint8_t id = n.ies[i], len = n.ies[i + 1];
+        if (i + 2u + len > n.bss.ie_length) break;
+        if (id == 45) mode |= kPhy11n;
+        else if (id == 191) mode |= kPhy11ac;
+        else if (id == 255 && len >= 1 && n.ies[i + 2] == 35) mode |= kPhy11ax;
+        i += 2u + len;
+    }
+    return mode;
+}
+static void fill_result(scan_result &r, const Net &n) {
+    memset(&r, 0, sizeof r); r.version = 1; fill_channel(r.ch, n.bss.freq_mhz); r.noise_known = 1; r.noise = -95; r.rssi = n.bss.signal_dbm;
+    r.snr = static_cast<int16_t>(n.bss.signal_dbm + 95); r.beacon_interval = n.bss.beacon_interval; r.capability = n.bss.capability;
+    memcpy(r.bssid, n.bss.bssid, 6); r.ssid_length = n.bss.ssid_length > 32 ? 32 : n.bss.ssid_length; memcpy(r.ssid, n.bss.ssid, 32);
+    r.age_ms = n.bss.age_ms;
+    uint32_t rates[15]; r.rate_count = static_cast<uint8_t>(rates_of(n, rates, 15));
+    for (unsigned i = 0; i < r.rate_count; i++) r.rates[i] = rates[i] / 2;   // Mb/s
+    const uint16_t ies = n.bss.ie_length > sizeof r.elements ? sizeof r.elements : n.bss.ie_length;
+    r.elements_length = ies; memcpy(r.elements, n.ies, ies);
+}
+static int copy_out(const apple80211req &rq, const void *src, size_t size) {
+    if (rq.req_len == 0 || !rq.req_data) return EINVAL;
+    return copyout(src, rq.req_data, rq.req_len < size ? rq.req_len : size);
+}
+// A get that gives no buffer takes a single value in req_val; one with a buffer gets {version, value}.
+static int answer_value(apple80211req &rq, uint32_t value) {
+    if (rq.req_len == 0 || !rq.req_data) { rq.req_val = static_cast<int32_t>(value); return 0; }
+    const uint32_t w[2] = { 1, value }; return copyout(w, rq.req_data, rq.req_len < sizeof w ? rq.req_len : sizeof w);
+}
+// The raw bytes, their length in req_len.
+static int answer_bytes(apple80211req &rq, const void *src, uint32_t size) {
+    if (!rq.req_data) return EINVAL;
+    const uint32_t n = rq.req_len < size ? rq.req_len : size; rq.req_len = size; return copyout(src, rq.req_data, n);
+}
+static int copy_in(const apple80211req &rq, void *dst, size_t size) {
+    if (!rq.req_data) return EINVAL;
+    memset(dst, 0, size);
+    return copyin(rq.req_data, dst, rq.req_len < size ? rq.req_len : size);
+}
+static int map_state(uint32_t s) {
+    switch (s) { case kStaScanning: return 1; case kStaAuth: return 2; case kStaAssoc: case kStaKeys: return 3; case kStaUp: return 4; default: return 0; }
+}
+
+// Sets this driver cannot carry out and must not swallow: each names another way of doing a thing (Apple's own
+// connectivity layer WCL_*, AWDL_*, NAN*, P2P_*, virtual interfaces, access point modes, offloads, GAS, ranging) or
+// an action on the chip (a private address, a roam, a reset). Refused, the daemon uses the plain requests or goes
+// without (a private address: the radio sends with wlan0's own). Bit n is request n; the numbers are 24A446's
+// (IO80211.framework's table of request names), 287 of them. Every other set is accepted with no effect: the daemon
+// tells the driver its state and policies that way, and Droid-VM saw it give the device up when
+// FILTER_MONITOR_EVENTS (564) was refused.
+static const uint8_t kRefusedSets[76] = {
+    0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x00, 0xf8, 0x3f, 0x08, 0xf3, 0xff, 0xff, 0xff, 0xff,
+    0xc8, 0x9f, 0x1f, 0x5f, 0xb8, 0xe3, 0x3f, 0x39, 0x9a, 0x27, 0xd2, 0xdf, 0x26, 0xc0, 0xf6, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xbf, 0xe5, 0xe8, 0x19, 0xc0, 0x0d, 0x30, 0x22, 0xc8, 0x0b, 0x70, 0x13, 0xff, 0xff, 0x5f, 0x02,
+    0xf1, 0x1b, 0x7c, 0x00, 0xf8, 0xc0, 0x81, 0x00, 0x00, 0x04, 0x00, 0x00, 0x9e, 0x80, 0x22, 0xba, 0x01, 0x2c, 0x60,
+};
+static bool refused_set(int type) { return type >= 0 && static_cast<size_t>(type) < sizeof kRefusedSets * 8 && (kRefusedSets[type / 8] >> (type % 8) & 1); }
+
+static int answer(bool set, apple80211req &rq) {
+    const int type = rq.req_type;
+    union Out { uint8_t raw[kChannelsInfoSize]; channels_list chans; scan_result res; assoc_request assoc; assoc_request27 assoc27; };   // not on the stack
+    Out *outp = static_cast<Out *>(IOMallocData(sizeof(Out)));
+    if (!outp) return ENOMEM;
+    memset(outp, 0, sizeof(Out));
+    struct Free { Out *p; ~Free() { memset(p, 0, sizeof(Out)); IOFreeData(p, sizeof(Out)); } } freeOut{outp};
+    Out &out = *outp;
+    uint32_t *w = reinterpret_cast<uint32_t *>(out.raw);
+    if (set) {
+        switch (type) {
+        case kPower: {
+            uint32_t in[6]; if (copy_in(rq, in, sizeof in)) return EFAULT;
+            const bool on = in[2] != 0;
+            if (on) first_time(kSeenPower, "power on");
+            bool notify = false;
+            IOLockLock(gLock);
+            const bool changed = gPower != on;
+            gPower = on;
+            if (!on) { if (gState >= kStaAuth) leave_locked(false, 0, &notify); gState = kStaOff; scan_finished_locked(false); }
+            else if (gState == kStaOff) gState = kStaIdle;
+            IOLockUnlock(gLock);
+            tally(kRatePowerSet);
+            // POWER_CHANGED only for a change, as a driver reports its state: each one makes wifid read the power
+            // and tell its clients (Settings' switch, Control Center), which redraw. A set to the state it has is
+            // done and says nothing (until 2026-11-15 every set posted one).
+            static unsigned said;
+            if (changed || said < 4) { ++said; log("power %u%s", on ? 1u : 0u, changed ? "" : " (as it was: no event)"); }
+            if (!changed) return 0;
+            tally(kRatePowerChanged);
+            ow_power p = { on ? 1u : 0u }; send(OW_POWER, &p, sizeof p);
+            if (notify) left(false, 0);
+            post_event(kEvPowerChanged, nullptr, 0); return 0; }
+        case kScanReq: case kScanReqMultiple: first_time(kSeenScan, "scan request"); return scan();
+        case kAssociate: {
+            // Only a layout that was seen: the network is never guessed from the key's bytes.
+            if (rq.req_len != sizeof(assoc_request) && rq.req_len != sizeof(assoc_request27)) {
+                log("join: an association request of %u bytes: not a layout this driver knows (592 or 656)", rq.req_len);
+                return EINVAL;
+            }
+            const bool modern = rq.req_len == sizeof(assoc_request27);
+            if (copy_in(rq, out.raw, rq.req_len)) return EFAULT;
+            if ((modern ? out.assoc27.version : out.assoc.version) != 1) return EINVAL;
+            log("join: layout %u, authentication lower 0x%x upper 0x%x, key of %u bytes of kind %u", rq.req_len,
+                modern ? out.assoc27.auth_lower : out.assoc.auth_lower, modern ? out.assoc27.auth_upper : out.assoc.auth_upper,
+                modern ? out.assoc27.network.key_length : out.assoc.network.key_length,
+                modern ? out.assoc27.network.key_cipher : out.assoc.network.key_cipher);
+            gAssocModern = modern;
+            first_time(kSeenJoin, "join request");
+            return join(modern ? out.assoc27.network : out.assoc.network); }
+        case kDisassociate: case kDeauth: log("leave"); leave(); return 0;
+        // Every other set: refused when it asks for something only another kind of driver does, else accepted with
+        // no effect (kRefusedSets).
+        default: return refused_set(type) ? EOPNOTSUPP : 0;
+        }
+    }
+    IOLockLock(gLock);
+    const uint32_t state = gPower ? gState : kStaOff;
+    const Net current = gCurrent;   // a copy: the answers below copy out without the lock
+    const int32_t rssi = gRssi, noise = gNoise;
+    const uint32_t rate = gRate;
+    const int assoc = gAssocResult;
+    const bool keyed = gKeyed;
+    const bool power = gPower;
+    char country[3] = { gCountry[0], gCountry[1], 0 };
+    bool have = false;
+    if (type == kScanResult) {
+        Reader &r = reader_locked(static_cast<const void *>(current_thread()));
+        if (r.cursor < gScanCount) {
+            const Net &n = gScan[r.cursor++];
+            fill_result(out.res, n); memcpy(out.raw + kScanRecordTimestamp, &n.seen_ns, sizeof n.seen_ns);
+            const uint64_t now = continuous_ns();   // AGE as of this answer, the same as CoreWiFi's now minus TIMESTAMP
+            out.res.age_ms = now > n.seen_ns ? static_cast<uint32_t>((now - n.seen_ns) / 1000000) : 0;
+            const uint32_t phy = phy_mode_of(n); memcpy(out.raw + kScanRecordPhyMode, &phy, sizeof phy);
+            have = true;
+        } else memset(&r, 0, sizeof r);   // after the last: the slot is free, and this thread's next read starts again
+    }
+    IOLockUnlock(gLock);
+    if (have) tally(kRateRead, true);
+    switch (type) {
+    case kPower: w[0] = 1; w[1] = 1; w[2] = power ? 1 : 0; return copy_out(rq, w, 24);
+    case kState: return answer_value(rq, static_cast<uint32_t>(map_state(state)));
+    case kOpMode: return answer_value(rq, 1);   // station
+    case kAuthType: w[0] = 1; w[1] = 1; w[2] = keyed && state >= kStaAuth ? 0x10 : 0; w[3] = 0; return copy_out(rq, w, 16);   // {version, lower: open system, upper: WPA2 personal or none, extension}
+    case kPowerSave: return answer_value(rq, 0);
+    case kCardCaps: {   // a bitmap, bit n in byte n / 8: AES, AES-CCM, power management, short slot and preamble, WPA2, WME, short guard interval
+        static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+        for (uint8_t b : has) out.raw[b / 8] |= static_cast<uint8_t>(1u << (b % 8));
+        return answer_bytes(rq, out.raw, 12); }
+    case kPhyMode: {
+        uint32_t active = 0;
+        if (state == kStaUp) active = current.bss.freq_mhz >= 4900 ? 0x2 : 0x8;   // 11a, 11g as the active PHY of the band
+        w[0] = 1; w[1] = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40; w[2] = active; return copy_out(rq, w, 12); }
+    case kSsid: if (state < kStaAssoc) return ENOENT; return answer_bytes(rq, current.bss.ssid, current.bss.ssid_length);
+    case kBssid: if (state < kStaAssoc) return ENOENT; return answer_bytes(rq, current.bss.bssid, 6);
+    case kChannel: if (state < kStaAuth || !current.bss.freq_mhz) return ENOENT; w[0] = 1; fill_channel(*reinterpret_cast<channel *>(out.raw + 4), current.bss.freq_mhz); return copy_out(rq, w, 16);
+    case kRssi: case kNoise: {   // {version, radios, unit (0: dBm), per chain[4], aggregate, extension per chain[4], its aggregate}
+        if (type == kRssi && state != kStaUp) return ENOENT;
+        const uint32_t v = static_cast<uint32_t>(type == kRssi ? rssi : noise);
+        w[0] = 1; w[1] = 1; w[2] = 0; for (int i = 3; i < 13; i++) w[i] = v; return copy_out(rq, w, 13 * 4); }
+    case kRssiBounds: w[0] = 1; w[1] = static_cast<uint32_t>(-90); w[2] = static_cast<uint32_t>(-40); w[3] = static_cast<uint32_t>(-80); return copy_out(rq, w, 16);
+    case kRate: return answer_value(rq, state == kStaUp ? (rate ? rate : 54) : 0);
+    case kTxPower: return answer_value(rq, 15);
+    case kDriverVersion: case kHardwareVersion: {
+        strlcpy(reinterpret_cast<char *>(out.raw), type == kDriverVersion ? "oneios-wifi 1" : "WCN785x (the phone's, through its vendor stack)", 256);
+        return copy_out(rq, out.raw, 256); }
+    case kCountryCode: return answer_bytes(rq, country, 3);   // the two letters and a NUL (the daemon asks with a 3-byte buffer)
+    case kAssociateResult: return answer_value(rq, static_cast<uint32_t>(assoc));
+    case kSupportedChannels: case kHwSupportedChannels: {   // the host's channels: active unless passive-only, DFS where radar
+        ow_channel list[OW_MAX_CHANNELS]; const unsigned count = channel_list(list);
+        out.chans.version = 1; unsigned n = 0;
+        for (unsigned i = 0; i < count && n < 401; i++) {
+            fill_channel(out.chans.list[n], list[i].freq_mhz);
+            if (!(list[i].flags & OW_CH_PASSIVE)) out.chans.list[n].flags |= 0x80;   // APPLE80211_C_FLAG_ACTIVE
+            if (list[i].flags & OW_CH_RADAR) out.chans.list[n].flags |= 0x100;       // APPLE80211_C_FLAG_DFS
+            n++;
+        }
+        out.chans.count = n; return copy_out(rq, &out.chans, sizeof out.chans); }
+    case kChannelsInfo: {
+        // 24A446's IO80211 (Apple80211GetWithIOCTL, type 207) reads a 10016-byte record: the count (16 bits) at 0x0c,
+        // then per channel i (at most 400) the number at 0x32e+i, indoor only at 0x4be+i, DFS at 0x64e+i, passive at
+        // 0x7de+i, 40 MHz at 0x96e+i, 80 MHz at 0xafe+i (bytes), a 32-bit bitmap at 0x12d0+4i (zero: wifid does not
+        // read it) and a 6 GHz flag at 0x1aa0+i (CHANNELINFO_BAND_NUM: 1 with it, else 0 below channel 15 and 3
+        // above). wifid reads CH_NUM, DFS, BAND_NUM, 40MHZ and 80MHZ; it logged "Could not read
+        // APPLE80211_IOC_CHANNELS_INFO err=-3903" while this was refused (the phone, 2026-11-13).
+        ow_channel list[OW_MAX_CHANNELS]; const unsigned count = channel_list(list);
+        w[0] = 1;
+        unsigned n = 0;
+        for (unsigned i = 0; i < count && n < 400; i++) {
+            const uint16_t f = list[i].freq_mhz; const uint8_t fl = list[i].flags;
+            const bool six = f >= 5925, five = f >= 4900 && !six;
+            channel c; fill_channel(c, f);
+            out.raw[0x32e + n] = static_cast<uint8_t>(c.channel);
+            out.raw[0x4be + n] = (fl & OW_CH_INDOOR) ? 1 : 0;
+            out.raw[0x64e + n] = (fl & OW_CH_RADAR) ? 1 : 0;
+            out.raw[0x7de + n] = (fl & OW_CH_PASSIVE) ? 1 : 0;
+            out.raw[0x96e + n] = (five || six) && !(fl & OW_CH_NO_HT40) ? 1 : 0;
+            out.raw[0xafe + n] = (five || six) && !(fl & OW_CH_NO_80MHZ) ? 1 : 0;
+            out.raw[0x1aa0 + n] = six ? 1 : 0;
+            n++;
+        }
+        const uint16_t n16 = static_cast<uint16_t>(n); memcpy(out.raw + 0x0c, &n16, 2);
+        static bool said;
+        if (!said) { said = true; log("channels info: %u channels (%s list)", n, gChannelCount ? "the host's" : "the built-in"); }
+        return copy_out(rq, out.raw, kChannelsInfoSize); }
+    case kScanResult: {
+        if (!have) return EIO;   // after the last record
+        static bool dumped;      // the first record of the boot, field by field, as the framework will read it
+        if (!dumped) {
+            dumped = true;
+            uint64_t stamp; memcpy(&stamp, out.raw + kScanRecordTimestamp, sizeof stamp);
+            uint32_t phy; memcpy(&phy, out.raw + kScanRecordPhyMode, sizeof phy);
+            const uint64_t now = continuous_ns(); const scan_result &r = out.res;
+            log("scan record 1 (%u B): ch %u flags 0x%x RSSI %d noise %d SNR %d cap 0x%x beacon %u BSSID %02x:%02x:%02x:.. name %u B "
+                "%u rates age %u ms TIMESTAMP %llu ns (%llu ms ago) PHY 0x%x IEs %u B",   // short: the console cuts a line at about 250
+                rq.req_len, r.ch.channel, r.ch.flags, r.rssi, r.noise, r.snr, r.capability, r.beacon_interval, r.bssid[0], r.bssid[1], r.bssid[2],
+                r.ssid_length, r.rate_count, r.age_ms, static_cast<unsigned long long>(stamp),
+                static_cast<unsigned long long>(now > stamp ? (now - stamp) / 1000000 : 0), phy, r.elements_length);
+        }
+        return copy_out(rq, out.raw, rq.req_len >= kScanRecord27 ? kScanRecord27 : sizeof out.res); }
+    case kCurrentNetwork: {
+        if (state < kStaAssoc) return ENOENT;
+        fill_result(out.res, current); out.res.rssi = static_cast<int16_t>(rssi);
+        const uint64_t now = continuous_ns(); memcpy(out.raw + kScanRecordTimestamp, &now, sizeof now);   // joined: seen now
+        out.res.age_ms = 0;
+        const uint32_t phy = phy_mode_of(current); memcpy(out.raw + kScanRecordPhyMode, &phy, sizeof phy);
+        return copy_out(rq, out.raw, rq.req_len >= kScanRecord27 ? kScanRecord27 : sizeof out.res); }
+    default: return EOPNOTSUPP;
+    }
+}
+
+// Each request with its answer for the first few hundred, then a type's first one only.
+static int request(bool set, apple80211req &rq) {
+    const uint32_t length = rq.req_len; const int32_t value = rq.req_val, type = rq.req_type;
+    first_time(kSeenRequest, "Apple80211 request");
+    const int error = answer(set, rq);
+    oneios_wifi_requests = oneios_wifi_requests + 1;
+    if (error == EOPNOTSUPP) { oneios_wifi_refused = oneios_wifi_refused + 1; oneios_wifi_last_refused = static_cast<uint32_t>(type); }
+    static unsigned shown;
+    const bool first = type >= 0 && type < 256 && !(gLogged[type / 32] & (1u << (type % 32)));
+    if (type >= 0 && type < 256) gLogged[type / 32] |= 1u << (type % 32);
+    if (shown < 150 || first || type == kScanReq || type == kAssociate || type == kDisassociate) {
+        ++shown;
+        char who[24] = "?"; proc_selfname(who, sizeof who);   // wifid, or another client of IO80211.framework
+        log("%s[%d] %s %d: len %u val %d -> %d (len %u val %d)", who, proc_selfpid(), set ? "sets" : "gets", type, length, value, error, rq.req_len, rq.req_val);
+    }
+    return error;
+}
+
+static bool station_init() {
+    gLock = IOLockAlloc();
+    gScan = static_cast<Net *>(IOMallocZeroData(sizeof(Net) * kMaxNetworks));
+    gFill = static_cast<Net *>(IOMallocZeroData(sizeof(Net) * kMaxNetworks));
+    gScanTimeout = thread_call_allocate(scan_timeout, nullptr);
+    gScanReuse = thread_call_allocate(scan_reused, nullptr);
+    gJoinTimeout = thread_call_allocate(join_timeout, nullptr);
+    gRateCall = thread_call_allocate(rate_line, nullptr);
+    gRateLock = IOLockAlloc();   // last: tally() counts nothing until the call it arms exists
+    return gLock && gScan && gFill && gScanTimeout && gJoinTimeout && gScanReuse && gRateCall && gRateLock;
+}
+
+}  // namespace oneios_wifi
+
+// The classes configd and wifid know a Wi-Fi interface by; Apple's IO80211Family, which defines both, is not in
+// this kernel or its collection.
+class IO80211Interface : public IOEthernetInterface {
+    OSDeclareDefaultStructors(IO80211Interface)
+    typedef IOEthernetInterface super;
+public:
+    // wifid finds the interface an if_attached event names by IOPropertyMatch {IOInterfaceName: "en0"}, a property
+    // IONetworkInterface does not publish: set as the interface is attached to DLIL.
+    bool initIfnetParams(struct ifnet_init_params *params) override {
+        if (!super::initIfnetParams(params)) return false;
+        char name[16];   // IFNAMSIZ
+        snprintf(name, sizeof name, "%s%u", params->name, params->unit);
+        setProperty("IOInterfaceName", name);
+        // configd's InterfaceNamer names it (IONetworkStack's user client attaches it to the network stack): from here
+        // on wifid can find it. The time says whether naming or what comes after it is the wait.
+        oneios_wifi::first_time(oneios_wifi::kSeenNamed, "naming (en0 attached to the network stack)");
+        return true;
+    }
+    SInt32 performCommand(IONetworkController *controller, unsigned long command, void *argument0, void *argument1) override {
+        if (!oneios_wifi::gIf) oneios_wifi::gIf = getIfnet();
+        if (command == SIOCGA80211 || command == SIOCSA80211) {
+            if (!argument1) return EINVAL;
+            return oneios_wifi::request(command == SIOCSA80211, *static_cast<oneios_wifi::apple80211req *>(argument1));
+        }
+        static unsigned said;   // the interface requests that are not Apple80211's, the first of them: what configures en0, and when
+        if (said < 24) {
+            ++said;
+            char who[24] = "?"; proc_selfname(who, sizeof who);
+            oneios_wifi::log("%s[%d]: interface request 0x%lx", who, proc_selfpid(), command);
+        }
+        return super::performCommand(controller, command, argument0, argument1);
+    }
+    // IO80211.framework can ask the interface for a user client before it uses the requests above. The family's
+    // answer stands (its own network user client, or a refusal); who asked, and for which type, is logged.
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override {
+        static unsigned said;
+        const IOReturn result = super::newUserClient(owningTask, securityID, type, handler);
+        if (said < 8) {
+            ++said;
+            char who[24] = "?"; proc_selfname(who, sizeof who);
+            oneios_wifi::log("%s[%d] asks the interface for a user client of type 0x%x -> 0x%x", who, proc_selfpid(), type, result);
+        }
+        return result;
+    }
+};
+OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
+
+class IO80211Controller : public IOEthernetController {
+    OSDeclareAbstractStructors(IO80211Controller)
+    typedef IOEthernetController super;
+public:
+    // IO80211.framework's interface list takes an interface whose SIOCGIFTYPE is IFT_ETHER of the Wi-Fi subfamily.
+    IONetworkInterface *createInterface() override {
+        IO80211Interface *interface = OSTypeAlloc(IO80211Interface);
+        if (interface && !interface->init(this)) OSSafeReleaseNULL(interface);
+        if (interface) {
+            oneios_net_set_subtype(interface, IFNET_SUBFAMILY_WIFI);
+            interface->setProperty("IO80211InterfaceRole", "Infrastructure");
+        }
+        return interface;
+    }
+};
+OSDefineMetaClassAndAbstractStructors(IO80211Controller, IOEthernetController)
+
+// The phone's Wi-Fi: one IEEE 802.11 medium, the link active only while the station is joined; frames to and from
+// the transport while joined.
+class OneiOSWifiController : public IO80211Controller {
+    OSDeclareDefaultStructors(OneiOSWifiController)
+    typedef IO80211Controller super;
+
+    IOEthernetAddress address;
+    IONetworkInterface *interface;
+    IONetworkMedium *medium;
+    bool enabled;
+
+    static OneiOSWifiController *gSelf;
+    // The medium stays the IEEE 802.11 one while the link is down: IO80211.framework lists an interface as Wi-Fi by
+    // its media (24A446's __getIfListCopy: SIOCGIFMEDIA's current medium must be of the IEEE 802.11 type; it asks the
+    // interface's type and subfamily only when that request fails), and the family answers SIOCGIFMEDIA from the
+    // selected and the active medium. With none of them set wifid never took en0 and never scanned (the phone,
+    // 2026-11-12).
+    static void link(bool up) {
+        if (gSelf) gSelf->setLinkStatus(up ? kIONetworkLinkValid | kIONetworkLinkActive : kIONetworkLinkValid, gSelf->medium, up ? WIFI_SPEED : 0);
+    }
+
+public:
+    bool initWithAddress(const uint8_t mac[6]) {
+        if (!super::init(nullptr)) return false;
+        memcpy(address.bytes, mac, kIOEthernetAddressSize);
+        memcpy(oneios_wifi::gMac, mac, 6);
+        return true;
+    }
+    void free() override {
+        OSSafeReleaseNULL(interface);
+        OSSafeReleaseNULL(medium);
+        super::free();
+    }
+    bool start(IOService *provider) override {
+        if (!super::start(provider)) return false;
+        // IONetworkMedium::medium and addMedium are not virtual (not bound): the object by its class name, its
+        // virtual init, and the dictionary keyed by its name, as addMedium does.
+        const OSSymbol *mediumClass = OSSymbol::withCString("IONetworkMedium");
+        OSObject *object = mediumClass ? OSMetaClass::allocClassWithName(mediumClass) : nullptr;
+        OSSafeReleaseNULL(mediumClass);
+        medium = object && object->metaCast("IONetworkMedium") ? reinterpret_cast<IONetworkMedium *>(object) : nullptr;
+        if (!medium) OSSafeReleaseNULL(object);
+        if (medium && !medium->init(kIOMediumIEEE80211Auto, WIFI_SPEED, 0, 0, "IEEE 802.11 auto")) OSSafeReleaseNULL(medium);
+        OSDictionary *media = OSDictionary::withCapacity(1);
+        bool published = medium && media && medium->getName() && media->setObject(medium->getName(), medium) && publishMediumDictionary(media);
+        OSSafeReleaseNULL(media);
+        if (!published) return false;
+        setSelectedMedium(medium);                              // SIOCGIFMEDIA's current medium, from the first request on
+        setLinkStatus(kIONetworkLinkValid, medium, 0);          // its active medium; the link itself is down until a join
+        if (!attachInterface(&interface, true)) return false;
+        gSelf = this;
+        oneios_wifi::gLink = link;
+        return true;
+    }
+    IOReturn getHardwareAddress(IOEthernetAddress *addressOut) override { *addressOut = address; return kIOReturnSuccess; }
+    // The radio sends with wlan0's address only: iOS's private (random) addresses are refused.
+    IOReturn setHardwareAddress(const IOEthernetAddress *addressIn) override { (void)addressIn; return kIOReturnUnsupported; }
+    IOReturn enable(IONetworkInterface *client) override {
+        (void)client;
+        enabled = true;
+        oneios_wifi::log("the interface is enabled (en0 is up)");
+        oneios_wifi::first_time(oneios_wifi::kSeenEnabled, "enable (IFF_UP)");
+        oneios_wifi::gIf = interface->getIfnet();
+        IOLockLock(oneios_wifi::gLock);
+        const bool up = oneios_wifi::gState == oneios_wifi::kStaUp;
+        IOLockUnlock(oneios_wifi::gLock);
+        link(up);
+        return kIOReturnSuccess;
+    }
+    IOReturn disable(IONetworkInterface *client) override { (void)client; enabled = false; setLinkStatus(kIONetworkLinkValid, medium, 0); return kIOReturnSuccess; }
+    UInt32 outputPacket(mbuf_t packet, void *parameter) override {
+        (void)parameter;
+        uint8_t frame[WIFI_FRAME];
+        size_t length = mbuf_pkthdr_len(packet);
+        bool up = enabled && __atomic_load_n(&oneios_wifi::gState, __ATOMIC_RELAXED) == oneios_wifi::kStaUp;
+        if (up && length >= ETHER_HDR_LEN && length <= sizeof frame && mbuf_copydata(packet, 0, length, frame) == 0 &&
+            !(frame[12] == (uint8_t)(OW_ETHERTYPE >> 8) && frame[13] == (uint8_t)OW_ETHERTYPE) &&
+            droidvm_net_tx_frame(frame, static_cast<unsigned>(length)) == 0) {
+            oneios_wifi_tx = oneios_wifi_tx + 1;
+        } else oneios_wifi_dropped = oneios_wifi_dropped + 1;
+        freePacket(packet);
+        return kIOReturnOutputSuccess;
+    }
+    IOReturn setPromiscuousMode(bool active) override { (void)active; return kIOReturnSuccess; }
+    IOReturn setMulticastMode(bool active) override { (void)active; return kIOReturnSuccess; }
+    IOReturn setMulticastList(IOEthernetAddress *addresses, UInt32 count) override { (void)addresses; (void)count; return kIOReturnSuccess; }
+    // A frame from the transport (its one receive thread, so inputPacket calls are serialized).
+    void input(const void *frame, unsigned length) {
+        if (!interface || !enabled || length < ETHER_HDR_LEN || length > WIFI_FRAME) return;
+        if (__atomic_load_n(&oneios_wifi::gState, __ATOMIC_RELAXED) != oneios_wifi::kStaUp) { oneios_wifi_dropped = oneios_wifi_dropped + 1; return; }
+        mbuf_t packet = allocatePacket(length);
+        if (!packet) return;
+        if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) != 0) { freePacket(packet); return; }
+        oneios_wifi_rx = oneios_wifi_rx + 1;
+        interface->inputPacket(packet, length);
+    }
+};
+OSDefineMetaClassAndStructors(OneiOSWifiController, IO80211Controller)
+OneiOSWifiController *OneiOSWifiController::gSelf;
+
+// ---- the start: the classes, then the transport; the controller once the device is up ----
+extern "C" void oneios_net_static_init(void) __asm__("__GLOBAL__sub_I_OneiOSWifi.cpp");
+struct MetaClassHead { void *vtable; void *reserved; const OSMetaClass *superClassLink; };
+static OneiOSWifiController *gController;
+static bool gRegistered;
+
+// On the caller's thread (the board's late start), as hid/ does: the kext load and the class registration take the
+// kext and class-loading locks and must not run beside another thread's kext loads.
+static bool register_classes() {
+    OSReturn status = OSKextLoadKextWithIdentifier("com.apple.iokit.IONetworkingFamily");
+    const OSMetaClass *controller = nullptr, *interface = nullptr;
+    if (const OSSymbol *name = OSSymbol::withCString("IOEthernetController")) { controller = OSMetaClass::getMetaClassWithName(name); name->release(); }
+    if (const OSSymbol *name = OSSymbol::withCString("IOEthernetInterface")) { interface = OSMetaClass::getMetaClassWithName(name); name->release(); }
+    if (status != kOSReturnSuccess || !controller || !interface) {
+        IOLog("ONEIOS WIFI: off: no IONetworkingFamily (load status 0x%x; the kernel is not in a kernel collection)\n", status);
+        return false;
+    }
+    oneios_wifi_stage = 1;
+    const OSMetaClass *boundController = reinterpret_cast<const OSMetaClass *>(oneios_net_controller_meta_link + vm_kernel_slide);
+    const OSMetaClass *boundInterface = reinterpret_cast<const OSMetaClass *>(oneios_net_interface_meta_link + vm_kernel_slide);
+    if (controller != boundController || interface != boundInterface || controller->getClassSize() != oneios_net_controller_size ||
+        interface->getClassSize() != oneios_net_interface_size) {
+        IOLog("ONEIOS WIFI: off: the live IOEthernetController/IOEthernetInterface (%p %u, %p %u) are not the bound ones (%p %u, %p %u): "
+              "the bindings are for another kernel collection\n", controller, controller->getClassSize(), interface, interface->getClassSize(),
+              boundController, oneios_net_controller_size, boundInterface, oneios_net_interface_size);
+        return false;
+    }
+    oneios_wifi_stage = 2;
+    void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!module) { IOLog("ONEIOS WIFI: off: the kernel's module could not be opened for class registration\n"); return false; }
+    oneios_net_static_init();
+    // The superclass each static initializer passed is the absolute symbol's value: the link address.
+    struct { char *meta; const OSMetaClass *bound; uint64_t link; } fix[] = {
+        { oneios_net_controller_meta, boundController, oneios_net_controller_meta_link },
+        { oneios_net_interface_meta, boundInterface, oneios_net_interface_meta_link },
+    };
+    bool linked = true;
+    for (auto &f : fix) {
+        MetaClassHead *head = reinterpret_cast<MetaClassHead *>(f.meta);
+        if (reinterpret_cast<uint64_t>(head->superClassLink) == f.link) head->superClassLink = f.bound;
+        linked = linked && head->superClassLink == f.bound;
+    }
+    if (!linked || OSMetaClass::postModLoad(module)) {
+        IOLog("ONEIOS WIFI: off: the classes did not register below IOEthernetController and IOEthernetInterface\n");
+        return false;
+    }
+    oneios_wifi_stage = 3;
+    return true;
+}
+
+// On the transport's worker thread, once the device is up.
+int droidvm_net_if_attach(const uint8_t mac[6]) {
+    IOService *resources = IOService::getResourceService();
+    if (!gRegistered || !resources) return -1;
+    // A built-in nub: IONetworkInterface turns its "built-in" into IOBuiltin, so configd's InterfaceNamer names it en0.
+    IOService *nub = OSTypeAlloc(IOService);
+    if (!nub || !nub->init()) { OSSafeReleaseNULL(nub); return -1; }
+    nub->setName("oneios-wlan");
+    nub->setProperty("built-in", kOSBooleanTrue);
+    // en0's unit is reserved, as the iPhone's own Wi-Fi node reserves it (24A446's device tree:
+    // /arm-io/apcie/pci-bridge0/centauri-alpha has network-interface-unit-en = <0>). configd's InterfaceNamer
+    // (NetworkInterfaceGetReservedRange: the property on the interface or a parent in the service plane) then names
+    // the interface en0 at once. Without it en0 is an interface the naming database does not know whenever its
+    // address is new (wlan0's address is a random one while One UI is not joined, so it changes between sessions),
+    // and a new interface is named only once IOKit is quiet ("waiting for quiet"): only after driverkitd has sent its
+    // dexts' personalities (on the phone en0 came up at +130 s and +162 s on 2026-11-12, 261 s in an earlier session).
+    // InterfaceNamer still refuses the unit when its database has en0 at another registry path (builtinAvailable).
+    static const uint32_t kUnitEn0 = 0;
+    nub->setProperty("network-interface-unit-en", const_cast<uint32_t *>(&kUnitEn0), sizeof kUnitEn0);
+    if (!nub->attach(resources)) { nub->release(); return -1; }
+    OneiOSWifiController *controller = OSTypeAlloc(OneiOSWifiController);
+    if (!controller || !controller->initWithAddress(mac)) { OSSafeReleaseNULL(controller); return -1; }
+    if (!controller->attach(nub)) { controller->release(); return -1; }
+    if (!controller->start(nub)) { controller->detach(nub); controller->release(); IOLog("ONEIOS WIFI: off: the controller did not start\n"); return -1; }
+    gController = controller;
+    oneios_wifi_stage = 4;
+    IOLog("ONEIOS WIFI: on: the phone's Wi-Fi, address %02x:%02x:%02x:%02x:%02x:%02x; asking the host for its radio\n",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ow_hello hello = { OW_VERSION };
+    oneios_wifi::send(OW_HELLO, &hello, sizeof hello);
+    return 0;
+}
+
+void droidvm_net_if_input(const void *frame, unsigned length) {
+    const uint8_t *f = static_cast<const uint8_t *>(frame);
+    if (length >= 14 + sizeof(ow_header) && f[12] == (uint8_t)(OW_ETHERTYPE >> 8) && f[13] == (uint8_t)OW_ETHERTYPE) {
+        ow_header h; memcpy(&h, f + 14, sizeof h);
+        if (h.magic == OW_MAGIC && 14 + sizeof h + h.length <= length) oneios_wifi::host_message(h.type, f + 14 + sizeof h, h.length);
+        return;   // never iOS's: a frame of this type from the radio is dropped here
+    }
+    if (gController) gController->input(frame, length);
+}
+
+void oneios_net_start(void) {
+    uint32_t enabled = 1;
+    PE_parse_boot_argn("oneios-wifi", &enabled, sizeof enabled);
+    if (!enabled) { IOLog("ONEIOS WIFI: off (oneios-wifi=0)\n"); return; }
+    oneios_wifi::gStartTime = mach_absolute_time();
+    if (!oneios_wifi::station_init()) { IOLog("ONEIOS WIFI: off: no memory for the station\n"); return; }
+    gRegistered = register_classes();
+    if (!gRegistered) return;
+    IOLog("ONEIOS WIFI: classes registered below the collection's IOEthernetController and IOEthernetInterface; starting /arm-io/net\n");
+    droidvm_net_start();   // the transport: maps /arm-io/net, starts its worker, which calls droidvm_net_if_attach
+}

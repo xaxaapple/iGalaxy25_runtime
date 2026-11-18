@@ -1,0 +1,33 @@
+// A made-up source for the edit list "gpu3d" (no Python original: written by hand, 2026-11-13): every anchor once.
+// (before anchor 0)
+DroidVMClientMemory droidvm_virtgpu_client_memory[64];
+// (before anchor 1)
+    c->resources[c->resourceCount++] = r;
+// (before anchor 2)
+        c->closed[c->closedCount++] = {*r, c->sequence};
+// (before anchor 3)
+    countPages(c, r, -1);
+// (before anchor 4)
+volatile int droidvm_virtgpu_compositor_pid;
+// (before anchor 5)
+            gSurfaceUses[gSurfaceUseCount++] = {record.surface, record.written != 0, c, answer};
+// (before anchor 6)
+        if (gSurfaceUses[i].client == c && (!ticket || gSurfaceUses[i].ticket == ticket)) {
+// (before anchor 7)
+    droidvm_surface_lock_options[options & 3] = droidvm_surface_lock_options[options & 3] + 1;
+// (before anchor 8)
+    count(4);
+// (before anchor 9)
+    if (entries) IODeleteData(entries, Entry, entryCapacity);
+// (before anchor 10)
+    IOLockUnlock(lock);
+    return status;
+}
+}
+}
+// For the display: the holds taken so far
+// (before anchor 11)
+    CtxCreate create = {{CmdCtxCreate, 0, 0, context, 0, {}}, 0, in.capset_id, {'x', 'n', 'u', ':'}};
+// (before anchor 12)
+    Submit submit = {{CmdSubmit3D, uint32_t(FlagFence) | uint32_t(FlagRingIndex), fence, c->context, uint8_t(in.ring_idx), {}}, in.size, 0};
+// (the end)

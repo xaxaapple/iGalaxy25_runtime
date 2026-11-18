@@ -1,0 +1,273 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * OneiOS: what a DisplayBrightness request to the backlight service holds, decoded with integers only (the kernel
+ * builds with no floating point). Portable C and C++, unit-tested on the host (test_bl_request.c, drivers/tests/host.sh).
+ *
+ * iOS 27's CoreBrightness (24A446, read with ipsw in the shared cache; README.md "DisplayBrightness"):
+ * __DisplaySetProperty_block_invoke takes the key DisplayBrightness either as a number, the slider's position 0..1
+ * read as kCFNumberFloatType (it then interpolates its slider-to-nits table at position * (points - 1)), or as a
+ * dictionary { Brightness = 0..1 (Float32, or an integer converted to float), Commit = bool, Period = seconds }.
+ * How IOKit's serialization hands a CFNumber of a float type to the kernel is not known here [U]: as its 32 or 64
+ * bits of IEEE 754, or as the integer the value truncates to. So a number is taken as a fraction only when its bits
+ * are a float or double between 2^-27 and 1 (an integer of that size is a float's bit pattern, not a count); the
+ * integers 0 and 1 are ambiguous (a truncated float would give 0 for every position below the top: the panel at its
+ * floor) and are not used; other integers are not a fraction.
+ */
+#ifndef ONEIOS_BL_REQUEST_H
+#define ONEIOS_BL_REQUEST_H
+
+#include <stdint.h>
+
+#define OBL_FRACTION_FULL 65535u
+
+enum {
+	OBL_DECODED = 0,
+	OBL_NOT_A_NUMBER = -1,     /* NaN, infinity, negative, out of range, not a float's bits */
+	OBL_AMBIGUOUS = -2,        /* the integer 0 or 1: maybe a float that lost its fraction */
+};
+
+/* value * scale, rounded, of an IEEE 754 single; -1 for NaN, infinity, a negative number or one of 2^23 or more. */
+static inline int64_t
+obl_f32_scale(uint32_t bits, uint32_t scale)
+{
+	uint32_t e = (bits >> 23) & 0xffu, m = bits & 0x7fffffu;
+	if (e == 0xffu) {
+		return -1;
+	}
+	if (bits >> 31) {
+		return (e | m) ? -1 : 0;
+	}
+	if (e == 0) {
+		return 0;                    /* zero or a denormal */
+	}
+	int shift = 150 - (int)e;        /* value = (2^23 | m) * 2^-shift */
+	if (shift <= 0) {
+		return -1;
+	}
+	if (shift > 63) {
+		return 0;
+	}
+	uint64_t product = (uint64_t)(0x800000u | m) * scale;
+	return (int64_t)((product + (1ull << (shift - 1))) >> shift);
+}
+
+/* The same for an IEEE 754 double (its mantissa cut to 24 bits). */
+static inline int64_t
+obl_f64_scale(uint64_t bits, uint32_t scale)
+{
+	uint32_t e = (uint32_t)(bits >> 52) & 0x7ffu;
+	uint64_t m = bits & 0xfffffffffffffull;
+	if (e == 0x7ffu) {
+		return -1;
+	}
+	if (bits >> 63) {
+		return (e | m) ? -1 : 0;
+	}
+	if (e == 0) {
+		return 0;
+	}
+	int shift = 1023 + 23 - (int)e;  /* value = ((2^52 | m) >> 29) * 2^-shift */
+	if (shift <= 0) {
+		return -1;
+	}
+	if (shift > 63) {
+		return 0;
+	}
+	uint64_t product = (((1ull << 52) | m) >> 29) * scale;
+	return (int64_t)((product + (1ull << (shift - 1))) >> shift);
+}
+
+/* A scaled value as a fraction 0..OBL_FRACTION_FULL; up to 1% over the top is the top (a float's 1.0000001). */
+static inline int32_t
+obl_fraction_of(int64_t scaled)
+{
+	if (scaled < 0 || scaled > (int64_t)OBL_FRACTION_FULL * 101 / 100) {
+		return OBL_NOT_A_NUMBER;
+	}
+	return scaled > (int64_t)OBL_FRACTION_FULL ? (int32_t)OBL_FRACTION_FULL : (int32_t)scaled;
+}
+
+/* A number's bits (an OSNumber's value, `bits` wide) as the slider's fraction, or OBL_AMBIGUOUS / OBL_NOT_A_NUMBER. */
+static inline int32_t
+obl_number_fraction(uint64_t value, unsigned bits)
+{
+	if (value <= 1) {
+		return OBL_AMBIGUOUS;
+	}
+	if (bits > 32 && value > 0xffffffffull) {
+		uint32_t e = (uint32_t)(value >> 52) & 0x7ffu;
+		return e >= 1023 - 27 && e <= 1023 ? obl_fraction_of(obl_f64_scale(value, OBL_FRACTION_FULL)) : OBL_NOT_A_NUMBER;
+	}
+	uint32_t e = (uint32_t)(value >> 23) & 0xffu;
+	return value <= 0xffffffffull && e >= 127 - 27 && e <= 127 ? obl_fraction_of(obl_f32_scale((uint32_t)value, OBL_FRACTION_FULL))
+	                                                          : OBL_NOT_A_NUMBER;
+}
+
+/* 4 or 8 bytes (an OSData, little-endian) of a float or double as the fraction. */
+static inline int32_t
+obl_data_fraction(const uint8_t *bytes, unsigned length)
+{
+	uint64_t v = 0;
+	if (length != 4 && length != 8) {
+		return OBL_NOT_A_NUMBER;
+	}
+	for (unsigned i = 0; i < length; i++) {
+		v |= (uint64_t)bytes[i] << (8 * i);
+	}
+	return obl_fraction_of(length == 4 ? obl_f32_scale((uint32_t)v, OBL_FRACTION_FULL) : obl_f64_scale(v, OBL_FRACTION_FULL));
+}
+
+/* A decimal text ("0.5", "1", ".25") as the fraction. */
+static inline int32_t
+obl_string_fraction(const char *s)
+{
+	uint64_t whole = 0, micro = 0, place = 100000;
+	int digits = 0;
+	while (*s >= '0' && *s <= '9') {
+		whole = whole * 10 + (uint64_t)(*s++ - '0');
+		digits++;
+		if (whole > 1) {
+			return OBL_NOT_A_NUMBER;
+		}
+	}
+	if (*s == '.') {
+		s++;
+		while (*s >= '0' && *s <= '9') {
+			micro += place * (uint64_t)(*s++ - '0');
+			place /= 10;
+			digits++;
+		}
+	}
+	if (*s != 0 || digits == 0) {
+		return OBL_NOT_A_NUMBER;
+	}
+	return obl_fraction_of((int64_t)(((whole * 1000000 + micro) * OBL_FRACTION_FULL + 500000) / 1000000));
+}
+
+/* A dictionary's Period (seconds) as milliseconds: a float's bits, or a whole number of seconds; -1 if neither or
+ * over 10 s. */
+static inline int32_t
+obl_period_ms(uint64_t value, unsigned bits)
+{
+	int64_t ms;
+	if (value < 100) {
+		ms = (int64_t)value * 1000;
+	} else if (bits > 32 && value > 0xffffffffull) {
+		ms = obl_f64_scale(value, 1000);
+	} else if (value <= 0xffffffffull && ((value >> 23) & 0xffu) >= 100) {
+		ms = obl_f32_scale((uint32_t)value, 1000);
+	} else {
+		return -1;
+	}
+	return ms < 0 || ms > 10000 ? -1 : (int32_t)ms;
+}
+
+/*
+ * How IOKit carries a CFNumber to the kernel [F, 24A446 IOKit.framework DoCFSerializeBinary at 0x18f07c8f4]: the value
+ * is read with CFNumberGetValue(kCFNumberLongLongType), so a float or double arrives as the integer it truncates to,
+ * and the width the OSNumber gets comes from a table by the CFNumber's type (0x18f113ec8): SInt8 8, SInt16 16, SInt32
+ * 32, SInt64 64, Float32 31, Float64 63, CGFloat 63. So 31 or 63 bits is a float that lost its fraction: no form of it
+ * that reaches setProperties keeps the value (a slider position 0.42 is 0). CoreBrightness sends the slider's position
+ * a second way, as a fixed-point integer (below), which does.
+ */
+static inline int
+obl_number_was_float(unsigned bits)
+{
+	return bits == 31 || bits == 63;
+}
+
+/*
+ * DisplayBrightnessSliderPosition and brightness-nits-cap [F, 24A446 CoreBrightness]: CFNumberCreate(kCFNumberSInt32Type)
+ * of fcvtzs(x, #16), i.e. signed 16.16 fixed point: the slider's position 0..1 as 0..0x10000
+ * (__DisplaySetLogicalBrightnessInternal 0x22aa0d784, __DisplayLogicalToSliderBrightnessInternal's result), and the cap
+ * in nits (SetBLDriverNitsCap 0x22aa0fdd8; __DisplaySetProperty_block_invoke 0x22a9f31d0). Each is set on the service
+ * alone (IORegistryEntrySetCFProperty in __DisplaySetBLDriverProperty_block_invoke).
+ */
+/* A 16.16 slider position as the fraction 0..OBL_FRACTION_FULL; up to 1% over 1 is the top; negative or larger: not one. */
+static inline int32_t
+obl_fixed16_fraction(uint64_t value)
+{
+	int32_t v = (int32_t)(uint32_t)value;
+	if (v < 0) {
+		return OBL_NOT_A_NUMBER;
+	}
+	return obl_fraction_of(((int64_t)v * OBL_FRACTION_FULL + 0x8000) >> 16);
+}
+
+/* A level of the light (0..OBL_FRACTION_FULL) for 16.16 nits against the panel's top in nits, bounded by a 16.16 cap when
+ * the cap is above 0 (a cap of 0 or less is no cap). -1 for nits of 0 or less: not a level (the display is not off for
+ * it; only its framebuffer's power request turns it off). */
+static inline int32_t
+obl_nits_level(int32_t nits16, int32_t cap16, uint32_t max_nits)
+{
+	if (nits16 <= 0 || max_nits == 0) {
+		return -1;
+	}
+	uint64_t n = (uint64_t)nits16, top = (uint64_t)max_nits << 16;
+	if (cap16 > 0 && n > (uint64_t)cap16) {
+		n = (uint64_t)cap16;
+	}
+	if (n > top) {
+		n = top;
+	}
+	return (int32_t)(n * OBL_FRACTION_FULL / top);
+}
+
+/*
+ * Only a change goes on (2026-11-15). CoreBrightness sends the slider's position some 550 times a second in a drag
+ * (phone, 2026-11-13), most of them the level the request before had; each was a bridge message to the host, whose
+ * fade starts again at every one (a repeated target with a FadePeriod never finished its walk), and a re-publish of
+ * IODisplayParameters and brightness-nits (nine objects made and freed). A request whose level, fade and flags are the
+ * last one sent is not sent again within OBL_RESEND_MS; one after that is (the host may have moved the panel since:
+ * its own restore at a display power change, a level set by hand). obl_sent_forget makes the next one go whatever it is.
+ */
+#define OBL_RESEND_MS 1000u
+
+struct obl_sent {
+	int valid;
+	uint32_t level, fade_ms, flags;
+	uint64_t at_ms;
+	uint64_t skipped;              /* requests not sent: the same as the last */
+};
+
+static inline int
+obl_send_wanted(struct obl_sent *s, uint32_t level, uint32_t fade_ms, uint32_t flags, uint64_t now_ms)
+{
+	if (s->valid && s->level == level && s->fade_ms == fade_ms && s->flags == flags && now_ms - s->at_ms < OBL_RESEND_MS) {
+		s->skipped++;
+		return 0;
+	}
+	s->valid = 1;
+	s->level = level;
+	s->fade_ms = fade_ms;
+	s->flags = flags;
+	s->at_ms = now_ms;
+	return 1;
+}
+
+static inline void
+obl_sent_forget(struct obl_sent *s)
+{
+	s->valid = 0;
+}
+
+/* The same for what the service publishes (IODisplayParameters' value, brightness-nits): only a change is set again. */
+struct obl_published {
+	int valid;
+	uint32_t value, nits16;
+};
+
+static inline int
+obl_publish_wanted(struct obl_published *p, uint32_t value, uint32_t nits16)
+{
+	if (p->valid && p->value == value && p->nits16 == nits16) {
+		return 0;
+	}
+	p->valid = 1;
+	p->value = value;
+	p->nits16 = nits16;
+	return 1;
+}
+
+#endif

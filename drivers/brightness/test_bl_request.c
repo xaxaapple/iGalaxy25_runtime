@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: MIT
+// Host test of oneios_bl_request.h: what a DisplayBrightness request may hold, decoded with integers, against the
+// host's own floating point.
+#include "oneios_bl_request.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+static int failures, checks;
+#define CHECK(c) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
+
+static uint32_t f32(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
+static uint64_t f64(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }
+static int32_t want(double f) { return (int32_t)floor(f * OBL_FRACTION_FULL + 0.5); }
+
+int main(void)
+{
+  // A float's bits: every slider step the host's arithmetic agrees with, to one unit of the rounding.
+  for (int i = 0; i <= 1000; i++) {
+    float f = (float)i / 1000.0f;
+    int32_t got = obl_fraction_of(obl_f32_scale(f32(f), OBL_FRACTION_FULL));
+    CHECK(got >= want(f) - 1 && got <= want(f) + 1);
+    int32_t got64 = obl_fraction_of(obl_f64_scale(f64((double)i / 1000.0), OBL_FRACTION_FULL));
+    CHECK(got64 >= want((double)i / 1000.0) - 1 && got64 <= want((double)i / 1000.0) + 1);
+  }
+  CHECK(obl_fraction_of(obl_f32_scale(f32(0.5f), OBL_FRACTION_FULL)) == 32768);
+  CHECK(obl_fraction_of(obl_f32_scale(f32(1.0f), OBL_FRACTION_FULL)) == 65535);
+  CHECK(obl_fraction_of(obl_f32_scale(f32(1.0001f), OBL_FRACTION_FULL)) == 65535);     // a float's 1.0 and a little
+  CHECK(obl_fraction_of(obl_f32_scale(f32(1.5f), OBL_FRACTION_FULL)) == OBL_NOT_A_NUMBER);
+  CHECK(obl_f32_scale(f32(-0.5f), OBL_FRACTION_FULL) == -1 && obl_f32_scale(f32(-0.0f), OBL_FRACTION_FULL) == 0);
+  CHECK(obl_f32_scale(f32(NAN), 1) == -1 && obl_f32_scale(f32(INFINITY), 1) == -1 && obl_f32_scale(f32(1e30f), 1) == -1);
+  CHECK(obl_f32_scale(f32(1e-30f), OBL_FRACTION_FULL) == 0 && obl_f32_scale(0x00000001u, OBL_FRACTION_FULL) == 0);
+  CHECK(obl_f64_scale(f64(0.25), OBL_FRACTION_FULL) == 16384 && obl_f64_scale(f64(-1.0), 1) == -1 && obl_f64_scale(f64(NAN), 1) == -1);
+
+  // A number: the bits of a float or double between 2^-27 and 1; 0 and 1 are ambiguous; other integers are not used.
+  CHECK(obl_number_fraction(f32(0.75f), 32) == 49151);
+  CHECK(obl_number_fraction(f32(0.75f), 64) == 49151);                                 // an OSNumber of 64 bits, a float's value
+  CHECK(obl_number_fraction(f64(0.75), 64) == 49151);
+  CHECK(obl_number_fraction(f32(1.0f), 32) == 65535);
+  CHECK(obl_number_fraction(0, 32) == OBL_AMBIGUOUS && obl_number_fraction(1, 32) == OBL_AMBIGUOUS && obl_number_fraction(1, 64) == OBL_AMBIGUOUS);
+  CHECK(obl_number_fraction(128, 32) == OBL_NOT_A_NUMBER);                             // a count of 255 steps is not a float's bits
+  CHECK(obl_number_fraction(255, 32) == OBL_NOT_A_NUMBER && obl_number_fraction(65535, 32) == OBL_NOT_A_NUMBER);
+  CHECK(obl_number_fraction(500 << 16, 32) == OBL_NOT_A_NUMBER);                        // 16.16 nits
+  CHECK(obl_number_fraction(f32(2.0f), 32) == OBL_NOT_A_NUMBER && obl_number_fraction(f32(-0.5f), 32) == OBL_NOT_A_NUMBER);
+  CHECK(obl_number_fraction(f32(1e-9f), 32) == OBL_NOT_A_NUMBER);                       // below 2^-27: not taken for a float
+  CHECK(obl_number_fraction(f64(2.0), 64) == OBL_NOT_A_NUMBER);
+
+  // OSData of a float or a double, little-endian.
+  uint32_t b = f32(0.5f);
+  uint8_t four[4] = { (uint8_t)b, (uint8_t)(b >> 8), (uint8_t)(b >> 16), (uint8_t)(b >> 24) }, eight[8];
+  uint64_t d = f64(0.25);
+  for (int i = 0; i < 8; i++) eight[i] = (uint8_t)(d >> (8 * i));
+  CHECK(obl_data_fraction(four, 4) == 32768 && obl_data_fraction(eight, 8) == 16384 && obl_data_fraction(four, 3) == OBL_NOT_A_NUMBER);
+
+  // Text.
+  CHECK(obl_string_fraction("0.5") == 32768 && obl_string_fraction("1") == 65535 && obl_string_fraction(".25") == 16384);
+  CHECK(obl_string_fraction("0") == 0 && obl_string_fraction("1.0") == 65535 && obl_string_fraction("0.333333") == 21845);
+  CHECK(obl_string_fraction("1.5") == OBL_NOT_A_NUMBER && obl_string_fraction("2") == OBL_NOT_A_NUMBER && obl_string_fraction("") == OBL_NOT_A_NUMBER);
+  CHECK(obl_string_fraction("abc") == OBL_NOT_A_NUMBER && obl_string_fraction("0.5s") == OBL_NOT_A_NUMBER && obl_string_fraction(".") == OBL_NOT_A_NUMBER);
+
+  // Period: seconds as a float's bits, or whole seconds.
+  CHECK(obl_period_ms(f32(0.25f), 32) == 250 && obl_period_ms(f32(1.5f), 32) == 1500 && obl_period_ms(f64(0.5), 64) == 500);
+  CHECK(obl_period_ms(0, 32) == 0 && obl_period_ms(1, 32) == 1000 && obl_period_ms(f32(60.0f), 32) == -1 && obl_period_ms(1000, 32) == -1);
+
+  // IOKit's widths: Float32 arrives as 31 bits, Float64 as 63 (the truncated integer), integers as 8..64.
+  CHECK(obl_number_was_float(31) && obl_number_was_float(63) && !obl_number_was_float(32) && !obl_number_was_float(64) && !obl_number_was_float(8));
+
+  // DisplayBrightnessSliderPosition: 16.16 of 0..1 (CoreBrightness's fcvtzs #16 into an SInt32).
+  CHECK(obl_fixed16_fraction(0) == 0 && obl_fixed16_fraction(0x10000) == 65535 && obl_fixed16_fraction(0x8000) == 32768);
+  CHECK(obl_fixed16_fraction(0x6b85) == 27525);                                          // 0.42
+  CHECK(obl_fixed16_fraction(0x10100) == 65535);                                         // a hair over 1: the top
+  CHECK(obl_fixed16_fraction(0x20000) == OBL_NOT_A_NUMBER && obl_fixed16_fraction(0xffffffffu) == OBL_NOT_A_NUMBER);   // 2.0, -1/65536
+
+  // brightness-nits (16.16) to a level of the light on a 500-nit panel, with and without a cap; nits 0 is no level.
+  CHECK(obl_nits_level(250 << 16, 0, 500) == 32767 && obl_nits_level(500 << 16, 0, 500) == 65535 && obl_nits_level(900 << 16, 0, 500) == 65535);
+  CHECK(obl_nits_level(250 << 16, 100 << 16, 500) == 13107 && obl_nits_level(50 << 16, 100 << 16, 500) == 6553);
+  CHECK(obl_nits_level(250 << 16, -5, 500) == 32767);                                    // a cap of 0 or less: none
+  CHECK(obl_nits_level(0, 0, 500) == -1 && obl_nits_level(-65536, 0, 500) == -1 && obl_nits_level(100 << 16, 0, 0) == -1);
+  CHECK(obl_nits_level(0x3b5c0000, 0, 500) >= 0);                                        // the phone's 27496 of 65535 came from such a value
+
+  // Only a change is sent (2026-11-15): a drag's repeats of one level are not, a new level, fade or flag is, and the same
+  // level again after OBL_RESEND_MS, or after a forget (a display power change), is.
+  struct obl_sent s = { 0 };
+  CHECK(obl_send_wanted(&s, 30000, 0, 0, 1000));
+  unsigned sent = 0;
+  for (unsigned i = 0; i < 550; i++) sent += (unsigned)obl_send_wanted(&s, i < 300 ? 30000 : 31000, 0, 0, 1000 + i * 2);
+  CHECK(sent == 1 && s.skipped == 549 && s.level == 31000);
+  CHECK(obl_send_wanted(&s, 31000, 250, 0, 2200) && obl_send_wanted(&s, 31000, 250, 1, 2201) && !obl_send_wanted(&s, 31000, 250, 1, 2202));
+  CHECK(!obl_send_wanted(&s, 31000, 250, 1, 2201 + OBL_RESEND_MS - 1) && obl_send_wanted(&s, 31000, 250, 1, 2201 + OBL_RESEND_MS));
+  obl_sent_forget(&s);
+  CHECK(obl_send_wanted(&s, 31000, 250, 1, 3300));
+  struct obl_published p = { 0 };
+  CHECK(obl_publish_wanted(&p, 100, 5000) && !obl_publish_wanted(&p, 100, 5000) && obl_publish_wanted(&p, 100, 5001) && obl_publish_wanted(&p, 101, 5001));
+
+  printf("bl request: %d checks, %d failed\n", checks, failures);
+  return failures != 0;
+}

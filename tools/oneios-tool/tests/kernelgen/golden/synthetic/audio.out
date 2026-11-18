@@ -1,0 +1,171 @@
+// A made-up source for the edit list "audio": every anchor once, between lines of its own.
+// (before anchor 0)
+extern kmod_info_t g_kernel_kmod_info;
+// OneiOS (build-oneios-audio.py): the UIDs and the speaker's output latency, from boot arguments at attach.
+#include <pexpert/pexpert.h>
+static uint32_t oneios_output_latency = 720;
+static char oneios_out_uid[32] = "Speaker", oneios_in_uid[32] = "Mic";
+// OneiOS: the "Actuator" device (haptics): drivers/haptics/oneios_haptic.c takes its periods.
+extern "C" bool oneios_haptic_actuator_ready(void);
+extern "C" void oneios_haptic_actuator_published(bool yes);
+extern "C" void oneios_haptic_actuator_running(bool on);
+extern "C" uint32_t oneios_haptic_actuator_play(const int16_t *frames, uint32_t count, uint32_t channels);
+// OneiOS: what the Actuator's user clients do (the kinds are drivers/bridge/oneios_bridge.h's OH_EV_*).
+extern "C" void oneios_haptic_actuator_event(uint32_t kind, uint32_t a, uint32_t b);
+static uint32_t oneios_actuator_on = 1, oneios_actuator_channels = 1;
+static bool oneios_publishing_actuator;
+extern "C" { volatile uint64_t oneios_actuator_frames; }
+// (before anchor 1)
+    bool isInput;
+    bool isActuator = false;   // OneiOS: the "Actuator" output: its periods go to drivers/haptics
+// (before anchor 2)
+    uint32_t channels() const { return isInput ? InputChannels : isActuator ? oneios_actuator_channels : OutputChannels; }
+// (before anchor 3)
+        if (isActuator) oneios_haptic_actuator_running(true); else transportSet(!isInput, true);
+// (before anchor 4)
+        if (isActuator) oneios_haptic_actuator_running(false); else transportSet(!isInput, false);
+// (before anchor 5)
+            const uint32_t played = isActuator ? oneios_haptic_actuator_play(at, PeriodFrames, ch) : droidvm_snd_play(at, PeriodFrames);
+// (before anchor 6)
+            if (isActuator) oneios_actuator_frames = oneios_actuator_frames + played;
+            else droidvm_audio_played = droidvm_audio_played + played;
+// (before anchor 7)
+        if (!isActuator) droidvm_audio_periods = droidvm_audio_periods + 1;
+// (before anchor 8)
+    DroidVMAudioDevice *device = OSTypeAlloc(DroidVMAudioDevice);
+    if (device) device->isActuator = oneios_publishing_actuator;   // OneiOS: before initRole sizes the ring
+// (before anchor 9)
+    setNumber(e, "output latency", isActuator ? Latency : oneios_output_latency);   // OneiOS: the host path's latency
+// (before anchor 10)
+    // OneiOS: oneios-audio-out-uid, oneios-audio-in-uid (none: no microphone), oneios-audio-latency.
+    PE_parse_boot_arg_str("oneios-audio-out-uid", oneios_out_uid, sizeof(oneios_out_uid));
+    PE_parse_boot_arg_str("oneios-audio-in-uid", oneios_in_uid, sizeof(oneios_in_uid));
+    PE_parse_boot_argn("oneios-audio-latency", &oneios_output_latency, sizeof(oneios_output_latency));
+    bool speaker = publishDevice(resources, false, oneios_out_uid, "droidvm-audio-out");
+    bool mic = strcmp(oneios_in_uid, "none") != 0 && publishDevice(resources, true, oneios_in_uid, "droidvm-audio-in");
+    // OneiOS: the Actuator (haptics), when drivers/haptics has the host's actuator; oneios-actuator=0 leaves it out.
+    PE_parse_boot_argn("oneios-actuator", &oneios_actuator_on, sizeof(oneios_actuator_on));
+    PE_parse_boot_argn("oneios-actuator-channels", &oneios_actuator_channels, sizeof(oneios_actuator_channels));
+    if (oneios_actuator_channels != 2) oneios_actuator_channels = 1;
+    oneios_publishing_actuator = true;
+    bool actuator = oneios_actuator_on && oneios_haptic_actuator_ready() && publishDevice(resources, false, "Actuator", "oneios-actuator");
+    oneios_publishing_actuator = false;
+    oneios_haptic_actuator_published(actuator);
+// (before anchor 11)
+    IOLog("DroidVMAudio: published Speaker=%d Mic=%d Actuator=%d as IOAudio2Devices (UIDs %s, %s, Actuator x%u; output latency %u frames)\n", speaker, mic,
+          actuator, oneios_out_uid, oneios_in_uid, oneios_actuator_channels, oneios_output_latency);
+// (before anchor 12)
+    droidvm_audio_clients = droidvm_audio_clients + 1;
+    if (device->isActuator) oneios_haptic_actuator_event(0, 0, 0);   // OneiOS: opened
+// (before anchor 13)
+    droidvm_audio_clients = droidvm_audio_clients - 1;
+    if (device && device->isActuator) oneios_haptic_actuator_event(1, 0, 0);   // OneiOS: closed
+// (before anchor 14)
+    droidvm_audio_selectors = droidvm_audio_selectors + 1;
+    if (device && device->isActuator) oneios_haptic_actuator_event(2, selector, 0);   // OneiOS: a selector
+// (before anchor 15)
+        droidvm_audio_bad_selectors = droidvm_audio_bad_selectors + 1;
+        if (device && device->isActuator) oneios_haptic_actuator_event(3, selector, 0);   // OneiOS: refused
+// (before anchor 16)
+        if (a->scalarInputCount < 1 || a->structureInputSize != sizeof f) {
+            if (device->isActuator) oneios_haptic_actuator_event(3, selector, 0);   // OneiOS: refused (its size)
+            return kIOReturnBadArgument;
+        }
+// (before anchor 17)
+        memcpy(&f, a->structureInput, sizeof f);
+        if (device->isActuator)   // OneiOS: the format the HAL asks of the Actuator
+            oneios_haptic_actuator_event(4, f.channels | device->channels() << 16, uint32_t(f.rate >> 32));
+// (before anchor 18)
+    droidvm_audio_maps = droidvm_audio_maps + 1;
+    if (device->isActuator) oneios_haptic_actuator_event(5, type, 0);   // OneiOS: a mapping
+// (before anchor 19)
+uint32_t droidvm_snd_capture(int16_t *frames, uint32_t count);
+// OneiOS (fix-audio-latency): the speaker's ring (oneios-audio-ring) and its engine's timing (OneiOSAudio.c reports it).
+uint32_t oneios_speaker_ring = 1920;
+volatile uint64_t oneios_speaker_periods, oneios_speaker_late_sum, oneios_speaker_late_max, oneios_speaker_leads,
+    oneios_speaker_lead_sum, oneios_speaker_lead_min = ~0ULL, oneios_speaker_lead_max, oneios_speaker_lead_last, oneios_speaker_tight;
+// (before anchor 20)
+    uint32_t seed;
+    uint32_t ringFrames = RingFrames;   // OneiOS: the speaker's is oneios_speaker_ring
+    bool speakerEngine() const { return !isInput && !isActuator; }   // OneiOS: hands a period on as it starts
+    void oneiosSpeakerPeriod(uint64_t deadline, uint64_t done);
+// (before anchor 21)
+    ringFrames = speakerEngine() ? oneios_speaker_ring : RingFrames;   // OneiOS
+    ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, Shared, ringFrames * 2 * channels(), page_size);
+// (before anchor 22)
+    setNumber(e, "output safety offset", speakerEngine() ? PeriodFrames : SafetyOffset);   // OneiOS: written by the period's start
+// (before anchor 23)
+    setNumber(e, "io buffer frame size", ringFrames);   // OneiOS: iOS's I/O buffer is at most 0.375 of it
+// (before anchor 24)
+void DroidVMAudioDevice::engineMain(void *self, wait_result_t) { static_cast<DroidVMAudioDevice *>(self)->run(); }
+
+// OneiOS (fix-audio-latency): the speaker at the start of its period `done` (the deadline has passed): the zero time
+// stamp of a wrap the last period crossed (in the past now, as a DMA wrap's), and the timing counters: how late the
+// period was taken (us), how far ahead of it the HAL has written (its write end: iOS's I/O buffer and safety offset as
+// used), and whether that came within a period of overwriting what is not yet taken (the ring too small for them).
+void DroidVMAudioDevice::oneiosSpeakerPeriod(uint64_t deadline, uint64_t done) {
+    EngineStatus *s = status();
+    const uint64_t wrap = done / ringFrames * ringFrames;
+    if (done && wrap + PeriodFrames > done) {
+        s->hostTime = startTime + absolute(wrap);
+        __asm__ volatile("dmb ish" ::: "memory");
+        s->sampleTime = wrap;
+        __asm__ volatile("dmb ish" ::: "memory");
+    }
+    const uint64_t now = mach_absolute_time();
+    uint64_t late = 0;
+    if (now > deadline) absolutetime_to_nanoseconds(now - deadline, &late);
+    late /= 1000;
+    oneios_speaker_periods = oneios_speaker_periods + 1;
+    oneios_speaker_late_sum = oneios_speaker_late_sum + late;
+    if (late > oneios_speaker_late_max) oneios_speaker_late_max = late;
+    const uint64_t written = s->writeEnd;
+    oneios_speaker_lead_last = written;
+    if (written <= done) return;
+    const uint64_t lead = written - done;
+    oneios_speaker_leads = oneios_speaker_leads + 1;
+    oneios_speaker_lead_sum = oneios_speaker_lead_sum + lead;
+    if (lead < oneios_speaker_lead_min) oneios_speaker_lead_min = lead;
+    if (lead > oneios_speaker_lead_max) oneios_speaker_lead_max = lead;
+    if (lead + PeriodFrames > ringFrames) oneios_speaker_tight = oneios_speaker_tight + 1;
+}
+// (before anchor 25)
+        // OneiOS: the speaker takes a period as it starts (the HAL has written it a safety offset of one period
+        // ahead), the others once it has passed.
+        const bool early = speakerEngine();
+        const uint64_t deadline = startTime + absolute(done + (early ? 0 : PeriodFrames));
+// (before anchor 26)
+        if (early) oneiosSpeakerPeriod(deadline, done);
+        // OneiOS: a period over the ring's end goes through `wrapped`, in two parts.
+        int16_t wrapped[PeriodFrames * 2];
+        const uint32_t first = uint32_t(done % ringFrames), part = ringFrames - first < PeriodFrames ? ringFrames - first : PeriodFrames;
+        int16_t *at = part == PeriodFrames ? buffer + first * ch : wrapped;
+        if (at == wrapped && !isInput) {
+            memcpy(wrapped, buffer + first * ch, part * 2 * ch);
+            memcpy(wrapped + part * ch, buffer, (PeriodFrames - part) * 2 * ch);
+        }
+// (before anchor 27)
+        if (at == wrapped) {   // OneiOS: back into the ring (the microphone's frames; the speaker's silence)
+            memcpy(buffer + first * ch, wrapped, part * 2 * ch);
+            memcpy(buffer, wrapped + part * ch, (PeriodFrames - part) * 2 * ch);
+        }
+        done += PeriodFrames;
+// (before anchor 28)
+        // OneiOS: at the wrap the period crossed (the speaker's is set as its next period starts).
+        const uint64_t wrap = done / ringFrames * ringFrames;
+        if (!early && wrap + PeriodFrames > done) {
+// (before anchor 29)
+            s->hostTime = startTime + absolute(wrap);
+// (before anchor 30)
+            s->sampleTime = wrap;
+// (before anchor 31)
+    // OneiOS: oneios-audio-ring=FRAMES, the speaker's ring (960..8192; best a whole number of 240-frame periods).
+    PE_parse_boot_argn("oneios-audio-ring", &oneios_speaker_ring, sizeof(oneios_speaker_ring));
+    if (oneios_speaker_ring < 4 * PeriodFrames) oneios_speaker_ring = 4 * PeriodFrames;
+    if (oneios_speaker_ring > RingFrames) oneios_speaker_ring = RingFrames;
+    droidvm_audio_stage = 3;
+// (before anchor 32)
+    droidvm_audio_stage = 4;
+    IOLog("DroidVMAudio: speaker: ring %u frames (iOS's I/O buffer at most %u), safety offset %u, each period handed on as it "
+          "starts; output latency %u frames\n", oneios_speaker_ring, oneios_speaker_ring * 3 / 8, (unsigned)PeriodFrames, oneios_output_latency);
+// (the end)
