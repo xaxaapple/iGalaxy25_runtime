@@ -1,17 +1,3 @@
-# Build the OneiOS image set (iOS 27.0.1 24A446, iPhone18,2) on a GitHub runner and hand it over in parts.
-#
-# The image is made from Apple's IPSW, fetched here from Apple's CDN with scripts/fetch/fetch.sh, exactly as on your
-# own PC (docs/building.md sections 1 to 3). It is Apple's software: it is never committed and never put in a
-# release. Delivery is a private hand-over to you: the .tar.zst is cut into parts (default 1900 MB) that go to
-#   - gofile.io (an unlisted link; the page and the parts' links are printed in the run's summary), and/or
-#   - the run's artifacts (parts, 3 days; the account's artifact storage must have room for ~11 GB).
-# Anyone who has a gofile link can download it: do not post the link.
-#
-# This is the workflow for the current tree (Rust oneios-tool, XnuPrelink pin 9b950f2 with stub relocation).
-# Put the parts together on the phone or PC:  cat OneiOS_*.tar.zst.part-* > OneiOS_iOS27.0.1_24A446_iPhone18-2.tar.zst
-# and check it:  sha256sum -c OneiOS_iOS27.0.1_24A446_iPhone18-2.tar.zst.sha256
-# Disk: about 60 GB at the peak (IPSW 11 + sources and kernel build + image 11 + its tar 11); the runner has ~93 GB free
-# once the preinstalled toolchains are removed (first step).
 name: build-image
 on:
   workflow_dispatch:
