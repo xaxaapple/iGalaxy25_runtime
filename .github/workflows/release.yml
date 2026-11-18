@@ -1,20 +1,3 @@
-# OneiOS's one workflow (docs/releases.md, "CI and releases"): the runtime package and the OneOS app (the fork,
-# submodule app/) built at the same time on two runners, and a release that carries both.
-#
-#   plan ──┬── runtime    (ubuntu-24.04) script checks, host tests, runtime/package.sh, the Apple-file refusal,
-#          │                             elf-check, drm2kgsl, the package's members, bin/oneios-tool for the
-#          │                             phone and oneios-tool-VERSION-android-arm64 beside the package
-#          ├── apk        (ubuntu-24.04) app/ at the head of the fork's branch, JDK 21, tribalfs' packages,
-#          │                             ./gradlew test assembleFullDebug, the APK's assets checked
-#          ├── apk-macos  (macos-15)     ./gradlew test of the same checkout on a Mac (core:root's script tests)
-#          └──────────────── release     needs runtime and apk; a tag v* or a dispatch only
-#
-# Triggers: a pull request or a push to main builds both and releases nothing. A tag vN.N.N[-suffix] on main builds
-# both and releases both. A dispatch (Actions, "build and release", Run workflow) on main takes a version and
-# "both", "runtime only" or "apk only".
-# The runtime job never checks out app/: the fork's tree cannot reach the package. Nothing of Apple's, Samsung's,
-# Google's or OPPO's is downloaded or uploaded here: runtime/package.sh refuses Apple files (`oneios-tool package`),
-# and .github/scripts/check-apk.sh refuses an APK that carries a package set, an image or firmware.
 name: build and release
 on:
   pull_request:
